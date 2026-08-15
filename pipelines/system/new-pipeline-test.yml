@@ -2762,7 +2762,7 @@ stages:
   - stage: azure_eastus2euap_n100_debug_resume_37deca
     dependsOn: []
     condition: >-
-      and(always(),
+      and(succeededOrFailed(),
       eq(variables['Build.Reason'], 'Manual'),
       eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], ''),
       or(eq(variables['CLUSTERMESH_DEBUG_MODE'], 'resume'),

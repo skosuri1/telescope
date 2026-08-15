@@ -113,6 +113,8 @@ def test_debug_stages_are_explicitly_mode_gated():
 
     assert "CLUSTERMESH_DEBUG_MODE'], 'resume'" in resume
     assert "CLUSTERMESH_DEBUG_MODE'], 'resume-existing'" in resume
+    assert "and(succeededOrFailed()," in resume
+    assert "and(always()," not in resume
     assert "clustermesh-debug-resume.yml" in resume
     assert "CLUSTERMESH_QUOTA_PREFLIGHT_ENABLED: \"false\"" in resume
     assert "eq(variables['Build.Reason'], 'Manual')" in resume
