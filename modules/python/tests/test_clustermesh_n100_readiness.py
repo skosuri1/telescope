@@ -151,3 +151,17 @@ def test_cilium_status_exec_has_wall_clock_and_command_timeouts():
     assert 'kubectl --request-timeout="${mesh_status_command_timeout}s"' in validate
     assert "cilium-dbg status timed out" in validate
     assert "for i in $(seq 1 120)" not in validate
+
+
+def test_runner_side_cilium_status_is_failure_only_and_bounded():
+    validate = VALIDATE_RESOURCES_PATH.read_text(encoding="utf-8")
+
+    failure_start = validate.index('if [ "$connected" -ne 1 ]; then')
+    loop_end = validate.index("\n      done", failure_start)
+    failure_block = validate[failure_start:loop_end]
+
+    assert "CLUSTERMESH_RUNNER_STATUS_TIMEOUT_SECONDS:-60" in validate
+    assert "cilium clustermesh status" in failure_block
+    assert '"${runner_status_timeout_seconds}s"' in failure_block
+    assert "runner-side cilium status timed out" in failure_block
+    assert "cilium clustermesh status" not in validate[loop_end:]

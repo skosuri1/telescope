@@ -1249,10 +1249,12 @@ steps:
         mesh_convergence_timeout_seconds="${CLUSTERMESH_PEER_CONVERGENCE_TIMEOUT_SECONDS:-1800}"
         mesh_status_command_timeout_seconds="${CLUSTERMESH_STATUS_COMMAND_TIMEOUT_SECONDS:-45}"
         mesh_status_poll_seconds="${CLUSTERMESH_STATUS_POLL_SECONDS:-15}"
+        runner_status_timeout_seconds="${CLUSTERMESH_RUNNER_STATUS_TIMEOUT_SECONDS:-60}"
         if ! [[ "$mesh_convergence_timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
            ! [[ "$mesh_status_command_timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
-           ! [[ "$mesh_status_poll_seconds" =~ ^[0-9]+$ ]]; then
-          echo "ClusterMesh peer convergence timeout values must be positive/positive/non-negative integers." >&2
+           ! [[ "$mesh_status_poll_seconds" =~ ^[0-9]+$ ]] ||
+           ! [[ "$runner_status_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+          echo "ClusterMesh peer convergence timeout values must be positive/positive/non-negative/positive integers." >&2
           exit 1
         fi
         connected=0
@@ -1323,14 +1325,21 @@ steps:
             kubectl --request-timeout=45s -n kube-system exec ds/cilium -- \
               cilium-dbg status --verbose 2>&1 \
             | grep -A 4 -E '^[[:space:]]+(mesh-|remote-)' | head -80 || true
+          echo "--- cilium clustermesh status (runner-side failure diagnostic) ---"
+          runner_status_rc=0
+          timeout --signal=TERM --kill-after=10s \
+            "${runner_status_timeout_seconds}s" \
+            cilium clustermesh status \
+              --context "$(kubectl config current-context)" \
+              --wait=false 2>&1 ||
+            runner_status_rc=$?
+          if [ "$runner_status_rc" -eq 124 ] || [ "$runner_status_rc" -eq 137 ]; then
+            echo "  runner-side cilium status timed out after ${runner_status_timeout_seconds}s"
+          elif [ "$runner_status_rc" -ne 0 ]; then
+            echo "  runner-side cilium status exited with code $runner_status_rc"
+          fi
           echo "--- end PEER-LIST DEBUG DUMP for $role ---"
         fi
-
-        echo "--- cilium clustermesh status (runner-side, richer diagnostics) ---"
-        # Best-effort, informational only — failures here don't fail the step
-        # because the in-pod check above is authoritative. cilium-cli reports
-        # per-remote connection state, endpoint counts, and version info.
-        cilium clustermesh status --context "$(kubectl config current-context)" --wait=false || true
       done
 
       if [ "$failures" -gt 0 ]; then
