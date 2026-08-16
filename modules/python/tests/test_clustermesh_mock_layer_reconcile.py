@@ -1710,7 +1710,12 @@ def _extract_bash_function(script_text, func_name):
 def _load_execute_yml_script():
     with open(EXECUTE_YML_PATH, "r", encoding="utf-8") as handle:
         doc = yaml.safe_load(handle)
-    return doc["steps"][1]["script"]
+    return next(
+        step["script"]
+        for step in doc["steps"]
+        if step.get("displayName")
+        == "Run CL2 across all clustermesh clusters"
+    )
 
 
 def _run_budget_function(func_names, call, env):

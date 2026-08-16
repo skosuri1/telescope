@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set +x
 set -uo pipefail
 
 shopt -s nullglob
@@ -62,6 +63,12 @@ no_op_reason=""
 # MUST NOT by itself stop later scenarios.
 infrastructure_failure=false
 scenario_incomplete=false
+azure_oidc_refresh_enabled=false
+azure_oidc_configuration_valid=true
+azure_login_refreshed_at=0
+azure_auth_failed=false
+azure_auth_failure_reported=false
+azure_oidc_refresh_interval_seconds="${AZURE_OIDC_REFRESH_INTERVAL_SECONDS:-2700}"
 
 mkdir -p "$SCENARIO_REPORT_DIR"
 rm -f -- "$summary_tmp"
@@ -105,6 +112,123 @@ add_error() {
       ;;
   esac
   echo "$message" >&2
+}
+
+configure_azure_oidc_refresh() {
+  local required="${CL2_REQUIRE_AZURE_OIDC_REFRESH:-false}"
+  local present=0
+  local -a names=(
+    SYSTEM_OIDCREQUESTURI
+    SYSTEM_ACCESSTOKEN
+    AZURESUBSCRIPTION_SERVICE_CONNECTION_ID
+    AZURESUBSCRIPTION_CLIENT_ID
+    AZURESUBSCRIPTION_TENANT_ID
+  )
+  local name
+
+  required="${required,,}"
+  if [ "$required" != "true" ] && [ "$required" != "false" ]; then
+    add_error \
+      "CL2_REQUIRE_AZURE_OIDC_REFRESH must be true or false, got $required" \
+      infra
+    return 1
+  fi
+  if ! [[ "$azure_oidc_refresh_interval_seconds" =~ ^[0-9]+$ ]]; then
+    add_error \
+      "AZURE_OIDC_REFRESH_INTERVAL_SECONDS must be a non-negative integer" \
+      infra
+    return 1
+  fi
+
+  for name in "${names[@]}"; do
+    if [ -n "${!name:-}" ]; then
+      present=$((present + 1))
+    fi
+  done
+  if [ "$required" = "false" ] && [ "$present" -eq 0 ]; then
+    return 0
+  fi
+
+  for name in "${names[@]}"; do
+    if [ -z "${!name:-}" ]; then
+      add_error \
+        "Refreshable Azure authentication is missing $name" \
+        infra
+      return 1
+    fi
+  done
+  azure_oidc_refresh_enabled=true
+}
+
+refresh_azure_login() {
+  local separator="?" request_url response oidc_token actual_subscription_id
+  local attempt
+
+  if [[ "$SYSTEM_OIDCREQUESTURI" == *"?"* ]]; then
+    separator="&"
+  fi
+  request_url="${SYSTEM_OIDCREQUESTURI}${separator}api-version=7.1&serviceConnectionId=${AZURESUBSCRIPTION_SERVICE_CONNECTION_ID}"
+
+  for attempt in 1 2 3; do
+    response=""
+    oidc_token=""
+    if response=$(curl \
+        --silent \
+        --show-error \
+        --fail \
+        --request POST \
+        --header "Content-Length: 0" \
+        --header "Content-Type: application/json" \
+        --header "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
+        "$request_url") &&
+       oidc_token=$(jq -er '
+         .oidcToken
+         | select(type == "string" and length > 0)
+       ' <<<"$response") &&
+       az login \
+         --service-principal \
+         --username "$AZURESUBSCRIPTION_CLIENT_ID" \
+         --tenant "$AZURESUBSCRIPTION_TENANT_ID" \
+         --allow-no-subscriptions \
+         --federated-token "$oidc_token" \
+         --output none &&
+       az account set --subscription "$TARGET_SUBSCRIPTION_ID" &&
+       actual_subscription_id=$(
+         az account show --query id --output tsv 2>/dev/null
+       ) &&
+       [[ "${actual_subscription_id,,}" == "${TARGET_SUBSCRIPTION_ID,,}" ]]; then
+      azure_login_refreshed_at=$(date +%s)
+      echo "Refreshed Azure workload-identity session for artifact preservation."
+      return 0
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      sleep $((attempt * 2))
+    fi
+  done
+  return 1
+}
+
+ensure_azure_login() {
+  local now
+
+  if [ "$azure_oidc_refresh_enabled" != "true" ]; then
+    return 0
+  fi
+  if [ "$azure_auth_failed" = "true" ]; then
+    return 1
+  fi
+
+  now=$(date +%s)
+  if [ "$azure_login_refreshed_at" -gt 0 ] &&
+     [ $((now - azure_login_refreshed_at)) -lt \
+       "$azure_oidc_refresh_interval_seconds" ]; then
+    return 0
+  fi
+  if refresh_azure_login; then
+    return 0
+  fi
+  azure_auth_failed=true
+  return 1
 }
 
 load_worker_summary() {
@@ -243,6 +367,15 @@ upload_and_verify() {
 
   size=$(stat -c%s "$file" 2>/dev/null || printf '0')
   echo "Uploading $file (${size} bytes) -> ${STORAGE_ACCOUNT_NAME}/${CONTAINER_NAME}/${blob_name}"
+  if ! ensure_azure_login; then
+    if [ "$azure_auth_failure_reported" != "true" ]; then
+      add_error \
+        "Unable to refresh Azure authentication for artifact upload" \
+        infra
+      azure_auth_failure_reported=true
+    fi
+    return 1
+  fi
   if ! az storage blob upload \
       --account-name "$STORAGE_ACCOUNT_NAME" \
       --container-name "$CONTAINER_NAME" \
@@ -255,6 +388,15 @@ upload_and_verify() {
     return 1
   fi
 
+  if ! ensure_azure_login; then
+    if [ "$azure_auth_failure_reported" != "true" ]; then
+      add_error \
+        "Unable to refresh Azure authentication for upload verification" \
+        infra
+      azure_auth_failure_reported=true
+    fi
+    return 1
+  fi
   if ! remote_size=$(az storage blob show \
       --account-name "$STORAGE_ACCOUNT_NAME" \
       --container-name "$CONTAINER_NAME" \
@@ -339,9 +481,25 @@ for command_name in az jq gzip tar stat find sort; do
     add_error "Required command is unavailable: $command_name" infra
   fi
 done
+if ! configure_azure_oidc_refresh; then
+  azure_oidc_configuration_valid=false
+fi
+if [ "$azure_oidc_refresh_enabled" = "true" ]; then
+  for command_name in curl date; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      add_error "Required command is unavailable: $command_name" infra
+      azure_oidc_configuration_valid=false
+    fi
+  done
+fi
 
 azure_ready=true
-if ! az account set --subscription "$TARGET_SUBSCRIPTION_ID"; then
+if [ "$azure_oidc_configuration_valid" != "true" ]; then
+  azure_ready=false
+elif ! ensure_azure_login; then
+  add_error "Unable to establish refreshable Azure authentication" infra
+  azure_ready=false
+elif ! az account set --subscription "$TARGET_SUBSCRIPTION_ID"; then
   add_error "Unable to select Azure subscription $TARGET_SUBSCRIPTION_ID" infra
   azure_ready=false
 else

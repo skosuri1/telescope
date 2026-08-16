@@ -86,6 +86,7 @@ ACNS_CLUSTER_SCOPED_RESOURCES = (
 ACNS_NAMESPACE = "acns-telemetry"
 
 MONITORING_NAMESPACE = "monitoring"
+MONITORING_API_GROUP = "monitoring.coreos.com"
 
 # Core/RBAC resource kinds always checked in "monitoring", mirrored verbatim
 # from scenario-health-gate.sh's baseline resource_arg so both tools agree on
@@ -248,13 +249,41 @@ def kubectl_delete(kubeconfig, kind, name, timeout_seconds, namespace=None, wait
     _run_kubectl(cmd, timeout_seconds + 5)
 
 
-def discover_monitoring_resource_types(kubeconfig, timeout_seconds) -> List[str]:
+def discover_monitoring_resource_types(kubeconfig, timeout_seconds) -> dict:
     cmd = _base_cmd(kubeconfig, timeout_seconds) + [
-        "api-resources", "--api-group=monitoring.coreos.com",
-        "--verbs=list", "--namespaced=true", "-o", "name",
+        "api-resources", f"--api-group={MONITORING_API_GROUP}",
+        "--verbs=list", "--namespaced=true", "-o", "json",
     ]
     stdout = _run_kubectl(cmd, timeout_seconds)
-    return [line.strip() for line in stdout.splitlines() if line.strip()]
+    try:
+        payload = json.loads(stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise ReconcileError(
+            f"kubectl returned invalid monitoring API discovery JSON: {exc}"
+        ) from exc
+    resources = payload.get("resources")
+    if not isinstance(resources, list):
+        raise ReconcileError(
+            "monitoring API discovery response was not an APIResourceList"
+        )
+
+    resource_by_kind = {}
+    for item in resources:
+        name = item.get("name")
+        kind = item.get("kind")
+        if not isinstance(name, str) or not name or "/" in name:
+            continue
+        if not isinstance(kind, str) or not kind:
+            continue
+        resource = f"{name}.{MONITORING_API_GROUP}"
+        existing = resource_by_kind.get(kind)
+        if existing is not None and existing != resource:
+            raise ReconcileError(
+                f"monitoring API kind {kind!r} maps to multiple resources: "
+                f"{existing!r}, {resource!r}"
+            )
+        resource_by_kind[kind] = resource
+    return resource_by_kind
 
 
 # ---------------------------------------------------------------------------
@@ -278,15 +307,22 @@ def list_scenario_namespaces(kubeconfig, namespace_prefix, timeout_seconds) -> L
     return sorted(names)
 
 
-def list_monitoring_targets(kubeconfig, timeout_seconds) -> List[Tuple[str, str]]:
+def list_monitoring_targets(
+    kubeconfig, timeout_seconds
+) -> List[Tuple[str, str, str]]:
     try:
-        discovered_types = discover_monitoring_resource_types(kubeconfig, timeout_seconds)
+        discovered_types = discover_monitoring_resource_types(
+            kubeconfig, timeout_seconds
+        )
     except ReconcileError as exc:
         if _is_absent_resource_error(exc):
-            discovered_types = []
+            discovered_types = {}
         else:
             raise
-    resource_arg = ",".join(MONITORING_BASELINE_RESOURCE_TYPES + tuple(discovered_types))
+    resource_arg = ",".join(
+        MONITORING_BASELINE_RESOURCE_TYPES
+        + tuple(sorted(discovered_types.values()))
+    )
     payload = kubectl_get_optional_json(
         kubeconfig, [resource_arg], timeout_seconds, namespace=MONITORING_NAMESPACE
     )
@@ -304,7 +340,8 @@ def list_monitoring_targets(kubeconfig, timeout_seconds) -> List[Tuple[str, str]
         if any(name.startswith(prefix) for prefix in MONITORING_PROTECTED_PREFIXES):
             continue
         if any(name.startswith(prefix) for prefix in MONITORING_ALLOWLIST_PREFIXES):
-            targets.append((kind, name))
+            resource = discovered_types.get(kind, kind.lower())
+            targets.append((resource, kind, name))
     return sorted(targets)
 
 
@@ -341,8 +378,12 @@ def gather_targets(kubeconfig, namespace_prefix, timeout_seconds) -> List[Target
         if kubectl_object_exists(kubeconfig, resource, name, timeout_seconds):
             targets.append(TargetRef(resource, kind, name))
 
-    for kind, name in list_monitoring_targets(kubeconfig, timeout_seconds):
-        targets.append(TargetRef(kind.lower(), kind, name, namespace=MONITORING_NAMESPACE))
+    for resource, kind, name in list_monitoring_targets(
+        kubeconfig, timeout_seconds
+    ):
+        targets.append(
+            TargetRef(resource, kind, name, namespace=MONITORING_NAMESPACE)
+        )
 
     for kind, name in list_exporter_rbac_targets(kubeconfig, timeout_seconds):
         targets.append(TargetRef(kind.lower(), kind, name))

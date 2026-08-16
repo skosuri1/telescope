@@ -168,6 +168,46 @@ func TestSortedRunReordersByTargetLabelsAndStoresOnlyRefs(t *testing.T) {
 	}
 }
 
+func TestTargetLabelsAllowsMatchingConstantsIdempotently(t *testing.T) {
+	source := labels.FromStrings(
+		"__name__", "metric",
+		"build", "76954",
+		"run", "76575-f36f3d5a",
+	)
+	constants := []labels.Label{
+		{Name: "build", Value: "76954"},
+		{Name: "run", Value: "76575-f36f3d5a"},
+		{Name: "tier", Value: "n100_debug_resume"},
+	}
+
+	got, err := targetLabels(source, constants)
+	if err != nil {
+		t.Fatalf("matching existing labels should be idempotent: %v", err)
+	}
+	want := labels.FromStrings(
+		"__name__", "metric",
+		"build", "76954",
+		"run", "76575-f36f3d5a",
+		"tier", "n100_debug_resume",
+	)
+	if !labels.Equal(got, want) {
+		t.Fatalf("unexpected idempotent target labels: got %s, want %s", got, want)
+	}
+	if got.Len() != want.Len() {
+		t.Fatalf("matching constants were duplicated: got %s", got)
+	}
+}
+
+func TestTargetLabelsRejectsConflictingConstants(t *testing.T) {
+	source := labels.FromStrings("__name__", "metric", "build", "old-build")
+	constants := []labels.Label{{Name: "build", Value: "new-build"}}
+
+	_, err := targetLabels(source, constants)
+	if err == nil || !strings.Contains(err.Error(), "expected \"new-build\"") {
+		t.Fatalf("expected conflicting-label error, got %v", err)
+	}
+}
+
 func TestNormalizeChunkMetasSortsAndDeduplicates(t *testing.T) {
 	chunk10 := chunks.Meta{Ref: 10, MinTime: 0, MaxTime: 9}
 	chunk20 := chunks.Meta{Ref: 20, MinTime: 10, MaxTime: 19}

@@ -74,14 +74,22 @@ state_path = Path(os.environ["FAKE_AZ_STATE"])
 with log_path.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(args) + "\\n")
 
+def option(name):
+    return args[args.index(name) + 1]
+
 if args[:2] == ["account", "set"]:
     sys.exit(0)
 if args[:2] == ["account", "show"]:
     print(os.environ["FAKE_AZ_SUBSCRIPTION_ID"])
     sys.exit(0)
-
-def option(name):
-    return args[args.index(name) + 1]
+if args[:1] == ["login"]:
+    if option("--federated-token") != "fresh-oidc-token":
+        sys.exit(20)
+    if option("--username") != "client-id":
+        sys.exit(21)
+    if option("--tenant") != "tenant-id":
+        sys.exit(22)
+    sys.exit(0)
 
 state = (
     json.loads(state_path.read_text(encoding="utf-8"))
@@ -107,6 +115,23 @@ if args[:3] == ["storage", "blob", "show"]:
     print(state[blob_name])
     sys.exit(0)
 sys.exit(19)
+""",
+    )
+    fake_curl = fake_bin / "curl"
+    _write_executable(
+        fake_curl,
+        """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if "Authorization: Bearer request-token" not in args:
+    sys.exit(31)
+count_path = Path(os.environ["FAKE_CURL_COUNT"])
+count = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+count_path.write_text(str(count + 1), encoding="utf-8")
+print('{"oidcToken":"fresh-oidc-token"}')
 """,
     )
     relabel = tmp_path / "fake-relabel.sh"
@@ -148,6 +173,8 @@ def _run_helper(
     lifecycle_only: bool = False,
     upload_sleep_seconds: str = "0",
     outer_timeout_seconds: int | None = None,
+    oidc_refresh: bool = False,
+    oidc_refresh_interval_seconds: str = "2700",
 ) -> subprocess.CompletedProcess[str]:
     fake_bin, az_log, relabel_log = _setup_fakes(
         tmp_path, relabel_should_fail=relabel_should_fail
@@ -175,9 +202,29 @@ def _run_helper(
             "FAKE_AZ_FAIL_UPLOAD_PATTERN": fail_upload_pattern,
             "FAKE_AZ_UPLOAD_SLEEP_SECONDS": upload_sleep_seconds,
             "FAKE_RELABEL_LOG": str(relabel_log),
+            "FAKE_CURL_COUNT": str(tmp_path / "curl-count"),
             "PRESERVE_LIFECYCLE_ONLY": "true" if lifecycle_only else "false",
+            "CL2_REQUIRE_AZURE_OIDC_REFRESH": (
+                "true" if oidc_refresh else "false"
+            ),
+            "AZURE_OIDC_REFRESH_INTERVAL_SECONDS": (
+                oidc_refresh_interval_seconds
+            ),
         }
     )
+    if oidc_refresh:
+        env.update(
+            {
+                "SYSTEM_OIDCREQUESTURI": (
+                    "https://dev.azure.com/test/_apis/distributedtask/"
+                    "hubs/build/plans/plan/jobs/job/oidctoken"
+                ),
+                "SYSTEM_ACCESSTOKEN": "request-token",
+                "AZURESUBSCRIPTION_SERVICE_CONNECTION_ID": "connection-id",
+                "AZURESUBSCRIPTION_CLIENT_ID": "client-id",
+                "AZURESUBSCRIPTION_TENANT_ID": "tenant-id",
+            }
+        )
     command = ["bash", str(SCRIPT)]
     if outer_timeout_seconds is not None:
         command = [
@@ -373,6 +420,37 @@ def test_snapshot_upload_failure_preserves_local_file(tmp_path):
     assert summary["uploaded_snapshot_count"] == 0
     assert summary["missing_snapshot_roles"] == ["mesh-1"]
     assert any("Upload failed" in error for error in summary["errors"])
+
+
+def test_oidc_refresh_reauthenticates_during_long_uploads(tmp_path):
+    scenario_dir = tmp_path / "share-infra-1"
+    worker_summary = scenario_dir / "worker-summary.json"
+    scenario_dir.mkdir(parents=True)
+    (scenario_dir / "scenario-policy.json").write_text(
+        '{"suite_continue": true}\n', encoding="utf-8"
+    )
+
+    result = _run_helper(
+        tmp_path,
+        scenario_dir,
+        worker_summary,
+        lifecycle_only=True,
+        oidc_refresh=True,
+        oidc_refresh_interval_seconds="0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = _az_calls(tmp_path / "az-log.jsonl")
+    login_calls = [call for call in calls if call[:1] == ["login"]]
+    curl_count = int((tmp_path / "curl-count").read_text(encoding="utf-8"))
+    assert len(login_calls) >= 3
+    assert curl_count == len(login_calls)
+    assert all(
+        call[call.index("--federated-token") + 1] == "fresh-oidc-token"
+        for call in login_calls
+    )
+    assert "request-token" not in result.stdout
+    assert "request-token" not in result.stderr
 
 
 def test_disabled_snapshots_are_noop(tmp_path):

@@ -56,7 +56,7 @@ class FakeCleanupCluster:
         self.acns_cnm_present = False
         self.monitoring_objects = []  # list of (kind, name)
         self.cluster_rbac_objects = []  # list of (kind, name)
-        self.monitoring_discovered_types = []
+        self.monitoring_discovered_types = []  # list of (resource name, kind)
         self.transient_get_failures = transient_get_failures
         self.stuck_namespaces = set(stuck_namespaces)
         self.delete_calls = []
@@ -80,8 +80,23 @@ class FakeCleanupCluster:
              timeout=None, check=False):
         del input, capture_output, text, timeout, check  # unused; fake honors them implicitly
         if "api-resources" in cmd:
-            body = "\n".join(self.monitoring_discovered_types)
-            return _completed(body + ("\n" if body else ""))
+            return _completed(
+                json.dumps(
+                    {
+                        "kind": "APIResourceList",
+                        "apiVersion": "v1",
+                        "resources": [
+                            {
+                                "name": resource,
+                                "kind": kind,
+                                "namespaced": True,
+                                "verbs": ["delete", "get", "list"],
+                            }
+                            for resource, kind in self.monitoring_discovered_types
+                        ],
+                    }
+                )
+            )
         if "get" in cmd:
             if self.transient_get_failures > 0:
                 self.transient_get_failures -= 1
@@ -146,9 +161,21 @@ class FakeCleanupCluster:
             elif kind == "containernetworkmetric":
                 self.acns_cnm_present = False
             else:
+                monitoring_kind = next(
+                    (
+                        discovered_kind
+                        for resource, discovered_kind
+                        in self.monitoring_discovered_types
+                        if kind
+                        == f"{resource}.{reconciler.MONITORING_API_GROUP}"
+                    ),
+                    kind,
+                )
                 self.monitoring_objects = [
                     (k, n) for (k, n) in self.monitoring_objects
-                    if not (k.lower() == kind and n == name)
+                    if not (
+                        k.lower() == monitoring_kind.lower() and n == name
+                    )
                 ]
                 self.cluster_rbac_objects = [
                     (k, n) for (k, n) in self.cluster_rbac_objects
@@ -307,7 +334,38 @@ def test_monitoring_allowlist_deleted_protected_baseline_remains(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 6. Transient API failure is retried, not treated as zero
+# 6. Monitoring CR deletion uses the fully qualified API resource
+# ---------------------------------------------------------------------------
+
+def test_monitoring_cr_deletion_uses_fully_qualified_resource(monkeypatch):
+    """AKS also installs azmonitoring.coreos.com PodMonitor resources.
+
+    A bare `kubectl delete podmonitor` resolves to that API group and misses
+    the Prometheus-operator object discovered from monitoring.coreos.com.
+    """
+    cluster = FakeCleanupCluster()
+    cluster.monitoring_discovered_types = [
+        ("podmonitors", "PodMonitor"),
+        ("servicemonitors", "ServiceMonitor"),
+    ]
+    cluster.add_monitoring_object("PodMonitor", "kvstoremesh-standalone-0")
+
+    result = _reconcile(monkeypatch, cluster, "propagation-probe")
+
+    assert result["status"] == "ok"
+    assert result["deleted"] == [
+        "monitoring/PodMonitor/kvstoremesh-standalone-0"
+    ]
+    assert (
+        "podmonitors.monitoring.coreos.com",
+        "kvstoremesh-standalone-0",
+        "monitoring",
+    ) in cluster.delete_calls
+    assert not cluster.monitoring_objects
+
+
+# ---------------------------------------------------------------------------
+# 7. Transient API failure is retried, not treated as zero
 # ---------------------------------------------------------------------------
 
 def test_transient_api_failure_is_retried(monkeypatch):
@@ -322,7 +380,7 @@ def test_transient_api_failure_is_retried(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 7. Stuck namespace produces a failure summary (never fabricates success)
+# 8. Stuck namespace produces a failure summary (never fabricates success)
 # ---------------------------------------------------------------------------
 
 def test_stuck_namespace_produces_failure_summary(monkeypatch):
@@ -353,7 +411,7 @@ def test_persistent_api_failure_fails_cleanly_without_fabricating_success(monkey
 
 
 # ---------------------------------------------------------------------------
-# 8. Multiple clusters aggregate correctly
+# 9. Multiple clusters aggregate correctly
 # ---------------------------------------------------------------------------
 
 def test_reconcile_all_aggregates_multiple_clusters(monkeypatch, tmp_path):
@@ -406,7 +464,7 @@ def test_reconcile_all_aggregates_multiple_clusters(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 9. Invalid scenario / invalid config fails cleanly (main())
+# 10. Invalid scenario / invalid config fails cleanly (main())
 # ---------------------------------------------------------------------------
 
 def test_main_unknown_scenario_fails_cleanly(tmp_path, capsys):

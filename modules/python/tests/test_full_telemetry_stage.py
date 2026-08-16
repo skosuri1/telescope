@@ -1002,6 +1002,27 @@ def test_execute_yml_final_lifecycle_preservation_wiring():
     assert "final_lifecycle_budget" in template
 
 
+def test_execute_yml_wires_refreshable_azure_authentication():
+    """The multi-hour CL2 task must not rely on its initial short-lived
+    workload-identity assertion for per-scenario Blob preservation."""
+    template = EXECUTE_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    credential_step = template.index(
+        'displayName: "Prepare refreshable Azure credentials"'
+    )
+    execute_step = template.index(
+        'displayName: "Run CL2 across all clustermesh clusters"'
+    )
+    assert credential_step < execute_step
+    assert "AZURESUBSCRIPTION_SERVICE_CONNECTION_ID" in template
+    assert "CL2_AZURE_SERVICE_CONNECTION_ID" in template
+    assert "CL2_AZURE_CLIENT_ID" in template
+    assert "CL2_AZURE_TENANT_ID" in template
+    assert "CL2_REQUIRE_AZURE_OIDC_REFRESH: \"true\"" in template
+    assert "SYSTEM_OIDCREQUESTURI: $(System.OidcRequestUri)" in template
+    assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in template
+
+
 def test_execute_yml_wait_propagation_probe_is_bounded():
     """Fix: wait_propagation_probe must never use an unbounded shell
     `wait` on the host-side propagation-probe orchestrator's PID -- it

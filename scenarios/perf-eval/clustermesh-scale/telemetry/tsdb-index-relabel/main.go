@@ -1846,15 +1846,26 @@ func mergeLabels(source labels.Labels, constants []labels.Label) labels.Labels {
 	source.Range(func(label labels.Label) {
 		merged = append(merged, label)
 	})
-	merged = append(merged, constants...)
+	for _, constant := range constants {
+		if !source.Has(constant.Name) {
+			merged = append(merged, constant)
+		}
+	}
 	return labels.New(merged...)
 }
 
 func targetLabels(source labels.Labels, constants []labels.Label) (labels.Labels, error) {
 	canonical := canonicalizeLabels(source)
 	for _, constant := range constants {
-		if canonical.Has(constant.Name) {
-			return labels.EmptyLabels(), fmt.Errorf("label %q already exists in %s", constant.Name, canonical)
+		if canonical.Has(constant.Name) &&
+			canonical.Get(constant.Name) != constant.Value {
+			return labels.EmptyLabels(), fmt.Errorf(
+				"label %q already exists with value %q, expected %q in %s",
+				constant.Name,
+				canonical.Get(constant.Name),
+				constant.Value,
+				canonical,
+			)
 		}
 	}
 	return mergeLabels(canonical, constants), nil
