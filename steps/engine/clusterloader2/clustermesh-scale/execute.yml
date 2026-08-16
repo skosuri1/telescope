@@ -16,26 +16,6 @@ steps:
       echo "##vso[task.setvariable variable=START_TIME]$startTimestamp"
     displayName: set up timestamp variable
 
-  - ${{ if eq(parameters.cloud, 'azure') }}:
-      - task: AzureCLI@2
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          addSpnToEnvironment: true
-          inlineScript: |
-            set -euo pipefail
-            : "${AZURESUBSCRIPTION_SERVICE_CONNECTION_ID:?service connection ID is unavailable}"
-            : "${servicePrincipalId:?service principal ID is unavailable}"
-            : "${tenantId:?tenant ID is unavailable}"
-            printf '##vso[task.setvariable variable=CL2_AZURE_SERVICE_CONNECTION_ID;issecret=true]%s\n' \
-              "$AZURESUBSCRIPTION_SERVICE_CONNECTION_ID"
-            printf '##vso[task.setvariable variable=CL2_AZURE_CLIENT_ID;issecret=true]%s\n' \
-              "$servicePrincipalId"
-            printf '##vso[task.setvariable variable=CL2_AZURE_TENANT_ID;issecret=true]%s\n' \
-              "$tenantId"
-        displayName: "Prepare refreshable Azure credentials"
-
   - script: |
       set -eo pipefail
       set -x
@@ -2544,9 +2524,9 @@ steps:
         CL2_REQUIRE_AZURE_OIDC_REFRESH: "true"
         SYSTEM_OIDCREQUESTURI: $(System.OidcRequestUri)
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-        AZURESUBSCRIPTION_SERVICE_CONNECTION_ID: $(CL2_AZURE_SERVICE_CONNECTION_ID)
-        AZURESUBSCRIPTION_CLIENT_ID: $(CL2_AZURE_CLIENT_ID)
-        AZURESUBSCRIPTION_TENANT_ID: $(CL2_AZURE_TENANT_ID)
+        AZURESUBSCRIPTION_SERVICE_CONNECTION_ID: $(AZURE_SERVICE_CONNECTION_ID)
+        AZURESUBSCRIPTION_CLIENT_ID: $(SP_CLIENT_ID)
+        AZURESUBSCRIPTION_TENANT_ID: $(TENANT_ID)
       ${{ else }}:
         CLOUD: ${{ parameters.cloud }}
       REGION: ${{ parameters.region }}

@@ -21,6 +21,8 @@ steps:
       echo "##vso[task.setvariable variable=SP_CLIENT_ID;issecret=true]$servicePrincipalId"
       echo "##vso[task.setvariable variable=SP_ID_TOKEN;issecret=true]$idToken"
       echo "##vso[task.setvariable variable=TENANT_ID;issecret=true]$tenantId"
+      printf '##vso[task.setvariable variable=AZURE_SERVICE_CONNECTION_ID;issecret=true]%s\n' \
+        "$AZURESUBSCRIPTION_SERVICE_CONNECTION_ID"
     addSpnToEnvironment: true
   displayName: 'Get login credentials'
   condition: ${{ parameters.condition }}
