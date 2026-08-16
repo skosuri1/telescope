@@ -1141,26 +1141,18 @@ steps:
         # command exhausts its 30s timeout after checking only a subset even
         # when every node is already Ready. Use one list snapshot per poll.
         node_readiness_snapshot() {
-          local snapshot summary snapshot_rc=0 xtrace_enabled=false
+          local snapshot summary snapshot_rc=0 xtrace_state
           NODE_READY_TOTAL=0
           NODE_NOT_READY_COUNT=0
           NODE_NOT_READY_NAMES=""
           NODE_READINESS_ERROR=""
 
-          # The parent validation task runs with `set -x`; tracing this
-          # assignment emits the full 103-node JSON document on every poll.
-          # Suppress xtrace only for the raw capture, then restore it before
-          # interpreting or reporting the bounded command result.
-          if [[ "$-" == *x* ]]; then
-            xtrace_enabled=true
-            set +x
-          fi
+          xtrace_state=$-
+          set +x
           snapshot=$(
             kubectl --request-timeout=25s get nodes -o json 2>&1
           ) || snapshot_rc=$?
-          if [ "$xtrace_enabled" = "true" ]; then
-            set -x
-          fi
+          [[ "$xtrace_state" != *x* ]] || set -x
           if [ "$snapshot_rc" -ne 0 ]; then
             NODE_READINESS_ERROR="$snapshot"
             return 2

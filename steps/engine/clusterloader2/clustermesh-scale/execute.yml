@@ -2521,12 +2521,7 @@ steps:
     env:
       ${{ if eq(parameters.cloud, 'azure') }}:
         CLOUD: aks
-        CL2_REQUIRE_AZURE_OIDC_REFRESH: "true"
-        SYSTEM_OIDCREQUESTURI: $(System.OidcRequestUri)
-        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-        AZURESUBSCRIPTION_SERVICE_CONNECTION_ID: $(AZURE_SERVICE_CONNECTION_ID)
-        AZURESUBSCRIPTION_CLIENT_ID: $(SP_CLIENT_ID)
-        AZURESUBSCRIPTION_TENANT_ID: $(TENANT_ID)
+        AZURE_OIDC_CONTEXT_B64: $(AZURE_OIDC_CONTEXT_B64)
       ${{ else }}:
         CLOUD: ${{ parameters.cloud }}
       REGION: ${{ parameters.region }}

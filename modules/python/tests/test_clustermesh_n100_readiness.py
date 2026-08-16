@@ -150,7 +150,7 @@ def test_node_readiness_has_final_recovery_grace_before_failure():
         validate.index("node_readiness_snapshot()"):
         validate.index("node_ready_initial_deadline")
     ]
-    assert 'if [[ "$-" == *x* ]]; then' in snapshot_capture
+    assert "xtrace_state=$-" in snapshot_capture
     assert "set +x" in snapshot_capture
     assert "set -x" in snapshot_capture
     assert snapshot_capture.index("set +x") < snapshot_capture.index(
@@ -158,7 +158,7 @@ def test_node_readiness_has_final_recovery_grace_before_failure():
     )
     assert snapshot_capture.index(
         "kubectl --request-timeout=25s get nodes -o json"
-    ) < snapshot_capture.index("\n            set -x\n")
+    ) < snapshot_capture.index('[[ "$xtrace_state" != *x* ]] || set -x')
 
 
 def test_cilium_status_exec_has_wall_clock_and_command_timeouts():

@@ -114,6 +114,31 @@ add_error() {
   echo "$message" >&2
 }
 
+load_azure_oidc_context() {
+  local decoded
+
+  if [ -z "${AZURE_OIDC_CONTEXT_B64:-}" ]; then
+    return 0
+  fi
+  if ! decoded=$(
+    printf '%s' "$AZURE_OIDC_CONTEXT_B64" | base64 --decode 2>/dev/null
+  ); then
+    add_error "Refreshable Azure authentication context is invalid" infra
+    return 1
+  fi
+  if ! SYSTEM_OIDCREQUESTURI=$(jq -er '.request_uri' <<<"$decoded") ||
+     ! SYSTEM_ACCESSTOKEN=$(jq -er '.request_token' <<<"$decoded") ||
+     ! AZURESUBSCRIPTION_SERVICE_CONNECTION_ID=$(
+       jq -er '.service_connection_id' <<<"$decoded"
+     ) ||
+     ! AZURESUBSCRIPTION_CLIENT_ID=$(jq -er '.client_id' <<<"$decoded") ||
+     ! AZURESUBSCRIPTION_TENANT_ID=$(jq -er '.tenant_id' <<<"$decoded"); then
+    add_error "Refreshable Azure authentication context is malformed" infra
+    return 1
+  fi
+  CL2_REQUIRE_AZURE_OIDC_REFRESH=true
+}
+
 configure_azure_oidc_refresh() {
   local required="${CL2_REQUIRE_AZURE_OIDC_REFRESH:-false}"
   local present=0
@@ -476,12 +501,13 @@ if [ "${lifecycle_only,,}" != "true" ]; then
     add_error "Relabel script does not exist: $RELABEL_SCRIPT"
   fi
 fi
-for command_name in az jq gzip tar stat find sort; do
+for command_name in az jq gzip tar stat find sort base64; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     add_error "Required command is unavailable: $command_name" infra
   fi
 done
-if ! configure_azure_oidc_refresh; then
+if ! load_azure_oidc_context ||
+   ! configure_azure_oidc_refresh; then
   azure_oidc_configuration_valid=false
 fi
 if [ "$azure_oidc_refresh_enabled" = "true" ]; then

@@ -1,5 +1,6 @@
 """Tests for per-scenario ClusterMesh artifact preservation."""
 
+import base64
 import json
 import os
 import subprocess
@@ -213,16 +214,23 @@ def _run_helper(
         }
     )
     if oidc_refresh:
+        oidc_context = base64.b64encode(
+            json.dumps(
+                {
+                    "request_uri": (
+                        "https://dev.azure.com/test/_apis/distributedtask/"
+                        "hubs/build/plans/plan/jobs/job/oidctoken"
+                    ),
+                    "request_token": "request-token",
+                    "service_connection_id": "connection-id",
+                    "client_id": "client-id",
+                    "tenant_id": "tenant-id",
+                }
+            ).encode("utf-8")
+        ).decode("ascii")
         env.update(
             {
-                "SYSTEM_OIDCREQUESTURI": (
-                    "https://dev.azure.com/test/_apis/distributedtask/"
-                    "hubs/build/plans/plan/jobs/job/oidctoken"
-                ),
-                "SYSTEM_ACCESSTOKEN": "request-token",
-                "AZURESUBSCRIPTION_SERVICE_CONNECTION_ID": "connection-id",
-                "AZURESUBSCRIPTION_CLIENT_ID": "client-id",
-                "AZURESUBSCRIPTION_TENANT_ID": "tenant-id",
+                "AZURE_OIDC_CONTEXT_B64": oidc_context,
             }
         )
     command = ["bash", str(SCRIPT)]

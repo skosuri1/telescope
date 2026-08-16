@@ -64,6 +64,13 @@ EXECUTE_TEMPLATE_PATH = (
 AZURE_LOGIN_TEMPLATE_PATH = (
     REPOSITORY_ROOT / "steps" / "cloud" / "azure" / "login.yml"
 )
+AZURE_OIDC_EXPORT_PATH = (
+    REPOSITORY_ROOT
+    / "steps"
+    / "cloud"
+    / "azure"
+    / "export-oidc-context.sh"
+)
 MOCK_EXECUTE_TEMPLATE_PATH = (
     REPOSITORY_ROOT
     / "steps"
@@ -1010,20 +1017,15 @@ def test_execute_yml_wires_refreshable_azure_authentication():
     workload-identity assertion for per-scenario Blob preservation."""
     template = EXECUTE_TEMPLATE_PATH.read_text(encoding="utf-8")
     login_template = AZURE_LOGIN_TEMPLATE_PATH.read_text(encoding="utf-8")
+    oidc_export = AZURE_OIDC_EXPORT_PATH.read_text(encoding="utf-8")
 
     assert "Prepare refreshable Azure credentials" not in template
-    assert "AZURESUBSCRIPTION_SERVICE_CONNECTION_ID" in template
-    assert "AZURE_SERVICE_CONNECTION_ID" in template
-    assert "$(SP_CLIENT_ID)" in template
-    assert "$(TENANT_ID)" in template
-    assert "CL2_REQUIRE_AZURE_OIDC_REFRESH: \"true\"" in template
-    assert "SYSTEM_OIDCREQUESTURI: $(System.OidcRequestUri)" in template
-    assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in template
-    assert (
-        "variable=AZURE_SERVICE_CONNECTION_ID;issecret=true"
-        in login_template
-    )
-    assert "AZURESUBSCRIPTION_SERVICE_CONNECTION_ID" in login_template
+    assert "AZURE_OIDC_CONTEXT_B64: $(AZURE_OIDC_CONTEXT_B64)" in template
+    assert "export-oidc-context.sh" in login_template
+    assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in login_template
+    assert "SYSTEM_OIDCREQUESTURI: $(System.OidcRequestUri)" in login_template
+    assert "AZURESUBSCRIPTION_SERVICE_CONNECTION_ID" in oidc_export
+    assert "variable=AZURE_OIDC_CONTEXT_B64;issecret=true" in oidc_export
 
 
 def test_execute_yml_wait_propagation_probe_is_bounded():
