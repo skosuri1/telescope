@@ -132,13 +132,20 @@ def test_node_readiness_has_final_recovery_grace_before_failure():
 
     assert "CLUSTERMESH_NODE_READY_TIMEOUT_SECONDS:-900" in validate
     assert "CLUSTERMESH_NODE_READY_GRACE_SECONDS:-300" in validate
+    assert "node_readiness_snapshot()" in validate
+    assert 'kubectl --request-timeout=25s get nodes -o json' in validate
+    assert "node_ready_initial_deadline" in validate
+    assert "node_ready_final_deadline" in validate
     grace = validate.index("initial node readiness budget exhausted")
-    recovered = validate.index("all nodes recovered during final readiness grace")
     failure = validate.index(
         "node readiness timeout after ${node_ready_total_seconds}s"
     )
-    assert grace < recovered < failure
-    assert '--timeout="${node_ready_grace_seconds}s"' in validate
+    assert grace < failure
+    assert 'if [ "$node_ready_grace_announced" -eq 1 ]; then' in validate
+    assert "all nodes recovered during final readiness grace" in validate
+    assert "kubectl wait --for=condition=Ready nodes --all" not in validate
+    assert "NODE_NOT_READY_COUNT" in validate
+    assert "NODE_NOT_READY_NAMES" in validate
 
 
 def test_cilium_status_exec_has_wall_clock_and_command_timeouts():
