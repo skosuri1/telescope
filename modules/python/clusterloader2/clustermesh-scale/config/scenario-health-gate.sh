@@ -669,7 +669,6 @@ started_epoch=$(date +%s)
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 deadline=$((started_epoch + timeout_seconds))
 stable_since=""
-stable_fingerprints='{}'
 last_observations='[]'
 
 write_summary() {
@@ -712,6 +711,7 @@ write_summary() {
       kubectl_request_timeout_seconds: $kubectl_request_timeout_seconds,
       expected_mock_count: $expected_mock_count,
       expected_remote_count: $expected_remote_count,
+      quiet_window_basis: "continuous-health",
       stable_seconds: $stable_seconds,
       clusters: $clusters
     }' > "$partial" &&
@@ -737,31 +737,26 @@ while true; do
 
   unhealthy_count=$(jq '[.[] | select(.healthy | not)] | length' \
     <<<"$observations")
-  fingerprints=$(jq -c \
-    'map({key: .role, value: .fingerprint.value}) | from_entries' \
-    <<<"$observations")
 
   if [ "$unhealthy_count" -eq 0 ]; then
-    if [ -z "$stable_since" ] ||
-       [ "$fingerprints" != "$stable_fingerprints" ]; then
-      if [ -n "$stable_since" ]; then
-        echo "Health fingerprint changed; resetting quiet window: ${stable_fingerprints} -> ${fingerprints}" >&2
-      else
-        echo "All clusters healthy; starting ${quiet_window_seconds}s quiet window."
-      fi
+    # CEP and CiliumIdentity totals naturally converge and garbage-collect
+    # after workload cleanup. They remain in each observation's diagnostic
+    # fingerprint, but exact count equality is not a health invariant. Any
+    # actual unsafe transition is represented by healthy=false below and
+    # resets the quiet window.
+    if [ -z "$stable_since" ]; then
+      echo "All clusters healthy; starting ${quiet_window_seconds}s continuous-health window."
       stable_since="$now"
-      stable_fingerprints="$fingerprints"
     fi
     stable_seconds=$((now - stable_since))
     if [ "$stable_seconds" -ge "$quiet_window_seconds" ]; then
       write_summary true
-      echo "ClusterMesh scenario health gate passed after ${stable_seconds}s stable: $summary_file"
+      echo "ClusterMesh scenario health gate passed after ${stable_seconds}s continuously healthy: $summary_file"
       exit 0
     fi
-    echo "All clusters healthy and stable for ${stable_seconds}/${quiet_window_seconds}s."
+    echo "All clusters continuously healthy for ${stable_seconds}/${quiet_window_seconds}s."
   else
     stable_since=""
-    stable_fingerprints='{}'
     jq -r '
       .[] | select(.healthy | not)
       | "\(.role) (\(.name)): \(.failures | join("; "))"

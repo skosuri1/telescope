@@ -262,6 +262,7 @@ def test_health_gate_succeeds_after_transient_cleanup(tmp_path):
     assert summary["success"] is True
     assert summary["infrastructure_healthy"] is True
     assert summary["scenario"] == "pod-churn-combined"
+    assert summary["quiet_window_basis"] == "continuous-health"
     assert summary["stable_seconds"] == 2
     assert summary["clusters"][0]["healthy"] is True
     assert summary["clusters"][0]["cleanup"]["scenario_namespace_count"] == 0
@@ -288,7 +289,9 @@ def test_health_gate_succeeds_after_transient_cleanup(tmp_path):
     assert "ClusterRole/apiserver-backend-exporter-old" in result.stderr
 
 
-def test_health_gate_resets_quiet_window_when_fingerprint_changes(tmp_path):
+def test_health_gate_keeps_quiet_window_when_diagnostic_counts_change(
+    tmp_path,
+):
     result, summary, poll_count = _run_gate(
         tmp_path,
         "instability",
@@ -297,10 +300,12 @@ def test_health_gate_resets_quiet_window_when_fingerprint_changes(tmp_path):
     )
 
     assert result.returncode == 0
-    assert poll_count == 5
+    assert poll_count == 3
     assert summary["success"] is True
+    assert summary["quiet_window_basis"] == "continuous-health"
     assert summary["clusters"][0]["fingerprint"]["cilium_identities"] == 6
-    assert "Health fingerprint changed; resetting quiet window" in result.stderr
+    assert "Health fingerprint changed" not in result.stderr
+    assert "continuously healthy" in result.stdout
 
 
 def test_health_gate_times_out_with_actionable_summary(tmp_path):
