@@ -594,6 +594,17 @@ def test_amw_capacity_guard_accepts_headroom_and_rejects_throttling(tmp_path):
               {"name":{"value":"EventsPerMinuteIngestedPercentUtilization"},"timeseries":[{"data":[{"maximum":134.5995}]}]}
             ]}
             JSON
+            elif [ "${HIGH_ACTIVE_UTILIZATION:-false}" = "true" ]; then
+              cat <<'JSON'
+            {"value":[
+              {"name":{"value":"ActiveTimeSeries"},"timeseries":[{"data":[{"maximum":600000}]}]},
+              {"name":{"value":"ActiveTimeSeriesLimit"},"timeseries":[{"data":[{"maximum":1000000}]}]},
+              {"name":{"value":"ActiveTimeSeriesPercentUtilization"},"timeseries":[{"data":[{"maximum":60}]}]},
+              {"name":{"value":"EventsPerMinuteIngested"},"timeseries":[{"data":[{"maximum":300000}]}]},
+              {"name":{"value":"EventsPerMinuteIngestedLimit"},"timeseries":[{"data":[{"maximum":1000000}]}]},
+              {"name":{"value":"EventsPerMinuteIngestedPercentUtilization"},"timeseries":[{"data":[{"maximum":30}]}]}
+            ]}
+            JSON
             elif [ "${THROTTLED:-false}" = "true" ]; then
               cat <<'JSON'
             {"value":[
@@ -714,8 +725,33 @@ def test_amw_capacity_guard_accepts_headroom_and_rejects_throttling(tmp_path):
     assert "Status: **complete (above nominal utilization)**" in (
         markdown_path.read_text(encoding="utf-8")
     )
+    high_event_rebalance = subprocess.run(
+        ["bash", "-c", rebalance_command],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+    assert high_event_rebalance.returncode == 0
+    assert "advisory threshold" in high_event_rebalance.stderr
+    assert "zero LimitThrottling drops" in high_event_rebalance.stderr
 
     environment["HIGH_UTILIZATION"] = "false"
+    environment["HIGH_ACTIVE_UTILIZATION"] = "true"
+    high_active_rebalance = subprocess.run(
+        ["bash", "-c", rebalance_command],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+    assert high_active_rebalance.returncode != 0
+    assert "active-series utilization" in high_active_rebalance.stderr
+    assert "post-rebalance limit" in high_active_rebalance.stderr
+
+    environment["HIGH_ACTIVE_UTILIZATION"] = "false"
     environment["PARTIAL"] = "true"
     partial = subprocess.run(
         ["bash", "-c", command],
@@ -750,6 +786,16 @@ def test_amw_capacity_guard_accepts_headroom_and_rejects_throttling(tmp_path):
         "events_dropped": 200,
         "time_series_samples_dropped": 100,
     }
+    throttled_rebalance = subprocess.run(
+        ["bash", "-c", rebalance_command],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+    assert throttled_rebalance.returncode != 0
+    assert "LimitThrottling drops" in throttled_rebalance.stderr
 
     environment["THROTTLED"] = "false"
     environment["FAIL_QUERY"] = "true"

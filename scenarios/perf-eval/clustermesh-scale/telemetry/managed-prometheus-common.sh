@@ -322,18 +322,56 @@ amw_capacity_preflight_ok() {
 amw_capacity_rebalance_ok() {
   local summary_path="${1:?AMW capacity summary path is required}"
   local threshold="${2:-${AKS_AMW_PREFLIGHT_MAX_UTILIZATION_PERCENT:-50}}"
+  local query_succeeded has_samples samples_complete active_percent events_percent
+  local events_dropped samples_dropped
 
-  if ! amw_capacity_preflight_ok "$summary_path" "$threshold"; then
+  if ! [[ "$threshold" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "AKS_AMW_PREFLIGHT_MAX_UTILIZATION_PERCENT must be numeric." >&2
+    return 1
+  fi
+
+  log_amw_capacity_summary "$summary_path"
+  query_succeeded=$(jq -r '.query_succeeded' "$summary_path")
+  if [ "$query_succeeded" != "true" ]; then
+    echo "AMW capacity query did not succeed." >&2
+    return 1
+  fi
+  has_samples=$(jq -r '.has_capacity_samples' "$summary_path")
+  samples_complete=$(jq -r '.capacity_samples_complete' "$summary_path")
+  if [ "$has_samples" != "true" ] || [ "$samples_complete" != "true" ]; then
+    echo "AMW has not emitted complete post-rebalance capacity samples yet." >&2
     return 1
   fi
   if ! jq -e '
-      .has_capacity_samples == true and
-      .capacity_samples_complete == true and
       .capacity_samples.active_series == true and
       .capacity_samples.events_per_minute == true
     ' "$summary_path" >/dev/null; then
     echo "AMW has not emitted complete post-rebalance capacity samples yet." >&2
     return 1
+  fi
+
+  events_dropped=$(jq -r \
+    '.limit_throttling.events_dropped' \
+    "$summary_path")
+  samples_dropped=$(jq -r \
+    '.limit_throttling.time_series_samples_dropped' \
+    "$summary_path")
+  if awk -v events="$events_dropped" -v samples="$samples_dropped" \
+      'BEGIN {exit !(events > 0 || samples > 0)}'; then
+    echo "AMW reported recent LimitThrottling drops." >&2
+    return 1
+  fi
+
+  active_percent=$(jq -r '.active_series.maximum_percent' "$summary_path")
+  events_percent=$(jq -r '.events_per_minute.maximum_percent' "$summary_path")
+  if awk -v value="$active_percent" -v limit="$threshold" \
+      'BEGIN {exit !(value >= limit)}'; then
+    echo "AMW active-series utilization ${active_percent}% is at or above the ${threshold}% post-rebalance limit." >&2
+    return 1
+  fi
+  if awk -v value="$events_percent" -v limit="$threshold" \
+      'BEGIN {exit !(value >= limit)}'; then
+    echo "AMW event-rate utilization ${events_percent}% is at or above the ${threshold}% advisory threshold; accepting because complete samples show zero LimitThrottling drops." >&2
   fi
 }
 

@@ -1388,7 +1388,7 @@ if [ "${amw_rebalance_existing,,}" = "true" ]; then
     fi
   done
   if [ "$rebalance_capacity_verified" != "true" ]; then
-    echo "##vso[task.logissue type=error;] One-to-one Azure Monitor workspace rebalance did not reach the required no-drop capacity state." >&2
+    echo "##vso[task.logissue type=error;] One-to-one Azure Monitor workspace rebalance did not reach the required complete-sample, no-drop, active-series-headroom state." >&2
     exit 1
   fi
 else
