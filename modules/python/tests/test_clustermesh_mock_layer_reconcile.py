@@ -264,6 +264,7 @@ class FakeKubeCluster:
         healthy_real_node=HEALTHY_REAL_NODE,
         permanently_broken_pods=(),
         transient_get_failures=0,
+        delete_timeouts_after_side_effects=0,
     ):
         self.nodes = {}
         self.pods = {}  # (namespace, name) -> pod dict
@@ -279,6 +280,9 @@ class FakeKubeCluster:
         self.healthy_real_node = healthy_real_node
         self.permanently_broken_pods = set(permanently_broken_pods)
         self.transient_get_failures = transient_get_failures
+        self.delete_timeouts_after_side_effects = (
+            delete_timeouts_after_side_effects
+        )
         self.nodes[healthy_real_node] = {
             "metadata": {"name": healthy_real_node, "labels": {}},
             "spec": {},
@@ -339,7 +343,7 @@ class FakeKubeCluster:
 
     def run(self, cmd, input=None, capture_output=True, text=True,  # pylint: disable=redefined-builtin
              timeout=None, check=False):
-        del capture_output, text, timeout, check  # unused; fake honors them implicitly
+        del capture_output, text, check  # unused; fake honors them implicitly
         if "get" in cmd:
             self.get_calls.append(list(cmd))
         if "get" in cmd and self.transient_get_failures > 0:
@@ -441,6 +445,9 @@ class FakeKubeCluster:
                     self.nodes.pop(name, None)
                 elif kind == "pod":
                     self.pods.pop((namespace, name), None)
+            if self.delete_timeouts_after_side_effects > 0:
+                self.delete_timeouts_after_side_effects -= 1
+                raise subprocess.TimeoutExpired(cmd, timeout)
             return _completed("")
         raise AssertionError(f"unexpected fake kubectl invocation: {cmd}")
 
@@ -537,6 +544,7 @@ def test_missing_agent_pod_is_recreated(tmp_path, monkeypatch):
     assert result["recreated_agents"] == ["mock-cilium-agent-1"]
     assert result["recreated_nodes"] == []
     assert (NAMESPACE, "mock-cilium-agent-1") in cluster.pods
+    assert cluster.delete_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +720,154 @@ def test_mass_present_node_drift_can_recover_without_deletion(tmp_path, monkeypa
     assert cluster.apply_calls == []
 
 
+def test_mass_present_agent_drift_fails_safe_without_deletion(
+    tmp_path, monkeypatch,
+):
+    role = "mesh-1"
+    node_docs, agent_docs = write_state_dir(tmp_path, role, node_count=30)
+    cluster = FakeKubeCluster()
+    cluster.seed(node_docs, agent_docs)
+    for pod in cluster.pods.values():
+        pod["status"] = {
+            "phase": "Running",
+            "containerStatuses": [{"ready": False}],
+        }
+
+    result = _reconcile(
+        monkeypatch,
+        cluster,
+        role,
+        tmp_path,
+        attempts=2,
+        settle_seconds=0,
+    )
+
+    assert result["status"] == "failed"
+    assert any(
+        "unsafe systemic mock-agent drift" in error
+        for error in result["errors"]
+    )
+    assert result["repair_diagnostics"]["agents"]["problem_counts"] == [
+        {"problem": "container not Ready", "count": 30},
+    ]
+    assert cluster.delete_calls == []
+    assert cluster.apply_calls == []
+
+
+def test_mass_present_agent_drift_can_recover_without_deletion(
+    tmp_path, monkeypatch,
+):
+    role = "mesh-1"
+    node_docs, agent_docs = write_state_dir(tmp_path, role, node_count=30)
+    cluster = FakeKubeCluster()
+    cluster.seed(node_docs, agent_docs)
+    for pod in cluster.pods.values():
+        pod["status"] = {
+            "phase": "Running",
+            "containerStatuses": [{"ready": False}],
+        }
+
+    def recover_agents(_seconds):
+        for pod in cluster.pods.values():
+            pod["status"] = {
+                "phase": "Running",
+                "containerStatuses": [{"ready": True}],
+            }
+
+    monkeypatch.setattr(reconciler.time, "sleep", recover_agents)
+    result = _reconcile(
+        monkeypatch,
+        cluster,
+        role,
+        tmp_path,
+        attempts=2,
+        settle_seconds=1,
+    )
+
+    assert result["status"] == "ok"
+    assert result["errors"] == []
+    assert cluster.delete_calls == []
+    assert cluster.apply_calls == []
+
+
+def test_many_missing_agents_are_recreated_in_batches_without_delete(
+    tmp_path, monkeypatch,
+):
+    role = "mesh-1"
+    node_docs, _agent_docs = write_state_dir(
+        tmp_path, role, node_count=100,
+    )
+    cluster = FakeKubeCluster()
+    cluster.seed(node_docs, [])
+
+    result = _reconcile(monkeypatch, cluster, role, tmp_path)
+
+    assert result["status"] == "ok"
+    assert len(result["recreated_agents"]) == 100
+    assert cluster.delete_calls == []
+    assert cluster.delete_invocations == 0
+    assert cluster.apply_invocations == 5
+
+
+def test_present_agent_repairs_are_delete_apply_batched(
+    tmp_path, monkeypatch,
+):
+    role = "mesh-1"
+    node_docs, agent_docs = write_state_dir(
+        tmp_path, role, node_count=100,
+    )
+    cluster = FakeKubeCluster()
+    cluster.seed(node_docs, agent_docs)
+    for index in range(21):
+        cluster.pods[(NAMESPACE, f"mock-cilium-agent-{index}")]["status"] = {
+            "phase": "Failed",
+            "containerStatuses": [{"ready": False}],
+        }
+
+    result = _reconcile(monkeypatch, cluster, role, tmp_path)
+
+    assert result["status"] == "ok"
+    assert len(result["recreated_agents"]) == 21
+    assert cluster.delete_invocations == 2
+    assert cluster.apply_invocations == 2
+
+
+def test_delete_timeout_after_side_effects_recovers_missing_agents(
+    tmp_path, monkeypatch,
+):
+    """Reproduce build 76994: the API deletes a batch, but kubectl times out.
+
+    The next attempt must skip DELETE for those now-missing Pods and reach the
+    bounded apply path instead of repeatedly timing out on absent names.
+    """
+    role = "mesh-1"
+    node_docs, agent_docs = write_state_dir(
+        tmp_path, role, node_count=100,
+    )
+    cluster = FakeKubeCluster(delete_timeouts_after_side_effects=1)
+    cluster.seed(node_docs, agent_docs)
+    for index in range(21):
+        cluster.pods[(NAMESPACE, f"mock-cilium-agent-{index}")]["status"] = {
+            "phase": "Failed",
+            "containerStatuses": [{"ready": False}],
+        }
+
+    result = _reconcile(
+        monkeypatch,
+        cluster,
+        role,
+        tmp_path,
+        attempts=3,
+        settle_seconds=0,
+    )
+
+    assert result["status"] == "ok"
+    assert result["attempts_used"] == 3
+    assert len(result["recreated_agents"]) == 21
+    assert cluster.delete_invocations == 2
+    assert cluster.apply_invocations == 2
+
+
 def test_many_missing_nodes_are_recreated_without_tripping_mass_drift_fuse(
     tmp_path, monkeypatch,
 ):
@@ -731,7 +887,7 @@ def test_many_missing_nodes_are_recreated_without_tripping_mass_drift_fuse(
     assert len(result["recreated_nodes"]) == 30
     assert len(result["recreated_agents"]) == 30
     assert cluster.delete_invocations == 2
-    assert cluster.apply_invocations == 2
+    assert cluster.apply_invocations == 4
 
 
 def test_multi_object_repairs_are_batched_by_kind(tmp_path, monkeypatch):

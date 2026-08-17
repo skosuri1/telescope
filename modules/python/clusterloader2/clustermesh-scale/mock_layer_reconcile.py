@@ -73,6 +73,8 @@ SUPPORT_MANIFEST_FILES = {
     "rbac": "rbac.yaml",
 }
 
+REPAIR_BATCH_SIZE = 20
+
 
 class ReconcileError(Exception):
     """An expected, per-cluster reconciliation failure (bad state, kubectl error, ...).
@@ -1120,9 +1122,7 @@ def mass_present_node_drift(
     Nodes that simultaneously look unhealthy are different: deleting a large
     fraction can turn a transient controller/API-server transition into a full
     mock-layer outage. Refuse that bulk delete and let bounded retries observe
-    whether the shared condition clears. This fuse is deliberately Node-only:
-    Pods are replaceable scheduling units and batched agent-only repair does not
-    destroy the synthetic Node identities/CiliumNode state being measured.
+    whether the shared condition clears.
     """
     present_repairs = sum(
         1 for name in plan.nodes_to_recreate if name in kwok_nodes
@@ -1131,35 +1131,91 @@ def mass_present_node_drift(
     return present_repairs >= threshold, present_repairs, threshold
 
 
-def apply_repairs(kubeconfig: str, desired: DesiredState, plan: ReconcilePlan, timeout_seconds: float) -> None:
+def mass_present_agent_drift(
+    desired: DesiredState,
+    plan: ReconcilePlan,
+    kwok_nodes: Dict[str, dict],
+    agent_pods: Dict[str, dict],
+) -> Tuple[bool, int, int]:
+    """Detect systemic live-Pod drift before any destructive replacement.
+
+    Missing agents are safe to recreate from persisted desired state. A large
+    set of present agents can all look unhealthy during a transient real-node
+    or API transition; deleting them together turns that observation glitch
+    into an actual full-cluster mock outage. Agents paired with missing Nodes
+    are excluded because their replacement is required by the Node repair.
+    """
+    paired_with_node_repairs = {
+        desired.agent_for_node[name]
+        for name in plan.nodes_to_recreate
+        if name not in kwok_nodes
+    }
+    present_repairs = sum(
+        1
+        for name in plan.agents_to_recreate
+        if name in agent_pods and name not in paired_with_node_repairs
+    )
+    threshold = max(10, (len(desired.agent_docs) + 3) // 4)
+    return present_repairs >= threshold, present_repairs, threshold
+
+
+def _repair_batches(names: List[str]):
+    for start in range(0, len(names), REPAIR_BATCH_SIZE):
+        yield names[start:start + REPAIR_BATCH_SIZE]
+
+
+def apply_repairs(
+    kubeconfig: str,
+    desired: DesiredState,
+    plan: ReconcilePlan,
+    kwok_nodes: Dict[str, dict],
+    agent_pods: Dict[str, dict],
+    timeout_seconds: float,
+) -> None:
     # Delete first (Node identity fields like podCIDR/providerID are immutable,
     # so a drifted/unhealthy object must be deleted before it can be reapplied).
-    kubectl_delete_many(
-        kubeconfig,
-        "pod",
-        plan.agents_to_recreate,
-        timeout_seconds,
-        namespace=desired.namespace,
-    )
-    kubectl_delete_many(
-        kubeconfig,
-        "node",
-        plan.nodes_to_recreate,
-        timeout_seconds,
-    )
+    # Never issue DELETEs for already-missing objects: kubectl expands a
+    # multi-name delete into one request per name, so deleting 100 absent Pods
+    # can consume the whole command timeout and prevent the subsequent apply.
+    present_agents = [
+        name for name in plan.agents_to_recreate if name in agent_pods
+    ]
+    present_nodes = [
+        name for name in plan.nodes_to_recreate if name in kwok_nodes
+    ]
+    for batch in _repair_batches(present_agents):
+        kubectl_delete_many(
+            kubeconfig,
+            "pod",
+            batch,
+            timeout_seconds,
+            namespace=desired.namespace,
+        )
+    for batch in _repair_batches(present_nodes):
+        kubectl_delete_many(
+            kubeconfig,
+            "node",
+            batch,
+            timeout_seconds,
+        )
+
     # Recreate nodes before their agents (an agent's K8S_NODE_NAME identity
     # references its node), matching provision-kwok-layer.sh's apply order.
-    kubectl_apply_docs(
-        kubeconfig,
-        (desired.node_docs[name] for name in plan.nodes_to_recreate),
-        timeout_seconds,
-    )
-    kubectl_apply_docs(
-        kubeconfig,
-        (desired.agent_docs[name] for name in plan.agents_to_recreate),
-        timeout_seconds,
-        namespace=desired.namespace,
-    )
+    # Apply in bounded batches so a timeout cannot strand the entire desired
+    # set after a successful delete.
+    for batch in _repair_batches(plan.nodes_to_recreate):
+        kubectl_apply_docs(
+            kubeconfig,
+            (desired.node_docs[name] for name in batch),
+            timeout_seconds,
+        )
+    for batch in _repair_batches(plan.agents_to_recreate):
+        kubectl_apply_docs(
+            kubeconfig,
+            (desired.agent_docs[name] for name in batch),
+            timeout_seconds,
+            namespace=desired.namespace,
+        )
 
 
 def _extra_object_errors(plan: ReconcilePlan) -> List[str]:
@@ -1425,6 +1481,29 @@ def reconcile_cluster(
                 continue
             break
 
+        mass_agent_drift, present_agent_repairs, mass_agent_threshold = (
+            mass_present_agent_drift(
+                desired, plan, kwok_nodes, agent_pods,
+            )
+        )
+        if mass_agent_drift:
+            errors = [
+                "unsafe systemic mock-agent drift: "
+                f"{present_agent_repairs}/{len(desired.agent_docs)} present "
+                "mock-agent Pods require recreation "
+                f"(safety threshold {mass_agent_threshold}); "
+                "refusing destructive bulk deletion"
+            ]
+            _progress(
+                role,
+                "mass-drift",
+                f"attempt {attempt}/{attempts}: {errors[0]}",
+            )
+            if attempt < attempts:
+                time.sleep(settle_seconds)
+                continue
+            break
+
         if not plan.nodes_to_recreate and not plan.agents_to_recreate:
             errors = validate_converged(desired, kwok_nodes, agent_pods, real_nodes)
             converged = not errors
@@ -1435,7 +1514,14 @@ def reconcile_cluster(
             break
 
         try:
-            apply_repairs(kubeconfig, desired, plan, request_timeout_seconds)
+            apply_repairs(
+                kubeconfig,
+                desired,
+                plan,
+                kwok_nodes,
+                agent_pods,
+                request_timeout_seconds,
+            )
         except ReconcileError as exc:
             errors = [str(exc)]
             _progress(role, "plan", f"attempt {attempt}/{attempts}: repair apply FAILED: {exc}")
