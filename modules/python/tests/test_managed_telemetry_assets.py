@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import tarfile
 import textwrap
 from pathlib import Path
 
@@ -90,6 +91,70 @@ def test_native_snapshot_relabel_uses_streaming_block_rewriter():
     assert "compareChunkMetas" in rewriter
     assert "atomicExchangeDirectories" in rewriter
     assert 'rm -rf "$snapshot_work"' in relabel
+    assert 'CL2_SNAPSHOT_RELABEL_CONCURRENCY:-4' in relabel
+    assert 'relabel_snapshot "${snapshots[$index]}" "$index" &' in relabel
+    assert 'wait "$pid" || relabel_failed=true' in relabel
+
+
+def test_native_snapshot_relabel_runs_snapshots_concurrently(tmp_path):
+    report_dir = tmp_path / "results"
+    ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    for role in ("mesh-1", "mesh-2"):
+        role_dir = report_dir / role
+        block = tmp_path / f"{role}-source" / ulid
+        block.mkdir(parents=True)
+        (block / "meta.json").write_text("{}\n", encoding="utf-8")
+        snapshot = role_dir / f"prom-snapshot-{role}.tar.gz"
+        role_dir.mkdir(parents=True)
+        with tarfile.open(snapshot, "w:gz") as archive:
+            archive.add(block.parent, arcname="snapshot")
+
+    event_dir = tmp_path / "events"
+    event_dir.mkdir()
+    fake_rewriter = tmp_path / "fake-rewriter.sh"
+    fake_rewriter.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -euo pipefail
+            touch "$EVENT_DIR/start.$$"
+            for _ in $(seq 1 40); do
+              count=$(find "$EVENT_DIR" -name 'start.*' | wc -l)
+              [ "$count" -ge 2 ] && exit 0
+              sleep 0.05
+            done
+            echo "snapshot relabel workers did not overlap" >&2
+            exit 42
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_rewriter.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "CL2_REPORT_DIR": str(report_dir),
+            "RUN_ID": "run-123",
+            "BUILD_ID": "build-456",
+            "SNAPSHOT_TIER": "tier-100",
+            "INDEX_RELABEL_BIN": str(fake_rewriter),
+            "CL2_SNAPSHOT_RELABEL_CONCURRENCY": "2",
+            "EVENT_DIR": str(event_dir),
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(TELEMETRY_DIR / "relabel-prometheus-snapshots.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(list(event_dir.glob("start.*"))) == 2
+    assert "Relabeled 2 Prometheus snapshot tarball(s)" in result.stdout
 
 
 def test_provider_registration_retries_transient_cli_failure(tmp_path):

@@ -67,16 +67,36 @@ def _setup_fakes(
 import json
 import os
 import sys
+import fcntl
 from pathlib import Path
 
 args = sys.argv[1:]
 log_path = Path(os.environ["FAKE_AZ_LOG"])
 state_path = Path(os.environ["FAKE_AZ_STATE"])
+lock_path = Path(f"{state_path}.lock")
+concurrency_path = Path(os.environ["FAKE_AZ_CONCURRENCY_STATE"])
+concurrency_lock_path = Path(f"{concurrency_path}.lock")
 with log_path.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(args) + "\\n")
 
 def option(name):
     return args[args.index(name) + 1]
+
+def adjust_concurrency(delta):
+    with concurrency_lock_path.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        concurrency = (
+            json.loads(concurrency_path.read_text(encoding="utf-8"))
+            if concurrency_path.exists()
+            else {"active": 0, "max": 0}
+        )
+        concurrency["active"] += delta
+        concurrency["max"] = max(
+            concurrency["max"], concurrency["active"]
+        )
+        concurrency_path.write_text(
+            json.dumps(concurrency), encoding="utf-8"
+        )
 
 if args[:2] == ["account", "set"]:
     sys.exit(0)
@@ -92,28 +112,39 @@ if args[:1] == ["login"]:
         sys.exit(22)
     sys.exit(0)
 
-state = (
-    json.loads(state_path.read_text(encoding="utf-8"))
-    if state_path.exists()
-    else {}
-)
 if args[:3] == ["storage", "blob", "upload"]:
+    adjust_concurrency(1)
     sleep_seconds = float(os.environ.get("FAKE_AZ_UPLOAD_SLEEP_SECONDS", "0"))
     if sleep_seconds > 0:
         import time
         time.sleep(sleep_seconds)
+    adjust_concurrency(-1)
     blob_name = option("--name")
     fail_pattern = os.environ.get("FAKE_AZ_FAIL_UPLOAD_PATTERN", "")
     if fail_pattern and fail_pattern in blob_name:
         sys.exit(17)
-    state[blob_name] = Path(option("--file")).stat().st_size
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    with lock_path.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = (
+            json.loads(state_path.read_text(encoding="utf-8"))
+            if state_path.exists()
+            else {}
+        )
+        state[blob_name] = Path(option("--file")).stat().st_size
+        state_path.write_text(json.dumps(state), encoding="utf-8")
     sys.exit(0)
 if args[:3] == ["storage", "blob", "show"]:
     blob_name = option("--name")
-    if blob_name not in state:
-        sys.exit(18)
-    print(state[blob_name])
+    with lock_path.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        state = (
+            json.loads(state_path.read_text(encoding="utf-8"))
+            if state_path.exists()
+            else {}
+        )
+        if blob_name not in state:
+            sys.exit(18)
+        print(state[blob_name])
     sys.exit(0)
 sys.exit(19)
 """,
@@ -176,6 +207,7 @@ def _run_helper(
     outer_timeout_seconds: int | None = None,
     oidc_refresh: bool = False,
     oidc_refresh_interval_seconds: str = "2700",
+    upload_concurrency: str = "2",
 ) -> subprocess.CompletedProcess[str]:
     fake_bin, az_log, relabel_log = _setup_fakes(
         tmp_path, relabel_should_fail=relabel_should_fail
@@ -202,6 +234,9 @@ def _run_helper(
             "FAKE_AZ_SUBSCRIPTION_ID": "subscription-1",
             "FAKE_AZ_FAIL_UPLOAD_PATTERN": fail_upload_pattern,
             "FAKE_AZ_UPLOAD_SLEEP_SECONDS": upload_sleep_seconds,
+            "FAKE_AZ_CONCURRENCY_STATE": str(
+                tmp_path / "az-concurrency.json"
+            ),
             "FAKE_RELABEL_LOG": str(relabel_log),
             "FAKE_CURL_COUNT": str(tmp_path / "curl-count"),
             "PRESERVE_LIFECYCLE_ONLY": "true" if lifecycle_only else "false",
@@ -211,6 +246,7 @@ def _run_helper(
             "AZURE_OIDC_REFRESH_INTERVAL_SECONDS": (
                 oidc_refresh_interval_seconds
             ),
+            "CL2_ARTIFACT_UPLOAD_CONCURRENCY": upload_concurrency,
         }
     )
     if oidc_refresh:
@@ -428,6 +464,62 @@ def test_snapshot_upload_failure_preserves_local_file(tmp_path):
     assert summary["uploaded_snapshot_count"] == 0
     assert summary["missing_snapshot_roles"] == ["mesh-1"]
     assert any("Upload failed" in error for error in summary["errors"])
+
+
+def test_parallel_snapshot_upload_isolates_one_failed_role(tmp_path):
+    scenario_dir = tmp_path / "share-infra-1"
+    worker_summary = scenario_dir / "worker-summary.json"
+    snapshot_1 = _create_snapshot(
+        scenario_dir / "mesh-1", "snapshot-a"
+    )
+    snapshot_2 = _create_snapshot(
+        scenario_dir / "mesh-2", "snapshot-b"
+    )
+    _write_worker_summary(worker_summary, ["mesh-1", "mesh-2"])
+
+    result = _run_helper(
+        tmp_path,
+        scenario_dir,
+        worker_summary,
+        fail_upload_pattern="prom-snapshot-mesh-2",
+        upload_concurrency="2",
+    )
+
+    assert result.returncode != 0
+    assert not snapshot_1.exists()
+    assert snapshot_2.exists()
+    summary = json.loads(
+        (scenario_dir / "artifact-preservation-summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["uploaded_snapshot_count"] == 1
+    assert summary["uploaded_snapshot_roles"] == ["mesh-1"]
+    assert summary["missing_snapshot_roles"] == ["mesh-2"]
+    assert summary["infrastructure_failure"] is True
+
+
+def test_parallel_snapshot_uploads_overlap(tmp_path):
+    scenario_dir = tmp_path / "share-infra-1"
+    worker_summary = scenario_dir / "worker-summary.json"
+    _create_snapshot(scenario_dir / "mesh-1", "snapshot-a")
+    _create_snapshot(scenario_dir / "mesh-2", "snapshot-b")
+    _write_worker_summary(worker_summary, ["mesh-1", "mesh-2"])
+
+    result = _run_helper(
+        tmp_path,
+        scenario_dir,
+        worker_summary,
+        upload_sleep_seconds="0.2",
+        upload_concurrency="2",
+    )
+
+    assert result.returncode == 0, result.stderr
+    concurrency = json.loads(
+        (tmp_path / "az-concurrency.json").read_text(encoding="utf-8")
+    )
+    assert concurrency["max"] >= 2
+    assert concurrency["active"] == 0
 
 
 def test_oidc_refresh_reauthenticates_during_long_uploads(tmp_path):

@@ -69,10 +69,16 @@ azure_login_refreshed_at=0
 azure_auth_failed=false
 azure_auth_failure_reported=false
 azure_oidc_refresh_interval_seconds="${AZURE_OIDC_REFRESH_INTERVAL_SECONDS:-2700}"
+artifact_upload_concurrency="${CL2_ARTIFACT_UPLOAD_CONCURRENCY:-8}"
 
 mkdir -p "$SCENARIO_REPORT_DIR"
 rm -f -- "$summary_tmp"
-trap 'rm -f -- "$summary_tmp"' EXIT
+artifact_work_dir=$(mktemp -d "${TMPDIR:-/tmp}/scenario-artifacts-XXXXXX")
+cleanup_temp_files() {
+  rm -f -- "$summary_tmp"
+  rm -rf -- "$artifact_work_dir"
+}
+trap cleanup_temp_files EXIT
 
 array_json() {
   if [ "$#" -eq 0 ]; then
@@ -382,6 +388,34 @@ handle_termination() {
 trap 'handle_termination TERM' TERM
 trap 'handle_termination INT' INT
 
+record_uploaded_artifact() {
+  local artifact_type="$1"
+  local size="$2"
+  local role="${3:-}"
+
+  case "$artifact_type" in
+    snapshot)
+      uploaded_snapshot_count=$((uploaded_snapshot_count + 1))
+      uploaded_snapshot_bytes=$((uploaded_snapshot_bytes + size))
+      if ! contains_value "$role" "${uploaded_snapshot_roles[@]}"; then
+        uploaded_snapshot_roles+=("$role")
+      fi
+      ;;
+    audit)
+      uploaded_audit_count=$((uploaded_audit_count + 1))
+      uploaded_audit_bytes=$((uploaded_audit_bytes + size))
+      ;;
+    acns)
+      uploaded_acns_count=$((uploaded_acns_count + 1))
+      uploaded_acns_bytes=$((uploaded_acns_bytes + size))
+      ;;
+    lifecycle)
+      uploaded_lifecycle_count=$((uploaded_lifecycle_count + 1))
+      uploaded_lifecycle_bytes=$((uploaded_lifecycle_bytes + size))
+      ;;
+  esac
+}
+
 upload_and_verify() {
   local file="$1"
   local blob_name="$2"
@@ -438,32 +472,110 @@ upload_and_verify() {
     return 1
   fi
 
-  case "$artifact_type" in
-    snapshot)
-      uploaded_snapshot_count=$((uploaded_snapshot_count + 1))
-      uploaded_snapshot_bytes=$((uploaded_snapshot_bytes + size))
-      if ! contains_value "$role" "${uploaded_snapshot_roles[@]}"; then
-        uploaded_snapshot_roles+=("$role")
-      fi
-      ;;
-    audit)
-      uploaded_audit_count=$((uploaded_audit_count + 1))
-      uploaded_audit_bytes=$((uploaded_audit_bytes + size))
-      ;;
-    acns)
-      uploaded_acns_count=$((uploaded_acns_count + 1))
-      uploaded_acns_bytes=$((uploaded_acns_bytes + size))
-      ;;
-    lifecycle)
-      uploaded_lifecycle_count=$((uploaded_lifecycle_count + 1))
-      uploaded_lifecycle_bytes=$((uploaded_lifecycle_bytes + size))
-      ;;
-  esac
+  record_uploaded_artifact "$artifact_type" "$size" "$role"
 
   if [ "$delete_after_upload" = "true" ]; then
     if ! rm -f -- "$file"; then
       echo "Warning: unable to remove verified snapshot $file" >&2
     fi
+  fi
+}
+
+flush_parallel_upload_batch() {
+  local artifact_type="$1"
+  local delete_after_upload="$2"
+  local index
+
+  for index in "${!parallel_upload_pids[@]}"; do
+    if wait "${parallel_upload_pids[$index]}"; then
+      record_uploaded_artifact \
+        "$artifact_type" \
+        "${parallel_upload_sizes[$index]}" \
+        "${parallel_upload_roles[$index]}"
+      if [ "$delete_after_upload" = "true" ] &&
+         ! rm -f -- "${parallel_upload_files[$index]}"; then
+        echo "Warning: unable to remove verified snapshot ${parallel_upload_files[$index]}" >&2
+      fi
+    else
+      add_error \
+        "Upload failed or verification failed for ${parallel_upload_files[$index]}" \
+        infra
+    fi
+  done
+
+  parallel_upload_pids=()
+  parallel_upload_files=()
+  parallel_upload_roles=()
+  parallel_upload_sizes=()
+}
+
+upload_entries_parallel() {
+  local artifact_type="$1"
+  local delete_after_upload="$2"
+  local entries_file="$3"
+  local file blob_name role size remote_size
+  local -a parallel_upload_pids=()
+  local -a parallel_upload_files=()
+  local -a parallel_upload_roles=()
+  local -a parallel_upload_sizes=()
+
+  while IFS=$'\t' read -r file blob_name role; do
+    [ -n "$file" ] || continue
+    if [ "${#parallel_upload_pids[@]}" -eq 0 ] &&
+       ! ensure_azure_login; then
+      if [ "$azure_auth_failure_reported" != "true" ]; then
+        add_error \
+          "Unable to refresh Azure authentication for parallel artifact upload" \
+          infra
+        azure_auth_failure_reported=true
+      fi
+      return 1
+    fi
+
+    size=$(stat -c%s "$file" 2>/dev/null || printf '0')
+    echo "Uploading $file (${size} bytes) -> ${STORAGE_ACCOUNT_NAME}/${CONTAINER_NAME}/${blob_name}"
+    (
+      if ! az storage blob upload \
+          --account-name "$STORAGE_ACCOUNT_NAME" \
+          --container-name "$CONTAINER_NAME" \
+          --name "$blob_name" \
+          --file "$file" \
+          --auth-mode login \
+          --overwrite \
+          --output none; then
+        echo "Upload failed for $file" >&2
+        exit 1
+      fi
+      if ! remote_size=$(az storage blob show \
+          --account-name "$STORAGE_ACCOUNT_NAME" \
+          --container-name "$CONTAINER_NAME" \
+          --name "$blob_name" \
+          --auth-mode login \
+          --query properties.contentLength \
+          --output tsv); then
+        echo "Upload verification failed for $file" >&2
+        exit 1
+      fi
+      remote_size=${remote_size//$'\r'/}
+      if ! [[ "$remote_size" =~ ^[0-9]+$ ]] ||
+         [ "$remote_size" -ne "$size" ]; then
+        echo "Upload verification size mismatch for $file: local=$size remote=${remote_size:-unknown}" >&2
+        exit 1
+      fi
+    ) &
+    parallel_upload_pids+=("$!")
+    parallel_upload_files+=("$file")
+    parallel_upload_roles+=("$role")
+    parallel_upload_sizes+=("$size")
+
+    if [ "${#parallel_upload_pids[@]}" -ge \
+         "$artifact_upload_concurrency" ]; then
+      flush_parallel_upload_batch "$artifact_type" "$delete_after_upload"
+    fi
+  done < "$entries_file"
+
+  if [ "${#parallel_upload_pids[@]}" -gt 0 ]; then
+    flush_parallel_upload_batch "$artifact_type" "$delete_after_upload"
   fi
 }
 
@@ -517,6 +629,13 @@ if [ "$azure_oidc_refresh_enabled" = "true" ]; then
       azure_oidc_configuration_valid=false
     fi
   done
+fi
+if ! [[ "$artifact_upload_concurrency" =~ ^[1-9][0-9]*$ ]] ||
+   [ "$artifact_upload_concurrency" -gt 16 ]; then
+  add_error \
+    "CL2_ARTIFACT_UPLOAD_CONCURRENCY must be an integer from 1 through 16" \
+    infra
+  azure_oidc_configuration_valid=false
 fi
 
 azure_ready=true
@@ -612,11 +731,14 @@ if [ "$azure_ready" = "true" ]; then
         -print0 | sort -z
     )
 
+    audit_entries="$artifact_work_dir/audit-entries.tsv"
+    : > "$audit_entries"
     while IFS= read -r -d '' audit; do
       role=$(basename "$(dirname "$(dirname "$audit")")")
       extension="${audit##*.}"
       blob_name="${BUILD_BRANCH}/telemetry-audit-self-hosted/${SCENARIO_NAME}/${RUN_ID}/telemetry-audit-self-hosted-${role}.${extension}"
-      upload_and_verify "$audit" "$blob_name" audit || true
+      printf '%s\t%s\t%s\n' \
+        "$audit" "$blob_name" "$role" >> "$audit_entries"
     done < <(
       find "$SCENARIO_REPORT_DIR" \
         -mindepth 3 \
@@ -626,11 +748,15 @@ if [ "$azure_ready" = "true" ]; then
            -o -name 'telemetry-audit-self-hosted.md' \) \
         -print0 | sort -z
     )
+    upload_entries_parallel audit false "$audit_entries" || true
 
+    acns_entries="$artifact_work_dir/acns-entries.tsv"
+    : > "$acns_entries"
     while IFS= read -r -d '' acns_file; do
       role=$(basename "$(dirname "$(dirname "$(dirname "$acns_file")")")")
       blob_name="${BUILD_BRANCH}/acns/${SCENARIO_NAME}/${RUN_ID}/${role}/$(basename "$acns_file")"
-      upload_and_verify "$acns_file" "$blob_name" acns || true
+      printf '%s\t%s\t%s\n' \
+        "$acns_file" "$blob_name" "$role" >> "$acns_entries"
     done < <(
       find "$SCENARIO_REPORT_DIR" \
         -mindepth 4 \
@@ -639,6 +765,7 @@ if [ "$azure_ready" = "true" ]; then
         -path '*/telemetry/acns/*' \
         -print0 | sort -z
     )
+    upload_entries_parallel acns false "$acns_entries" || true
   fi
 fi
 
@@ -678,6 +805,8 @@ if [ "${lifecycle_only,,}" != "true" ]; then
   fi
 
   if [ "$azure_ready" = "true" ] && [ "$relabel_ready" = "true" ]; then
+    snapshot_entries="$artifact_work_dir/snapshot-entries.tsv"
+    : > "$snapshot_entries"
     for snapshot in "${snapshot_files[@]}"; do
       role=$(basename "$(dirname "$snapshot")")
       if [ ! -s "$snapshot" ] ||
@@ -687,8 +816,10 @@ if [ "${lifecycle_only,,}" != "true" ]; then
         continue
       fi
       blob_name="${BUILD_BRANCH}/${SCENARIO_NAME}/${RUN_ID}/$(basename "$snapshot")"
-      upload_and_verify "$snapshot" "$blob_name" snapshot "$role" true || true
+      printf '%s\t%s\t%s\n' \
+        "$snapshot" "$blob_name" "$role" >> "$snapshot_entries"
     done
+    upload_entries_parallel snapshot true "$snapshot_entries" || true
   fi
 
   if [ "${#uploaded_snapshot_roles[@]}" -gt 0 ]; then

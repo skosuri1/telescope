@@ -161,9 +161,32 @@ relabel_snapshot() {
   echo "Relabeled ${#blocks[@]} index file(s) in $snapshot"
 }
 
+relabel_concurrency="${CL2_SNAPSHOT_RELABEL_CONCURRENCY:-4}"
+if ! [[ "$relabel_concurrency" =~ ^[1-9][0-9]*$ ]] ||
+   [ "$relabel_concurrency" -gt 16 ]; then
+  echo "CL2_SNAPSHOT_RELABEL_CONCURRENCY must be an integer from 1 through 16." >&2
+  exit 1
+fi
+
+relabel_failed=false
+relabel_pids=()
 for index in "${!snapshots[@]}"; do
-  relabel_snapshot "${snapshots[$index]}" "$index"
+  relabel_snapshot "${snapshots[$index]}" "$index" &
+  relabel_pids+=("$!")
+  if [ "${#relabel_pids[@]}" -ge "$relabel_concurrency" ]; then
+    for pid in "${relabel_pids[@]}"; do
+      wait "$pid" || relabel_failed=true
+    done
+    relabel_pids=()
+  fi
 done
+for pid in "${relabel_pids[@]}"; do
+  wait "$pid" || relabel_failed=true
+done
+if [ "$relabel_failed" = "true" ]; then
+  echo "One or more Prometheus snapshots failed block relabeling." >&2
+  exit 1
+fi
 
 echo "Relabeled ${#snapshots[@]} Prometheus snapshot tarball(s) with run/build/tier/snapshot_cluster."
 echo "##vso[task.setvariable variable=CL2_PROM_SNAPSHOT_RELABEL_READY]true"
