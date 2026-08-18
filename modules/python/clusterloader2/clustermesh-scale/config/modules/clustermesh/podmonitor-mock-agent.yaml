@@ -20,6 +20,12 @@ spec:
       honorLabels: true
       path: /metrics
       relabelings:
+        # Stable logical identity for telemetry coverage. A recreated
+        # StatefulSet Pod keeps the same kwok-node-N name even when its IP
+        # changes, so historical target series can be grouped correctly.
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          action: replace
+          targetLabel: mock_node
         - sourceLabels: [__address__]
           action: replace
           targetLabel: __address__

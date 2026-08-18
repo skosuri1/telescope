@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -127,6 +128,80 @@ def _target_jobs(targets):
         if scrape_url:
             jobs[job]["scrape_urls"].append(scrape_url)
     return dict(sorted(jobs.items()))
+
+
+def _mock_target_identity(target):
+    """Return the logical KWOK Node served by a mock-agent target.
+
+    Prometheus can retain several IP-based labelsets after a Pod is recreated.
+    Counting those raw series overstates coverage. The stable Pod name is the
+    logical identity for StatefulSet-owned agents; legacy mock-cilium-agent-N
+    names normalize to the same kwok-node-N identity.
+    """
+    labels = target.get("labels", {})
+    candidates = (
+        labels.get("mock_node"),
+        labels.get("mock_clustermesh_serves_node"),
+        labels.get("mock-clustermesh/serves-node"),
+        labels.get("pod"),
+        labels.get("job"),
+    )
+    for candidate in candidates:
+        if not candidate:
+            continue
+        match = re.search(r"(?:^|/)(kwok-node|mock-cilium-agent)-([0-9]+)$", candidate)
+        if match:
+            return f"kwok-node-{int(match.group(2))}"
+    return None
+
+
+def _generic_target_identity(target):
+    labels = target.get("labels", {})
+    return (
+        labels.get("pod")
+        or labels.get("instance")
+        or target.get("scrapeUrl")
+        or labels.get("job")
+    )
+
+
+def _logical_target_summary(targets, job_predicate, identity_fn):
+    grouped = {}
+    raw_total = 0
+    unknown_identity_count = 0
+    for target in targets:
+        labels = target.get("labels", {})
+        job = labels.get("job", "")
+        if not job_predicate(job):
+            continue
+        raw_total += 1
+        identity = identity_fn(target)
+        if not identity:
+            unknown_identity_count += 1
+            continue
+        state = grouped.setdefault(identity, {"up": False, "down": False})
+        if target.get("health") == "up":
+            state["up"] = True
+        else:
+            state["down"] = True
+
+    up_identities = sorted(
+        identity for identity, state in grouped.items() if state["up"]
+    )
+    down_only_identities = sorted(
+        identity
+        for identity, state in grouped.items()
+        if not state["up"] and state["down"]
+    )
+    return {
+        "total": len(grouped),
+        "up": len(up_identities),
+        "down": len(down_only_identities),
+        "raw_total": raw_total,
+        "unknown_identity_count": unknown_identity_count,
+        "up_identities": up_identities,
+        "down_only_identities": down_only_identities,
+    }
 
 
 def build_audit(
@@ -262,38 +337,34 @@ def build_audit(
             }
         )
     if expected_mock_agent_targets > 0:
-        mock_targets = [
-            target
-            for job_name, target in jobs.items()
-            if "mock-cilium-agent" in job_name
-        ]
-        target_count = sum(target["total"] for target in mock_targets)
-        up_targets = sum(target["up"] for target in mock_targets)
-        down_targets = sum(target["down"] for target in mock_targets)
+        live_mock = _logical_target_summary(
+            targets,
+            lambda job: "mock-cilium-agent" in job,
+            _mock_target_identity,
+        )
+        target_count = live_mock["total"]
+        up_targets = live_mock["up"]
+        down_targets = live_mock["down"]
         live_healthy = (
             target_count == expected_mock_agent_targets
             and up_targets == expected_mock_agent_targets
             and down_targets == 0
+            and live_mock["unknown_identity_count"] == 0
         )
-        historical_mock_targets = [
-            target
-            for job_name, target in historical_jobs.items()
-            if "mock-cilium-agent" in job_name
-        ]
-        historical_target_count = sum(
-            target["total"] for target in historical_mock_targets
+        historical_mock = _logical_target_summary(
+            historical_targets or [],
+            lambda job: "mock-cilium-agent" in job,
+            _mock_target_identity,
         )
-        historical_up_targets = sum(
-            target["up"] for target in historical_mock_targets
-        )
-        historical_down_targets = sum(
-            target["down"] for target in historical_mock_targets
-        )
+        historical_target_count = historical_mock["total"]
+        historical_up_targets = historical_mock["up"]
+        historical_down_targets = historical_mock["down"]
         historical_healthy = (
             target_count == 0
             and historical_target_count == expected_mock_agent_targets
             and historical_up_targets == expected_mock_agent_targets
             and historical_down_targets == 0
+            and historical_mock["unknown_identity_count"] == 0
         )
         healthy = live_healthy or historical_healthy
         checks.append(
@@ -305,9 +376,17 @@ def build_audit(
                 "target_count": target_count,
                 "up_targets": up_targets,
                 "down_targets": down_targets,
+                "raw_target_series": live_mock["raw_total"],
+                "unknown_target_identities": live_mock[
+                    "unknown_identity_count"
+                ],
                 "historical_target_count": historical_target_count,
                 "historical_up_targets": historical_up_targets,
                 "historical_down_targets": historical_down_targets,
+                "historical_raw_target_series": historical_mock["raw_total"],
+                "historical_unknown_target_identities": historical_mock[
+                    "unknown_identity_count"
+                ],
                 "historical_target_evidence": historical_healthy,
             }
         )
@@ -323,33 +402,26 @@ def build_audit(
                     "sample_metrics": [metric_name] if covered else [],
                 }
             )
-        hubble_targets = [
-            target
-            for job_name, target in jobs.items()
-            if "hubble" in job_name.lower()
-        ]
-        target_count = sum(target["total"] for target in hubble_targets)
-        up_targets = sum(target["up"] for target in hubble_targets)
-        down_targets = sum(target["down"] for target in hubble_targets)
+        live_hubble = _logical_target_summary(
+            targets,
+            lambda job: "hubble" in job.lower(),
+            _generic_target_identity,
+        )
+        target_count = live_hubble["total"]
+        up_targets = live_hubble["up"]
+        down_targets = live_hubble["down"]
         live_healthy = target_count > 0 and down_targets == 0
-        historical_hubble_targets = [
-            target
-            for job_name, target in historical_jobs.items()
-            if "hubble" in job_name.lower()
-        ]
-        historical_target_count = sum(
-            target["total"] for target in historical_hubble_targets
+        historical_hubble = _logical_target_summary(
+            historical_targets or [],
+            lambda job: "hubble" in job.lower(),
+            _generic_target_identity,
         )
-        historical_up_targets = sum(
-            target["up"] for target in historical_hubble_targets
-        )
-        historical_down_targets = sum(
-            target["down"] for target in historical_hubble_targets
-        )
+        historical_target_count = historical_hubble["total"]
+        historical_up_targets = historical_hubble["up"]
+        historical_down_targets = historical_hubble["down"]
         historical_healthy = (
             target_count == 0
-            and historical_target_count > 0
-            and historical_down_targets == 0
+            and historical_up_targets > 0
         )
         checks.append(
             {
@@ -363,9 +435,16 @@ def build_audit(
                 "target_count": target_count,
                 "up_targets": up_targets,
                 "down_targets": down_targets,
+                "raw_target_series": live_hubble["raw_total"],
                 "historical_target_count": historical_target_count,
                 "historical_up_targets": historical_up_targets,
                 "historical_down_targets": historical_down_targets,
+                "historical_raw_target_series": historical_hubble[
+                    "raw_total"
+                ],
+                "historical_stale_down_advisory": (
+                    historical_down_targets > 0 and historical_healthy
+                ),
                 "historical_target_evidence": historical_healthy,
             }
         )

@@ -710,6 +710,20 @@ if [ "$azure_ready" = "true" ]; then
       -print0 | sort -z
   )
 
+  # Pre-repair evidence is nested by role/attempt and commonly repeats
+  # basenames (repair-state.json, current.log, previous.log). Preserve the
+  # relative path instead of flattening it so no cluster or attempt collides.
+  while IFS= read -r -d '' mock_diagnostic_file; do
+    relative_path="${mock_diagnostic_file#"$SCENARIO_REPORT_DIR/"}"
+    blob_name="${BUILD_BRANCH}/lifecycle/${SCENARIO_NAME}/${RUN_ID}/${relative_path}"
+    upload_and_verify "$mock_diagnostic_file" "$blob_name" lifecycle || true
+  done < <(
+    find "$SCENARIO_REPORT_DIR" \
+      -type f \
+      -path '*/mock-layer-diagnostics*/*' \
+      -print0 | sort -z
+  )
+
   # Audit/ACNS telemetry are independent of the lifecycle-only durable-state
   # set. Per-role scenario evidence is likewise already durable from the
   # early pass; re-uploading 100 role files plus verification serially can

@@ -1027,10 +1027,13 @@ def test_audit_requires_exact_mock_agent_target_coverage():
         {"labels": {"job": "apiserver-backend-exporter"}, "health": "up"},
         *[
             {
-                "labels": {"job": "monitoring/mock-cilium-agent-0"},
+                "labels": {
+                    "job": "monitoring/mock-cilium-agent",
+                    "mock_node": f"kwok-node-{index}",
+                },
                 "health": "up",
             }
-            for _ in range(100)
+            for index in range(100)
         ],
     ]
 

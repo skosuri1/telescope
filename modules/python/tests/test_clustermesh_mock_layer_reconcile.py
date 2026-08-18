@@ -120,6 +120,40 @@ def _agent_doc_with_clustermesh(index, cluster_id="1"):
     return doc
 
 
+def _controller_agent_doc(index):
+    node_name = f"kwok-node-{index}"
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": node_name,
+            "namespace": NAMESPACE,
+            "labels": {
+                "app": "mock-cilium-agent",
+                "mock-clustermesh/agent-controller": "kwok-node",
+            },
+        },
+        "spec": {
+            "serviceAccountName": SERVICE_ACCOUNT,
+            "restartPolicy": "Always",
+            "containers": [
+                {
+                    "name": "mock-cilium-agent",
+                    "image": IMAGE,
+                    "env": [
+                        {
+                            "name": "K8S_NODE_NAME",
+                            "valueFrom": {
+                                "fieldRef": {"fieldPath": "metadata.name"}
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+
 def write_state_dir(
     state_root, role, node_count, metadata_overrides=None,
     node_doc_fn=_node_doc, agent_doc_fn=_agent_doc,
@@ -152,6 +186,60 @@ def write_state_dir(
         metadata.update(metadata_overrides)
     (state_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     return node_docs, agent_docs
+
+
+def write_controller_state_dir(state_root, role, node_count):
+    node_docs, agent_docs = write_state_dir(
+        state_root,
+        role,
+        node_count,
+        metadata_overrides={
+            "schema_version": 3,
+            "agent_identity_source": "pod-name",
+            "agent_controller_manifest": "agent-controller.yaml",
+            "agent_controller_name": "kwok-node",
+        },
+        agent_doc_fn=_controller_agent_doc,
+    )
+    template = {
+        "metadata": {
+            "labels": dict(agent_docs[0]["metadata"]["labels"]),
+        },
+        "spec": json.loads(json.dumps(agent_docs[0]["spec"])),
+    }
+    controller_docs = [
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "kwok-node", "namespace": NAMESPACE},
+            "spec": {
+                "clusterIP": "None",
+                "selector": dict(agent_docs[0]["metadata"]["labels"]),
+            },
+        },
+        {
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": "kwok-node", "namespace": NAMESPACE},
+            "spec": {
+                "serviceName": "kwok-node",
+                "replicas": node_count,
+                "podManagementPolicy": "Parallel",
+                "selector": {
+                    "matchLabels": dict(agent_docs[0]["metadata"]["labels"])
+                },
+                "template": template,
+            },
+        },
+    ]
+    state_dir = state_root / role
+    (state_dir / "agent-controller.yaml").write_text(
+        "".join(
+            f"---\n{yaml.safe_dump(doc)}" for doc in controller_docs
+        ),
+        encoding="utf-8",
+    )
+    return node_docs, agent_docs, controller_docs
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +358,8 @@ class FakeKubeCluster:
         self.pods = {}  # (namespace, name) -> pod dict
         self.secrets = {}  # (namespace, name) -> secret dict
         self.deployments = {}  # (namespace, name) -> deployment dict
+        self.services = {}  # (namespace, name) -> service dict
+        self.statefulsets = {}  # (namespace, name) -> statefulset dict
         self.namespaces = set()  # live Namespace names
         self.existence_objects = set()  # (kind_lower, namespace_or_None, name)
         self.apply_calls = []
@@ -352,6 +442,7 @@ class FakeKubeCluster:
         if "get" in cmd and "nodes" in cmd:
             return _completed(json.dumps({"items": list(self.nodes.values())}))
         if "get" in cmd and "pods" in cmd:
+            self._ensure_statefulset_pods()
             namespace = _namespace_of(cmd)
             items = [pod for (ns, _name), pod in self.pods.items() if ns == namespace]
             return _completed(json.dumps({"items": items}))
@@ -363,6 +454,26 @@ class FakeKubeCluster:
             if deployment is None:
                 return _failed(f'Error from server (NotFound): deployments.apps "{name}" not found')
             return _completed(json.dumps(deployment))
+        if "get" in cmd and "service" in cmd:
+            idx = cmd.index("service")
+            name = cmd[idx + 1]
+            namespace = _namespace_of(cmd)
+            service = self.services.get((namespace, name))
+            if service is None:
+                return _failed(
+                    f'Error from server (NotFound): services "{name}" not found'
+                )
+            return _completed(json.dumps(service))
+        if "get" in cmd and "statefulset" in cmd:
+            idx = cmd.index("statefulset")
+            name = cmd[idx + 1]
+            namespace = _namespace_of(cmd)
+            statefulset = self.statefulsets.get((namespace, name))
+            if statefulset is None:
+                return _failed(
+                    f'Error from server (NotFound): statefulsets.apps "{name}" not found'
+                )
+            return _completed(json.dumps(statefulset))
         if "get" in cmd and "stage" in cmd:
             # kubectl_list_names (via kubectl_list_by_name): ONE true LIST
             # call proving the whole Stage set at once (mirrors
@@ -421,6 +532,26 @@ class FakeKubeCluster:
                 for (kind, _ns, name) in self.existence_objects if kind == "flowschema"
             ]
             return _completed(json.dumps({"kind": "FlowSchemaList", "items": items}))
+        if "get" in cmd and "events" in cmd:
+            return _completed(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "involvedObject": {
+                                    "name": "mock-cilium-agent-0"
+                                },
+                                "reason": "Evicted",
+                                "message": "test event",
+                            }
+                        ]
+                    }
+                )
+            )
+        if "logs" in cmd:
+            name = cmd[cmd.index("logs") + 1]
+            stream = "previous" if "--previous" in cmd else "current"
+            return _completed(f"{name} {stream} log\n")
         if "apply" in cmd:
             self.apply_invocations += 1
             for doc in yaml.safe_load_all(input):
@@ -445,6 +576,7 @@ class FakeKubeCluster:
                     self.nodes.pop(name, None)
                 elif kind == "pod":
                     self.pods.pop((namespace, name), None)
+                    self._ensure_statefulset_pods()
             if self.delete_timeouts_after_side_effects > 0:
                 self.delete_timeouts_after_side_effects -= 1
                 raise subprocess.TimeoutExpired(cmd, timeout)
@@ -481,6 +613,19 @@ class FakeKubeCluster:
                 deployment.get("spec") or {}
             ).get("replicas", 1)
             self.deployments[(namespace, name)] = deployment
+        elif kind == "Service":
+            namespace = doc["metadata"].get("namespace", NAMESPACE)
+            self.services[(namespace, name)] = json.loads(json.dumps(doc))
+        elif kind == "StatefulSet":
+            namespace = doc["metadata"].get("namespace", NAMESPACE)
+            statefulset = json.loads(json.dumps(doc))
+            replicas = (statefulset.get("spec") or {}).get("replicas", 0)
+            statefulset["status"] = {
+                "currentReplicas": replicas,
+                "readyReplicas": replicas,
+            }
+            self.statefulsets[(namespace, name)] = statefulset
+            self._ensure_statefulset_pods()
         elif kind in ("Stage", "PriorityLevelConfiguration", "FlowSchema", "ClusterRoleBinding"):
             self.existence_objects.add((kind.lower(), None, name))
         elif kind == "ServiceAccount":
@@ -490,6 +635,55 @@ class FakeKubeCluster:
             self.namespaces.add(name)
         else:
             raise AssertionError(f"unexpected apply kind: {kind}")
+
+    def _ensure_statefulset_pods(self):
+        for (namespace, name), statefulset in self.statefulsets.items():
+            spec = statefulset.get("spec") or {}
+            replicas = spec.get("replicas", 0)
+            template = spec.get("template") or {}
+            for index in range(replicas):
+                pod_name = f"{name}-{index}"
+                key = (namespace, pod_name)
+                if key in self.pods:
+                    continue
+                pod = {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": pod_name,
+                        "namespace": namespace,
+                        "labels": json.loads(
+                            json.dumps(
+                                (template.get("metadata") or {}).get("labels")
+                                or {}
+                            )
+                        ),
+                        "annotations": json.loads(
+                            json.dumps(
+                                (template.get("metadata") or {}).get(
+                                    "annotations"
+                                )
+                                or {}
+                            )
+                        ),
+                        "ownerReferences": [
+                            {
+                                "kind": "StatefulSet",
+                                "name": name,
+                                "controller": True,
+                            }
+                        ],
+                    },
+                    "spec": json.loads(
+                        json.dumps(template.get("spec") or {})
+                    ),
+                }
+                pod["spec"]["nodeName"] = self.healthy_real_node
+                pod["status"] = {
+                    "phase": "Running",
+                    "containerStatuses": [{"ready": True}],
+                }
+                self.pods[key] = pod
 
 
 def _reconcile(monkeypatch, cluster, role, state_root, **kwargs):
@@ -526,6 +720,86 @@ def test_healthy_cluster_is_a_noop(tmp_path, monkeypatch):
     # Never touch healthy objects.
     assert not cluster.apply_calls
     assert not cluster.delete_calls
+
+
+def test_controller_owned_agents_are_restored_without_naked_pod_apply(
+    tmp_path, monkeypatch,
+):
+    role = "mesh-1"
+    node_docs, _agent_docs, _controller_docs = write_controller_state_dir(
+        tmp_path, role, node_count=2
+    )
+    cluster = FakeKubeCluster()
+    for node_doc in node_docs:
+        cluster._apply(node_doc)  # pylint: disable=protected-access
+
+    result = _reconcile(monkeypatch, cluster, role, tmp_path)
+
+    assert result["status"] == "ok"
+    assert result["repaired_agent_controller"]
+    assert (NAMESPACE, "kwok-node") in cluster.statefulsets
+    assert (NAMESPACE, "kwok-node-0") in cluster.pods
+    assert (NAMESPACE, "kwok-node-1") in cluster.pods
+    assert all(doc["kind"] != "Pod" for doc in cluster.apply_calls)
+    assert result["recreated_agents"] == []
+
+
+def test_controller_recreates_deleted_agent_ordinal(tmp_path, monkeypatch):
+    role = "mesh-1"
+    node_docs, _agent_docs, controller_docs = write_controller_state_dir(
+        tmp_path, role, node_count=2
+    )
+    cluster = FakeKubeCluster()
+    for node_doc in node_docs:
+        cluster._apply(node_doc)  # pylint: disable=protected-access
+    for controller_doc in controller_docs:
+        cluster._apply(controller_doc)  # pylint: disable=protected-access
+    cluster.pods.pop((NAMESPACE, "kwok-node-1"))
+
+    result = _reconcile(monkeypatch, cluster, role, tmp_path)
+
+    assert result["status"] == "ok"
+    assert (NAMESPACE, "kwok-node-1") in cluster.pods
+    assert all(doc["kind"] != "Pod" for doc in cluster.apply_calls)
+    owner = cluster.pods[(NAMESPACE, "kwok-node-1")]["metadata"][
+        "ownerReferences"
+    ][0]
+    assert owner["kind"] == "StatefulSet"
+    assert owner["name"] == "kwok-node"
+
+
+def test_self_heal_probe_evidence_moves_into_report_diagnostics(
+    tmp_path, monkeypatch,
+):
+    role = "mesh-1"
+    node_docs, agent_docs = write_state_dir(tmp_path, role, node_count=1)
+    state_dir = tmp_path / role
+    probe = {
+        "schema_version": 1,
+        "success": True,
+        "pod": "kwok-node-0",
+    }
+    (state_dir / "self-heal-probe.json").write_text(
+        json.dumps(probe), encoding="utf-8"
+    )
+    cluster = FakeKubeCluster()
+    cluster.seed(node_docs, agent_docs)
+    diagnostics_root = tmp_path / "report-diagnostics"
+
+    result = _reconcile(
+        monkeypatch,
+        cluster,
+        role,
+        tmp_path,
+        diagnostics_root=str(diagnostics_root),
+    )
+
+    destination = diagnostics_root / role / "self-heal-probe.json"
+    assert result["status"] == "ok"
+    assert destination.is_file()
+    assert json.loads(destination.read_text(encoding="utf-8")) == probe
+    assert not (state_dir / "self-heal-probe.json").exists()
+    assert str(destination) in result["diagnostic_files"]
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +840,51 @@ def test_unready_agent_pod_is_replaced(tmp_path, monkeypatch):
     assert result["recreated_agents"] == ["mock-cilium-agent-0"]
     assert ("pod", "mock-cilium-agent-0") in cluster.delete_calls
     assert cluster.pods[key]["status"]["phase"] == "Running"
+
+
+def test_unready_agent_diagnostics_are_captured_before_replacement(
+    tmp_path, monkeypatch,
+):
+    role = "mesh-1"
+    node_docs, agent_docs = write_state_dir(tmp_path, role, node_count=1)
+    cluster = FakeKubeCluster()
+    cluster.seed(node_docs, agent_docs)
+    key = (NAMESPACE, "mock-cilium-agent-0")
+    cluster.pods[key]["status"] = {
+        "phase": "Failed",
+        "containerStatuses": [{"ready": False}],
+    }
+    diagnostics_root = tmp_path / "diagnostics"
+
+    result = _reconcile(
+        monkeypatch,
+        cluster,
+        role,
+        tmp_path,
+        diagnostics_root=str(diagnostics_root),
+    )
+
+    assert result["status"] == "ok"
+    assert result["diagnostic_errors"] == []
+    state_path = (
+        diagnostics_root / role / "attempt-01" / "repair-state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["agents"][0]["name"] == "mock-cilium-agent-0"
+    assert state["agents"][0]["host_node"] == HEALTHY_REAL_NODE
+    assert state["events"][0]["reason"] == "Evicted"
+    assert (
+        diagnostics_root
+        / role
+        / "attempt-01"
+        / "mock-cilium-agent-0.current.log"
+    ).read_text(encoding="utf-8") == "mock-cilium-agent-0 current log\n"
+    assert (
+        diagnostics_root
+        / role
+        / "attempt-01"
+        / "mock-cilium-agent-0.previous.log"
+    ).read_text(encoding="utf-8") == "mock-cilium-agent-0 previous log\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1924,9 +2243,7 @@ def test_mock_reconcile_budget_is_zero_outside_mock_mode():
 
 
 def test_scenario_post_budget_seconds_reflects_bumped_mock_reconcile_budget():
-    """Proves the 300s bump propagates automatically through
-    scenario_post_budget_seconds (the shared "protected budget" accounting)
-    rather than needing every caller updated separately."""
+    """The post budget includes both reconciles and the derived cleanup bound."""
     out = _run_budget_function(
         [
             "scenario_quiet_window_seconds",
@@ -1944,8 +2261,8 @@ def test_scenario_post_budget_seconds_reflects_bumped_mock_reconcile_budget():
             "CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS": "900",
         },
     )
-    # quiet(60) + buffer(900) + artifact(600) + diag(300) + mock_reconcile(300) + cleanup(120) = 2280
-    assert out == "2280"
+    # 60 + 900 + 600 + 300 + (2 * 300) + 315 = 2775.
+    assert out == "2775"
 
 
 def test_run_mock_layer_reconcile_timeout_fallback_is_syntactically_wired():

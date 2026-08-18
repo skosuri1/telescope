@@ -592,6 +592,53 @@ KUBECONFIG="$kubeconfig" kubectl -n kube-system logs \
   -l io.cilium/app=operator --tail=2000 --prefix=true \
   > "$log_dir/cilium-operator.log" 2>&1 || true
 
+# Repair this cluster's persisted mock layer while Prometheus and the ACNS
+# monitors are still live, then audit the post-repair target set below. The
+# parent orchestration retains its post-cleanup all-cluster reconcile as a
+# second lifecycle boundary; this local pass prevents telemetry from judging
+# a target gap that we already know how to repair only after Prometheus has
+# been torn down.
+if [ "${CL2_MOCK_MODE:-false}" = "true" ] &&
+   [ -n "${CLUSTERMESH_RUN_ID:-}" ]; then
+  mock_reconciler="$(dirname "$python_script_file")/mock_layer_reconcile.py"
+  mock_state_root="$HOME/.kube/mock-layer-state/${CLUSTERMESH_RUN_ID}"
+  mock_state_metadata="${mock_state_root}/${role}/metadata.json"
+  mock_worker_inventory="$report_dir/mock-layer-worker-cluster.json"
+  mock_worker_summary="$report_dir/mock-layer-reconcile-worker-${role}.json"
+  if [ ! -f "$mock_reconciler" ]; then
+    echo "##vso[task.logissue type=error;] $role: mock-layer reconciler is missing at $mock_reconciler"
+    telemetry_coverage_failed=1
+  elif [ ! -s "$mock_state_metadata" ]; then
+    echo "##vso[task.logissue type=error;] $role: persisted mock desired state is missing at $mock_state_metadata"
+    telemetry_coverage_failed=1
+  else
+    jq -n \
+      --arg role "$role" \
+      --arg kubeconfig "$kubeconfig" \
+      '[{role: $role, kubeconfig: $kubeconfig}]' \
+      > "$mock_worker_inventory"
+    mock_worker_reconcile_rc=0
+    timeout --signal=TERM --kill-after=30s \
+      "${CL2_MOCK_WORKER_RECONCILE_TIMEOUT_SECONDS:-600}s" \
+      python3 "$mock_reconciler" \
+        --clusters "$mock_worker_inventory" \
+        --state-root "$mock_state_root" \
+        --run-id "$CLUSTERMESH_RUN_ID" \
+        --expected-mock-count "${CL2_MOCK_NODE_COUNT:-0}" \
+        --max-concurrent 1 \
+        --attempts "${CL2_MOCK_WORKER_RECONCILE_ATTEMPTS:-5}" \
+        --settle-seconds "${CL2_MOCK_WORKER_RECONCILE_SETTLE_SECONDS:-15}" \
+        --request-timeout-seconds 30 \
+        --diagnostics-dir "$report_dir/mock-layer-diagnostics-worker" \
+        --summary-file "$mock_worker_summary" ||
+      mock_worker_reconcile_rc=$?
+    if [ "$mock_worker_reconcile_rc" -ne 0 ]; then
+      echo "##vso[task.logissue type=error;] $role: pre-telemetry mock-layer reconcile failed rc=${mock_worker_reconcile_rc}; audit will run but required telemetry is invalid"
+      telemetry_coverage_failed=1
+    fi
+  fi
+fi
+
 if [ "${CL2_ACNS_TELEMETRY_ENABLED:-false}" = "true" ]; then
   acns_setup_script="$repo_root/scenarios/perf-eval/clustermesh-scale/telemetry/setup-acns-telemetry.sh"
   echo "------- $role: verifying fresh ACNS telemetry after CL2 -------"
@@ -714,24 +761,57 @@ if [ "${CL2_PROM_SNAPSHOT_ENABLED:-false}" = "true" ]; then
   if [ -z "$prom_pod" ]; then
     echo "##vso[task.logissue type=warning;] $role: prom-snapshot: no Running prometheus pod found in namespace monitoring (label app.kubernetes.io/name=prometheus); skipping snapshot"
   else
-    echo "  $role: prom-snapshot: pod=$prom_pod, starting port-forward"
-    pf_log=$(mktemp)
-    KUBECONFIG="$kubeconfig" kubectl -n monitoring port-forward \
-      "$prom_pod" :9090 >"$pf_log" 2>&1 &
-    PF_PID=$!
-    # Wait for port-forward to bind + report local port
+    PF_PID=""
+    pf_log=""
     local_port=""
-    for _i in $(seq 1 20); do
-      local_port=$(grep -oE 'Forwarding from 127\.0\.0\.1:[0-9]+' "$pf_log" 2>/dev/null \
-        | head -1 | grep -oE '[0-9]+$' || true)
-      [ -n "$local_port" ] && break
-      sleep 0.5
-    done
-    if [ -z "$local_port" ]; then
-      echo "##vso[task.logissue type=warning;] $role: prom-snapshot: port-forward never reported a local port (log: $(cat "$pf_log" 2>/dev/null | head -5)); skipping"
-      kill "$PF_PID" 2>/dev/null || true
+    stop_prom_port_forward() {
+      if [ -n "${PF_PID:-}" ]; then
+        kill "$PF_PID" 2>/dev/null || true
+        wait "$PF_PID" 2>/dev/null || true
+      fi
+      PF_PID=""
+      local_port=""
+    }
+    start_prom_port_forward() {
+      stop_prom_port_forward
+      if [ -n "${pf_log:-}" ]; then
+        rm -f "$pf_log"
+      fi
+      pf_log=$(mktemp)
+      KUBECONFIG="$kubeconfig" kubectl -n monitoring port-forward \
+        "$prom_pod" :9090 >"$pf_log" 2>&1 &
+      PF_PID=$!
+      for _i in $(seq 1 20); do
+        local_port=$(grep -oE 'Forwarding from 127\.0\.0\.1:[0-9]+' "$pf_log" 2>/dev/null \
+          | head -1 | grep -oE '[0-9]+$' || true)
+        if [ -n "$local_port" ] &&
+           curl -fsS --max-time 2 \
+             "http://127.0.0.1:${local_port}/-/ready" >/dev/null 2>&1; then
+          echo "  $role: prom-snapshot: verified port-forward on 127.0.0.1:$local_port"
+          return 0
+        fi
+        if ! kill -0 "$PF_PID" 2>/dev/null; then
+          break
+        fi
+        sleep 0.5
+      done
+      echo "  $role: prom-snapshot: port-forward did not become ready (log: $(head -5 "$pf_log" 2>/dev/null | tr '\n' ' '))"
+      stop_prom_port_forward
+      return 1
+    }
+    restart_prom_port_forward_for_retry() {
+      local delay_seconds="$1"
+      stop_prom_port_forward
+      if [ "$delay_seconds" -gt 0 ]; then
+        sleep "$delay_seconds"
+      fi
+      start_prom_port_forward
+    }
+
+    echo "  $role: prom-snapshot: pod=$prom_pod, starting port-forward"
+    if ! start_prom_port_forward; then
+      echo "##vso[task.logissue type=warning;] $role: prom-snapshot: unable to establish a verified Prometheus port-forward; skipping snapshot"
     else
-      echo "  $role: prom-snapshot: port-forward listening on 127.0.0.1:$local_port"
       snapshot_max_attempts="${CL2_PROM_SNAPSHOT_MAX_ATTEMPTS:-5}"
       snapshot_retry_seconds="${CL2_PROM_SNAPSHOT_RETRY_SECONDS:-2}"
       snapshot_error_retry_seconds="${CL2_PROM_SNAPSHOT_ERROR_RETRY_SECONDS:-10}"
@@ -856,8 +936,12 @@ if [ "${CL2_PROM_SNAPSHOT_ENABLED:-false}" = "true" ]; then
         fi
         if [ "$snapshot_server_error" = "true" ]; then
           if [ "$_snapshot_attempt" -lt "$snapshot_max_attempts" ]; then
-            echo "  $role: prom-snapshot: Prometheus returned HTTP ${snap_http_code}; retrying after completed server error in ${snapshot_error_retry_seconds}s"
-            sleep "$snapshot_error_retry_seconds"
+            echo "  $role: prom-snapshot: Prometheus returned HTTP ${snap_http_code}; recreating the port-forward before retry in ${snapshot_error_retry_seconds}s"
+            if ! restart_prom_port_forward_for_retry \
+                "$snapshot_error_retry_seconds"; then
+              snap_curl_error="${snap_curl_error}; port-forward recreation failed"
+              break
+            fi
             continue
           fi
           break
@@ -868,15 +952,14 @@ if [ "${CL2_PROM_SNAPSHOT_ENABLED:-false}" = "true" ]; then
           break
         fi
         if [ "$_snapshot_attempt" -lt "$snapshot_max_attempts" ]; then
-          echo "  $role: prom-snapshot: admin API attempt ${_snapshot_attempt}/${snapshot_max_attempts} returned no snapshot name (curl_rc=${snap_curl_rc}, http=${snap_http_code:-none}); retrying in ${snapshot_retry_seconds}s"
-          if [ "$snapshot_baseline_ok" != "true" ] &&
-             [ "$snapshot_retry_seconds" -gt 0 ]; then
-            sleep "$snapshot_retry_seconds"
+          echo "  $role: prom-snapshot: admin API attempt ${_snapshot_attempt}/${snapshot_max_attempts} returned no snapshot name (curl_rc=${snap_curl_rc}, http=${snap_http_code:-none}); recreating the port-forward before retry"
+          if ! restart_prom_port_forward_for_retry 0; then
+            snap_curl_error="${snap_curl_error}; port-forward recreation failed"
+            break
           fi
         fi
       done
-      kill "$PF_PID" 2>/dev/null || true
-      wait "$PF_PID" 2>/dev/null || true
+      stop_prom_port_forward
       if [ -z "$snap_name" ]; then
         prom_admin_api=$(timeout 15s env KUBECONFIG="$kubeconfig" \
           kubectl --request-timeout=10s -n monitoring get prometheus k8s \

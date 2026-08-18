@@ -490,11 +490,21 @@ steps:
 
       # Bound for one scenario-owned cleanup pass.
       scenario_cleanup_reconcile_budget_seconds() {
-        if [ "$cluster_count" -ge 50 ]; then
-          echo 300
-        else
-          echo 120
+        if [ -n "${CL2_SCENARIO_CLEANUP_RECONCILE_BUDGET_SECONDS:-}" ]; then
+          echo "$CL2_SCENARIO_CLEANUP_RECONCILE_BUDGET_SECONDS"
+          return
         fi
+        local _a="${CL2_SCENARIO_CLEANUP_RECONCILE_ATTEMPTS:-5}"
+        local _s="${CL2_SCENARIO_CLEANUP_RECONCILE_SETTLE_SECONDS:-15}"
+        local _r="${CL2_SCENARIO_CLEANUP_RECONCILE_REQUEST_TIMEOUT_SECONDS:-30}"
+        local _c _w
+        if [ "$cluster_count" -ge 50 ]; then
+          _c="${CL2_SCENARIO_CLEANUP_RECONCILE_CONCURRENCY:-12}"
+        else
+          _c="${CL2_SCENARIO_CLEANUP_RECONCILE_CONCURRENCY:-$cluster_count}"
+        fi
+        _w=$(( (cluster_count + _c - 1) / _c ))
+        echo $(( _w * (_a * (_r + _s) + _r) + 60 ))
       }
 
       # Mirror the probe script's scale-aware readiness default.
@@ -526,8 +536,7 @@ steps:
         _quiet=$(scenario_quiet_window_seconds "$1")
         _artifact=$(scenario_artifact_budget_seconds)
         _diag=$(scenario_diag_budget_seconds)
-        # The pre-scenario reconcile is accounted for separately.
-        _mock_reconcile=$(scenario_mock_reconcile_budget_seconds)
+        _mock_reconcile=$(( 2 * $(scenario_mock_reconcile_budget_seconds) ))
         _cleanup_reconcile=$(scenario_cleanup_reconcile_budget_seconds)
         echo $(( _quiet + CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS + _artifact + _diag + _mock_reconcile + _cleanup_reconcile ))
       }
@@ -602,6 +611,7 @@ steps:
           --attempts "$_attempts" \
           --settle-seconds "$_settle_seconds" \
           --request-timeout-seconds 30 \
+          --diagnostics-dir "${CL2_REPORT_DIR}/${SCENARIO}/mock-layer-diagnostics/${_label}" \
           --summary-file "$_output" || _rc=$?
         # Always persist an authoritative summary after an outer timeout.
         if [ "$_rc" -eq 124 ] || [ "$_rc" -eq 137 ]; then
@@ -662,11 +672,14 @@ steps:
       run_scenario_cleanup_reconcile() {
         local _output="$1"
         mkdir -p "$(dirname "$_output")"
-        local _concurrency
+        local _concurrency _attempts _settle _request
+        _attempts="${CL2_SCENARIO_CLEANUP_RECONCILE_ATTEMPTS:-5}"
+        _settle="${CL2_SCENARIO_CLEANUP_RECONCILE_SETTLE_SECONDS:-15}"
+        _request="${CL2_SCENARIO_CLEANUP_RECONCILE_REQUEST_TIMEOUT_SECONDS:-30}"
         if [ "$cluster_count" -ge 50 ]; then
-          _concurrency=12
+          _concurrency="${CL2_SCENARIO_CLEANUP_RECONCILE_CONCURRENCY:-12}"
         else
-          _concurrency="$cluster_count"
+          _concurrency="${CL2_SCENARIO_CLEANUP_RECONCILE_CONCURRENCY:-$cluster_count}"
         fi
         local _budget
         _budget=$(scenario_cleanup_reconcile_budget_seconds)
@@ -676,9 +689,9 @@ steps:
           --clusters "$HOME/.kube/clustermesh-clusters.json" \
           --scenario "$SCENARIO" \
           --max-concurrent "$_concurrency" \
-          --attempts 5 \
-          --settle-seconds 15 \
-          --request-timeout-seconds 30 \
+          --attempts "$_attempts" \
+          --settle-seconds "$_settle" \
+          --request-timeout-seconds "$_request" \
           --summary-file "$_output" || _rc=$?
         if [ "$_rc" -ne 0 ]; then
           echo "##vso[task.logissue type=error;] scenario-cleanup-reconcile failed rc=${_rc} for ${SCENARIO}; see ${_output} (scenario-health-gate.sh remains authoritative)"
@@ -1912,6 +1925,13 @@ steps:
             echo "##vso[task.logissue type=error;] ${SCENARIO}: scenario policy output is missing"
           fi
 
+          mock_reconcile_valid=true
+          if ! run_mock_layer_reconcile \
+              "pre-preserve" \
+              "${CL2_REPORT_DIR}/${SCENARIO}/mock-layer-reconcile-pre-preserve.json"; then
+            mock_reconcile_valid=false
+          fi
+
           artifact_preservation_rc=0
           timeout --signal=TERM --kill-after=30s \
             "${artifact_preservation_budget}s" \
@@ -2050,15 +2070,8 @@ steps:
 
           fi
 
-          # B.4.5: post-scenario ACTIVE cleanup of THIS scenario's own
-          # recoverable Kubernetes residue (namespaces, ACNS CRs, allowlisted
-          # monitoring/exporter objects) -- run AFTER diagnostics but BEFORE
-          # the mock-layer reconcile + health gate, so both of those observe
-          # an environment this scenario has already cleaned up after
-          # itself. This is repair, not proof: scenario-health-gate.sh below
-          # remains the proof-only, final authority, so a failure here is
-          # logged but does NOT independently stop the suite -- the health
-          # gate decides that.
+          # Remove allowlisted scenario residue before final reconciliation;
+          # the health gate remains the proof-only authority.
           cleanup_reconcile_output="${CL2_REPORT_DIR}/${SCENARIO}/scenario-cleanup-reconcile.json"
           if ! run_scenario_cleanup_reconcile "$cleanup_reconcile_output"; then
             echo "##vso[task.logissue type=warning;] ${SCENARIO}: scenario-cleanup-reconcile did not fully converge; deferring to the post-scenario health gate"
@@ -2066,7 +2079,6 @@ steps:
 
           # Repair the mock layer before the proof-only health gate.
           mock_reconcile_after_output="${CL2_REPORT_DIR}/${SCENARIO}/mock-layer-reconcile-after.json"
-          mock_reconcile_valid=true
           if ! run_mock_layer_reconcile "after" "$mock_reconcile_after_output"; then
             mock_reconcile_valid=false
           fi
@@ -2081,10 +2093,7 @@ steps:
             cleanup_concurrency="$cluster_count"
           fi
           cleanup_summary="${CL2_REPORT_DIR}/${SCENARIO}/scenario-health-gate.json"
-          # B.6: always run the health gate — even when measurement or
-          # evidence already failed — to prove baseline recovery. It is
-          # proof-only (no repair inside it); repair already happened via
-          # the reconciler passes above.
+          # Always prove baseline recovery, even after measurement failure.
           cleanup_gate_rc=0
           expected_mock_count=0
           if [ "$CL2_MOCK_MODE" = "true" ]; then
@@ -2102,13 +2111,7 @@ steps:
             --concurrency "$cleanup_concurrency" \
             --summary-file "$cleanup_summary" || cleanup_gate_rc=$?
 
-          # B.7: recovery_valid is normally just the health gate's result;
-          # node-churn scenarios ALSO require the churner's own pool
-          # restoration (cleanup_failed=false) — a target stimulus failure
-          # or recovery timeout invalidates THIS scenario's measurement
-          # (via target_stimulus_valid above) but, by design, does not by
-          # itself stop later scenarios as long as the health gate proves
-          # the shared baseline is healthy (intentional scenario isolation).
+          # Node churn also requires its pool-restoration finalizer.
           infrastructure_healthy=true
           if [ "$cleanup_gate_rc" -ne 0 ]; then
             infrastructure_healthy=false
