@@ -36,28 +36,11 @@ steps:
         set -x
       }
 
-      # Matrix variables (namespaces, mesh_size, deployments_per_namespace,
-      # replicas_per_deployment, hold_duration, warmup_duration, restart_count,
-      # api_server_calls_per_second, test_type) are auto-exported by AzDO to
-      # the script as UPPERCASE env vars (e.g. NAMESPACES, MESH_SIZE). Re-export
-      # them under the CL2_* names that scale.py and the CL2 yaml templates
-      # (config.yaml / event-throughput.yaml) consume.
-      #
-      # Why this re-export rather than `env: CL2_NAMESPACES: $(namespaces)` in
-      # the YAML: AzDO's `$()` runtime macro does not expand matrix variables
-      # in `env:` block values (see prior failed run with literal '$(namespaces)'
-      # reaching python). Same pattern as
-      # steps/engine/clusterloader2/network-scale/execute.yml which references
-      # the auto-exported names directly.
+      # Re-export AzDO's uppercase matrix variables under the CL2 names.
       export CL2_NAMESPACES="$NAMESPACES"
-      # %global variation knob (Hemanth/Anubhab feedback experiment): how many
-      # of the N namespaces get the `clustermesh.cilium.io/global=true` annotation.
-      # Default to NAMESPACES (100% global, backward-compatible). Matrix entries
-      # for the %global sweep set `global_namespace_count` explicitly.
+      # Default to 100% global namespaces.
       export CL2_GLOBAL_NAMESPACE_COUNT="${GLOBAL_NAMESPACE_COUNT:-$NAMESPACES}"
-      # test_type suffix for share-infra %global cells. See collect.yml header
-      # comment; this is exported here so the env propagates to downstream
-      # collect step in the same job. Empty string for non-matrix runs.
+      # Propagate the share-infra result suffix.
       export TEST_TYPE_SUFFIX="${TEST_TYPE_SUFFIX:-}"
       export CL2_DEPLOYMENTS_PER_NAMESPACE="$DEPLOYMENTS_PER_NAMESPACE"
       export CL2_REPLICAS_PER_DEPLOYMENT="$REPLICAS_PER_DEPLOYMENT"
@@ -65,36 +48,18 @@ steps:
       export CL2_HOLD_DURATION="$HOLD_DURATION"
       export CL2_WARMUP_DURATION="$WARMUP_DURATION"
       export CL2_RESTART_GENERATION="$RESTART_COUNT"
-      # MOCK mode (topology clustermesh-scale-mock): matrix/pipeline var
-      # `mock_mode` auto-exports as MOCK_MODE; re-export under the CL2_* name that
-      # scale.py configure (--mock-mode) consumes. Falls back to a directly-set
-      # CL2_MOCK_MODE pipeline variable, then to false → real runs unchanged.
+      # Normalize the matrix mock-mode value for scale.py.
       cl2_mock_mode_raw="${MOCK_MODE:-${CL2_MOCK_MODE:-false}}"
       export CL2_MOCK_MODE="${cl2_mock_mode_raw,,}"
-      # Default 100 virtual nodes in mock mode (matches deploy-mock-layer.yml's own
-      # MOCK_NODE_COUNT default, so an unset override behaves identically for both
-      # provisioning and CL2 configuration); real mode stays 0 (unchanged).
+      # Match the mock deployer's default virtual-node count.
       export CL2_MOCK_NODE_COUNT="${MOCK_NODE_COUNT:-$( [ "$CL2_MOCK_MODE" = "true" ] && echo 100 || echo 0 )}"
       export CL2_KWOK_USAGE_CPU="${KWOK_USAGE_CPU:-${CL2_KWOK_USAGE_CPU:-1m}}"
       export CL2_KWOK_USAGE_MEMORY="${KWOK_USAGE_MEMORY:-${CL2_KWOK_USAGE_MEMORY:-1Mi}}"
-      # CL2 attempt count for the per-cluster worker (run-cl2-on-cluster.sh). At
-      # scale a single cluster's AKS apiserver can throw a transient "server is
-      # currently unable to handle the request (post namespaces)" that kills CL2's
-      # prometheus-stack setup BEFORE any measurement (n=20 spike build 71650,
-      # mesh-2). The worker retries ONLY that early-setup signature (no junit yet),
-      # never real test outcomes. Default 2 in mock mode (cheap early retry), 1 in
-      # real mode → real runs are byte-for-byte unchanged. Honor an explicit override.
+      # Retry only the worker's recognized pre-measurement setup failure.
       export CL2_MAX_ATTEMPTS="${CL2_MAX_ATTEMPTS:-$( [ "$CL2_MOCK_MODE" = "true" ] && echo 2 || echo 1 )}"
-      # Prometheus memory limit (Gi). Consumed by scale.py (initial CL2 override)
-      # AND run-cl2-on-cluster.sh's prom-cr-patcher. Exported here so the stage
-      # variable reliably reaches both; unset -> the scripts default to 12Gi
-      # (mesh tiers unchanged). The 10k baseline sets it high (big prompool node).
+      # Shared Prometheus memory override for configure and runtime patching.
       export CL2_PROMETHEUS_MEMORY_LIMIT_GI="${CL2_PROMETHEUS_MEMORY_LIMIT_GI:-}"
-      # Phase 4a — Scenario #2 (Pod Churn Stress) knobs. Shell defaults so
-      # matrix entries that don't set these (event-throughput, default-config)
-      # silently fall back to the documented Phase 4a defaults rather than
-      # passing empty strings to argparse type=int. Pod-churn matrix entries
-      # set these explicitly via auto-exported uppercase matrix vars.
+      # Pod-churn defaults also protect argparse from empty matrix values.
       export CL2_CHURN_CYCLES="${CHURN_CYCLES:-5}"
       export CL2_CHURN_UP_DURATION="${CHURN_UP_DURATION:-60s}"
       export CL2_CHURN_DOWN_DURATION="${CHURN_DOWN_DURATION:-60s}"
@@ -103,13 +68,7 @@ steps:
       export CL2_KILL_BATCH="${KILL_BATCH:-5}"
       export CL2_KILL_DURATION_SECONDS="${KILL_DURATION_SECONDS:-600}"
       export CL2_KILL_JOB_DEADLINE_SECONDS="${KILL_JOB_DEADLINE_SECONDS:-660}"
-      # Per-worker watchdog timeout for execute-parallel (N=100 hardening,
-      # commit added 2026-05-19). Matrix entry can set worker_timeout_seconds
-      # (auto-exported as WORKER_TIMEOUT_SECONDS); default 0 = unbounded,
-      # which preserves all existing tier behavior (n=2/5/10/20). The
-      # watchdog SIGTERMs (then SIGKILLs) a worker that exceeds the budget,
-      # recording exit 124 — guards against pathological CL2/docker/kubectl
-      # hangs blocking the whole AzDO step until the job timeout.
+      # Optional per-worker watchdog; zero preserves unbounded behavior.
       export CL2_WORKER_TIMEOUT_SECONDS="${WORKER_TIMEOUT_SECONDS:-0}"
       # Phase 4b — Scenario #4 (ClusterMesh APIServer Failure) knobs.
       export CL2_APISERVER_KILL_TARGET_CONTEXT="${APISERVER_KILL_TARGET_CONTEXT:-clustermesh-1}"
@@ -117,11 +76,7 @@ steps:
       export CL2_APISERVER_KILL_OBSERVATION_SECONDS="${APISERVER_KILL_OBSERVATION_SECONDS:-60}"
       # Phase 4b — Scenario #7 (HA Configuration Validation) knob.
       export CL2_HA_CONFIG_REPLICAS="${HA_CONFIG_REPLICAS:-3}"
-      # Phase 4b — Scenario #3 (Node Churn / IP Churn) knobs.
-      # node-churner.sh (driven from this script, NOT Method:Exec — see
-      # config/node-churner.sh header for the design rationale) consumes
-      # these directly. scale.py configure also writes them into overrides.yaml
-      # so CL2 templates that reference CL2_NODE_CHURN_* can use them.
+      # Host-side node churn and CL2 overrides share these values.
       export CL2_NODE_CHURN_TARGET_CONTEXT="${NODE_CHURN_TARGET_CONTEXT:-${APISERVER_KILL_TARGET_CONTEXT:-clustermesh-1}}"
       export CL2_NODE_CHURN_TARGET_NODEPOOL="${NODE_CHURN_TARGET_NODEPOOL:-default}"
       export CL2_NODE_CHURN_CYCLES="${NODE_CHURN_CYCLES:-3}"
@@ -735,17 +690,7 @@ steps:
         wait "$_pid" 2>/dev/null || true
       }
 
-      # Launch propagation+connectivity probe orchestrator in background.
-      # Mirrors launch_node_churner: CL2 scenario yaml provides the workload
-      # (backend Deployment + global Service per cluster); orchestrator
-      # runs HOST-SIDE and emits PropagationTimings.jsonl +
-      # ConnectivityResults.jsonl into the LEADER cluster's per-cluster
-      # report dir (scale.py collect's _emit_propagation_probe_rows picks
-      # them up).
-      #
-      # Sets PROBE_PID. Caller `wait`s after execute-parallel returns so
-      # JSONLs are finalized before collect runs.
-      # Skips silently if CL2_PROPAGATION_PROBE_ENABLED != "true".
+      # Launch the host-side propagation probe and retain its PID.
       launch_propagation_probe() {
         local _scen="$1" _report_dir_base="$2"
         PROBE_PID=""
@@ -758,11 +703,7 @@ steps:
           echo "##vso[task.logissue type=warning;] propagation-probe: $_probe_script not found; skipping"
           return 0
         fi
-        # Output dir: leader cluster's per-cluster report dir. collect.py
-        # reads per-cluster report dirs keyed by ROLE (mesh-1, not the
-        # AKS name clustermesh-1), so we use .role here to match. Probe
-        # JSONLs land at <base>/mesh-1/ which scale.py's
-        # _emit_propagation_probe_rows picks up at collect time.
+        # Store probe rows under the leader role used by collect.py.
         local _leader_role _leader_name
         _leader_role=$(jq -r '.[0].role' < "$HOME/.kube/clustermesh-clusters.json")
         _leader_name=$(jq -r '.[0].name' < "$HOME/.kube/clustermesh-clusters.json")
@@ -804,17 +745,7 @@ steps:
         echo "propagation-probe: launched PID=$PROBE_PID for scenario=${_scen}; log=${_probe_log}"
       }
 
-      # Bounded wait for the host-side propagation-probe orchestrator.
-      # Polls PROBE_PID rather than using a bare shell `wait` (which would
-      # block forever if the background process somehow outlived its own
-      # internal workload-readiness/PROBE_COUNT deadlines) -- see
-      # propagation_probe_wait_budget_seconds for how the outer bound is
-      # computed. If that bound is exceeded the whole process GROUP is
-      # terminated via the existing terminate_process_group helper and
-      # this returns rc=124 (matching the coreutils `timeout` convention
-      # used elsewhere in this file). On normal completion the already-
-      # finalized PropagationTimings.jsonl/ConnectivityResults.jsonl are
-      # left untouched -- this function only observes exit status.
+      # Bound the host-side probe wait and terminate its process group on timeout.
       wait_propagation_probe() {
         local _scen="$1"
         PROBE_WAIT_RC=0
@@ -827,11 +758,7 @@ steps:
         _deadline=$(( $(date +%s) + _budget ))
         echo "propagation-probe: waiting on PID=$PROBE_PID for scenario=${_scen} (bounded to ${_budget}s)"
         while true; do
-          # Linux-specific liveness check: kill -0 alone reports true for
-          # zombie (already-exited, not-yet-reaped) children, which would
-          # make a plain `kill -0` polling loop never observe completion.
-          # Checking /proc's process state avoids that false positive;
-          # kill -0 remains the fallback if /proc is unavailable.
+          # Treat Linux zombie children as complete before the final wait.
           if [ -r "/proc/${PROBE_PID}/stat" ]; then
             _state=$(awk '{print $3}' "/proc/${PROBE_PID}/stat" 2>/dev/null)
             if [ "$_state" = "Z" ] || [ -z "$_state" ]; then
@@ -1003,14 +930,7 @@ steps:
         DETACH_REJOIN_PID=""
       }
 
-      # Cross-cluster CNP propagation cost probe. Applies the same CNP
-      # IN PARALLEL to every cluster, then polls each cluster's
-      # cilium-dbg policy get to measure per-cluster load latency.
-      # max(latency) = "time to fleet-wide enforcement" — the GitOps/
-      # Fleet workload-policy rollout question. Output: ${leader_role}-
-      # MeshPolicyPropProbe.jsonl. scale.py collect picks it up via
-      # _emit_policy_prop_probe_rows. Default OFF; opt-in via
-      # CL2_POLICY_PROP_PROBE_ENABLED=true.
+      # Measure parallel CNP application through fleet-wide enforcement.
       launch_mesh_policy_propagation_probe() {
         local _scen="$1" _report_dir_base="$2"
         POLICY_PROP_PID=""
@@ -1135,14 +1055,7 @@ steps:
         FAILOVER_PID=""
       }
 
-      # clustermesh-apiserver restart survival probe. Starts long-lived
-      # curl pods on every peer running an in-pod 1Hz curl loop against
-      # the victim's global Service, rolling-restarts clustermesh-apiserver
-      # on victim, verifies Deployment generation incremented, computes
-      # per-peer transport-survival ratio. Output ${leader_role}-
-      # MeshRestartSurvivalProbe.jsonl. scale.py collect picks it up via
-      # _emit_restart_survival_probe_rows. Default OFF; opt-in via
-      # CL2_RESTART_SURVIVAL_PROBE_ENABLED=true.
+      # Measure peer transport survival across a mesh-apiserver restart.
       launch_mesh_restart_survival_probe() {
         local _scen="$1" _report_dir_base="$2"
         RESTART_SURVIVAL_PID=""
@@ -1329,27 +1242,13 @@ steps:
         return 0
       }
 
-      # Proactive failure-time debug dump — runs after every scenario
-      # (always for node-churn; on rc!=0 for others). Writes diagnostic
-      # state to <report_dir>/_debug/scenario-diag-<scenario>.log so
-      # postmortem doesn't depend on AzDO retaining stdout. Captures:
-      #   - per-cluster `kubectl get nodes` (Ready state, IPs)
-      #   - per-cluster `kubectl -n kube-system get pods` (mesh + workload pods)
-      #   - per-cluster `cilium clustermesh status` (mesh health)
-      #   - clusters JSON snapshot
-      #   - share-infra meta snapshot
-      #   - node-churner.log + NodeChurnTimings_*.json contents (for node-churn)
-      # User direction 2026-05-14: assume failure; keep this dump baked
-      # in until end-to-end node-churn is green.
+      # Persist failure-time cluster, mesh, scenario, and churn diagnostics.
       scenario_failure_diag() {
         local _scen="$1" _rc="${2:-0}"
         local _diag_dir="${CL2_REPORT_DIR}/_debug"
         mkdir -p "$_diag_dir"
         local _diag_log="${_diag_dir}/scenario-diag-${_scen}.log"
-        # Read augmented clusters JSON (has kubeconfig field) — the shell
-        # `$clusters` var earlier in this script is the EARLY discovery
-        # output WITHOUT kubeconfig. Build 67126 regression: using
-        # `$clusters` here caused _kc=null → kubectl context errors.
+        # Use the augmented inventory because it contains kubeconfig paths.
         local _clusters_with_kc
         _clusters_with_kc=$(cat "$HOME/.kube/clustermesh-clusters.json" 2>/dev/null || echo "[]")
         {
@@ -1388,11 +1287,7 @@ steps:
             echo "-- recent kube-system events --"
             KUBECONFIG="$_kc" kubectl --context "$_name" -n kube-system get events \
               --sort-by=.lastTimestamp 2>&1 | tail -20 || true
-            # APF / kwok-controller / readiness diag. Root-cause of the n2 mesh-1
-            # readiness collapse (build 72911) was API Priority & Fairness starvation
-            # of the workload-low class throttling kwok-controller's pod-status PATCHes.
-            # These four probes surface that in-band, at the moment of failure, so future
-            # postmortems don't need a 30-min prom-snapshot dive.
+            # Capture the APF/KWOK signals behind prior readiness collapse.
             echo "-- APF rejections by priority (non-zero; kwok status-PATCHes live in workload-low) --"
             KUBECONFIG="$_kc" kubectl --context "$_name" get --raw /metrics 2>/dev/null \
               | awk '/^apiserver_flowcontrol_rejected_requests_total/ && $NF+0 != 0 { if (++n <= 20) print } END { if (n==0) exit 1 }' \
@@ -1419,16 +1314,7 @@ steps:
           echo ""
           if is_node_churn_scenario "$_scen"; then
             echo "-- node-churn timing files + logs --"
-            # Two report-dir layouts exist:
-            #   share-infra mode: <CL2_REPORT_DIR>/<scen>/<role>/...
-            #   solo-scenario mode: <CL2_REPORT_DIR>/<role>/...
-            # Search BOTH from CL2_REPORT_DIR root so we pick up
-            # NodeChurnTimings_*.json regardless of layout. Trailing
-            # `|| true` so an empty find (no files match) doesn't
-            # propagate non-zero through pipefail → set -e (build 67542
-            # solo-scenario n2_node_churn_combined exited 1 here even
-            # though both clusters' CL2 succeeded — find returned 1
-            # because the share-infra-style path didn't exist).
+            # Search both share-infra and single-scenario report layouts.
             find "${CL2_REPORT_DIR}" \
               \( -name 'NodeChurnTimings_*.json' -o -name 'node-churner*.log' \) \
               2>/dev/null | while IFS= read -r _f; do
@@ -1645,39 +1531,20 @@ steps:
             '. += [{"scenario": $name, "start_timestamp": $start}]' \
             "$SHARE_INFRA_META" > "${SHARE_INFRA_META}.tmp" && mv "${SHARE_INFRA_META}.tmp" "$SHARE_INFRA_META"
 
-          # Per-scenario report dir so collect.yml can iterate per-scenario.
-          # tear_down_prometheus=True so each scenario gets a clean Prom deploy
-          # (rather than colliding with the previous scenario's leftover
-          # PodMonitor + scrape config).
-          #
-          # Per-scenario max_concurrent override:
-          # The isolation scenario REQUIRES every peer cluster's Prometheus
-          # window to overlap the target's 10min churn window — otherwise
-          # peers in later batches start CL2 AFTER target's churn has
-          # ended and produce useless rows for the A/B. Bump concurrency to
-          # mesh_size (== cluster_count) for isolation. Safe at n=20 because
-          # peers SLEEP during the kill window — 1 heavy container + 19
-          # idle ones easily fits the agent. Same override applies to
-          # node-churn-* scenarios: node-churner.sh's ready-sentinel
-          # barrier requires every cluster's CL2 to be running before the
-          # first nodepool op fires.
+          # Mesh-wide scenarios require overlapping observation windows.
           if needs_mesh_wide_concurrency "$SCENARIO"; then
             EFFECTIVE_MAX_CONCURRENT="${cluster_count}"
             echo "Scenario ${SCENARIO}: overriding max_concurrent ${CL2_MAX_CONCURRENT:-4} → ${EFFECTIVE_MAX_CONCURRENT} (mesh-wide observation required)"
           else
             EFFECTIVE_MAX_CONCURRENT="${CL2_MAX_CONCURRENT:-4}"
           fi
-          # Launch the host-side stimulus driver for node-churn-* scenarios
-          # BEFORE execute-parallel so the churner is ready to consume CL2
-          # sentinels as soon as the per-cluster CL2 containers start.
+          # Start host-side churn before workers publish readiness sentinels.
           NODE_CHURNER_PID=""
           NODE_CHURNER_WAIT_RC=0
           if is_node_churn_scenario "$SCENARIO"; then
             launch_node_churner "$SCENARIO" "${CL2_REPORT_DIR}/${SCENARIO}"
           fi
-          # Propagation probe runs host-side too — orchestrator script
-          # polls all N peers' ipcache/identity/CEP. Launched in background
-          # before execute-parallel; we wait after the CL2 phase ends.
+          # Start host-side mesh probes before the CL2 fan-out.
           PROBE_PID=""
           RECOVERY_PID=""
           DETACH_REJOIN_PID=""
@@ -1951,23 +1818,7 @@ steps:
               CL2_PROM_SNAPSHOT_TARGET="$CL2_PROM_SNAPSHOT_TARGET" \
               bash "$SCENARIO_ARTIFACT_PRESERVER" || artifact_preservation_rc=$?
 
-          # Fix: parse the preservation script's OWN summary (authoritative)
-          # rather than treating every nonzero exit code as a shared
-          # evidence-infrastructure failure. The summary distinguishes:
-          #   - infrastructure_failure=true (Azure auth, blob upload/verify,
-          #     required tooling) -- or a missing/malformed summary, which
-          #     is fail-safe-treated the same way -- means the shared
-          #     evidence infrastructure itself is unsafe. artifact_preserved
-          #     is set false, which (via scenario_policy.py's
-          #     suite_stop_reasons/suite_continue) MUST stop later
-          #     scenarios.
-          #   - scenario_incomplete=true (missing/invalid worker summary,
-          #     missing/invalid role snapshots, relabel failure) with
-          #     infrastructure_failure=false means only THIS scenario's OWN
-          #     artifact set is incomplete. artifact_preserved stays true
-          #     (does NOT stop the suite) but folds into evidence_valid so
-          #     the final scenario_policy.py call below marks THIS
-          #     scenario's measurement_valid=false.
+          # Distinguish shared preservation failure from scenario-local gaps.
           artifact_summary_file="${CL2_REPORT_DIR}/${SCENARIO}/artifact-preservation-summary.json"
           artifact_preserved=true
           artifact_infrastructure_failure=false
@@ -2184,20 +2035,8 @@ steps:
             "$SHARE_INFRA_META" > "${SHARE_INFRA_META}.tmp" &&
             mv "${SHARE_INFRA_META}.tmp" "$SHARE_INFRA_META"
 
-          # B.8.5: final lifecycle-only artifact upload. Everything this
-          # scenario will ever write to scenario-policy.json/
-          # scenario-health-gate.json/mock-layer-reconcile-*.json is now
-          # on disk -- re-upload just these small durable-state files
-          # (PRESERVE_LIFECYCLE_ONLY=true) so Blob storage carries the
-          # FINAL suite_continue/recovery fields even if the job dies
-          # before the end-of-stage collect() step runs. Uploads the
-          # EARLY artifact-preservation-summary.json alongside them but
-          # writes its OWN artifact-preservation-final-summary.json only
-          # after all uploads finish (avoids a recursive self-upload
-          # race). A failure here is ALWAYS an infrastructure failure --
-          # the mode skips every scenario-local requirement -- so it must
-          # override artifact_preserved and re-finalize the policy/
-          # metadata that was just written above, then stop the suite.
+          # B.8.5: final lifecycle-only artifact upload.
+          # Persist final policy/recovery state before end-of-stage collection.
           final_lifecycle_infrastructure_failure=false
           if [ "${CL2_PROM_SNAPSHOT_ENABLED,,}" = "true" ] &&
              [ "${CL2_PROM_SNAPSHOT_TARGET,,}" = "blob" ]; then
@@ -2357,14 +2196,7 @@ steps:
             fi
           fi
 
-          # B.9: measurement validity and suite continuation are
-          # independent decisions. An invalid measurement alone (e.g. a
-          # target stimulus timeout, or evidence failure) marks the build
-          # SucceededWithIssues but — as long as suite_continue=true — the
-          # remaining scenarios still run, since the health gate above
-          # already proved the shared baseline recovered. Only stop the
-          # whole suite when suite_continue=false (recovery, infra,
-          # artifact preservation, or mock reconcile actually failed).
+          # B.9: measurement validity and suite continuation are independent.
           if [ "$measurement_valid" != "true" ]; then
             overall_rc=1
             if [ "$suite_continue" = "true" ]; then
@@ -2402,45 +2234,20 @@ steps:
             mv "${SHARE_INFRA_META}.tmp" "$SHARE_INFRA_META"
         done
 
-        # Make the meta file available to collect.yml via a step variable —
-        # written as task.setvariable so the next step in the same job picks it up.
+        # Make the meta file available to collect.yml.
         ado_set_variable SHARE_INFRA_META "$SHARE_INFRA_META"
 
         echo "============================================="
         echo "Share-infra summary: ${#SCENARIO_LIST[@]} scenarios processed, overall_rc=${overall_rc}"
         echo "============================================="
-        # Phase 4b: do NOT exit with non-zero on per-scenario failure.
-        # If we did, AzDO's default succeeded() gate on subsequent steps
-        # (collect + upload + destroy) would SKIP them and we'd lose ALL
-        # data even when most scenarios succeeded. Instead, emit
-        # `task.complete result=SucceededWithIssues` so the step shows
-        # orange in the AzDO UI (not green, not red) while still allowing
-        # downstream steps to run. Per-scenario failures remain visible
-        # via the ##vso[task.logissue type=warning] lines emitted in the
-        # loop above; per-row failures are also queryable in Kusto via
-        # the status column.
-        #
-        # Genuinely catastrophic failures (validation errors above this
-        # block) still exit 1 — those happen BEFORE any data is gathered
-        # so skipping downstream is the right call.
+        # Preserve collection after scenario failures; setup failures still exit.
         if [ "$overall_rc" -ne 0 ]; then
           ado_complete_with_issues
         fi
         exit 0
       fi
 
-      # Single-scenario path (default, unchanged from Phase 4a — prod pipeline
-      # relies on this).
-      #
-      # Bounded-parallel CL2 fan-out across clusters. Each worker invokes
-      # run-cl2-on-cluster.sh — same per-cluster body the bash for-loop used
-      # to run sequentially (CL2 invoke + junit gate + log capture + failure
-      # diag), now with bounded concurrency. CL2_MAX_CONCURRENT defaults to 4
-      # at the matrix level (event-throughput.yaml); smaller tiers can lower
-      # it to 1 to recover sequential behavior if needed.
-      #
-      # Same per-scenario override as the share-infra loop above: isolation
-      # and node-churn-* need mesh-wide concurrent observation.
+      # Single-scenario path with the same bounded fan-out and concurrency rules.
       SINGLE_SCENARIO_BASENAME="${CL2_CONFIG_FILE%.yaml}"
       if needs_mesh_wide_concurrency "$SINGLE_SCENARIO_BASENAME"; then
         EFFECTIVE_MAX_CONCURRENT="${cluster_count}"
@@ -2491,30 +2298,11 @@ steps:
       if [ "${NODE_CHURNER_WAIT_RC:-0}" -ne 0 ]; then
         single_scenario_rc="$NODE_CHURNER_WAIT_RC"
       fi
-      # Proactive failure debug dump for single-scenario mode too. Run
-      # unconditionally for node-churn AND upper-bound (rich state worth
-      # dumping regardless of success); rc!=0 for everything else.
+      # Always diagnose node-churn/upper-bound; diagnose other failures.
       if is_node_churn_scenario "$SINGLE_SCENARIO_BASENAME" || is_upper_bound_scenario "$SINGLE_SCENARIO_BASENAME" || [ "$single_scenario_rc" -ne 0 ]; then
         scenario_failure_diag "$SINGLE_SCENARIO_BASENAME" "$single_scenario_rc"
       fi
-      # In single-scenario prod mode we DON'T have a share-infra loop to
-      # break out of, but we still want the AzDO step to surface non-zero
-      # rc on CL2 failure (prod's existing contract). The churner-finalizer
-      # cleanup_failed state is logged via the timing JSON (Kusto-visible);
-      # we don't promote it to step failure here because terraform destroy
-      # will tear down the cluster regardless.
-      #
-      # 2026-05-21 (%global matrix experiment): mirror the share-infra
-      # behavior. At cl2_max_concurrent>=12, a SINGLE worker OOM/timeout
-      # would otherwise exit non-zero here, which causes AzDO's default
-      # `succeeded()` gate to skip the next steps (Collect + Upload Test
-      # Results to telescopedata). That loses ALL 99 successful workers'
-      # data for the cell. By emitting SucceededWithIssues and exit 0,
-      # collect/upload still run and per-row failures remain visible in
-      # the blob's `status` field + the warning logissue emitted by
-      # scale.py for the failed worker. Genuinely catastrophic
-      # pre-execute-parallel failures still exit 1 above this block
-      # (they happen before any data is gathered).
+      # Preserve collection after worker failures in single-scenario mode.
       if [ "$single_scenario_rc" -ne 0 ]; then
         echo "##vso[task.logissue type=warning;] Single-scenario CL2 exited rc=${single_scenario_rc} — some workers failed. Per-worker details in scale.py output above; per-cluster rows in blob carry status field. Emitting SucceededWithIssues so collect/upload still runs and successful workers' data is preserved."
         ado_complete_with_issues
