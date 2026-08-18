@@ -2,21 +2,27 @@
 """Reconcile the KWOK + mock-cilium-agent mock layer against its persisted desired state.
 
 `provision-kwok-layer.sh` (scenarios/perf-eval/clustermesh-scale/mock/) can persist the
-EXACT KWOK Node + mock-cilium-agent Pod manifests it generated for a cluster into
-MOCK_STATE_DIR (see deploy-mock-layer.yml, which sets one per cluster role under
-$HOME/.kube/mock-layer-state/<role>). This module is a bounded, best-effort repair
-pass over that already-deployed layer: for each cluster it loads the persisted
-desired manifests, inspects the live KWOK Nodes and mock-cilium-agent Pods via
-kubectl, and repairs ONLY the deterministic objects the manifests describe.
+EXACT KWOK Node + expected mock-cilium-agent Pod manifests it generated for a
+cluster into MOCK_STATE_DIR (see deploy-mock-layer.yml, which sets one per cluster
+role under $HOME/.kube/mock-layer-state/<role>). Current desired-state snapshots
+also persist the headless Service + StatefulSet that owns those Pods. This module
+is a bounded, best-effort repair pass over that already-deployed layer: for each
+cluster it loads the persisted desired manifests, inspects the live KWOK Nodes,
+agent controller, and mock-cilium-agent Pods via kubectl, and repairs ONLY the
+deterministic objects the manifests describe.
 
 It deliberately does much less than a general controller:
-  * It never touches anything outside the exact desired Node/Pod names it loaded.
+  * It never touches anything outside the exact desired Node/Pod/controller names
+    it loaded.
   * It never deletes an object it cannot account for in the desired manifests --
     any such "extra" object is unsafe drift and fails that cluster's reconcile
     rather than being silently removed.
   * It only recreates/repairs; it does not re-derive desired state (podCIDR
     scheme, cluster identity, inherited cilium-config, ...) -- that derivation
     happens once, in provision-kwok-layer.sh, at persist time.
+  * For controller-owned snapshots it never directly creates a Pod. It restores
+    the StatefulSet and deletes only unhealthy existing Pods; Kubernetes then
+    recreates missing ordinals from the persisted controller template.
 
 Exit code is 0 iff every cluster converges to a healthy, exact, 1:1 state within
 the bounded attempt budget; 1 otherwise. A structured JSON summary (schema_version,
@@ -28,6 +34,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -96,7 +103,7 @@ class UnsafeSourceSecretMissing(ReconcileError):
 
 @dataclass
 class DesiredState:
-    """The exact desired Nodes/Pods loaded from a cluster's persisted state dir."""
+    """The exact desired Nodes/Pods/controller loaded from persisted state."""
 
     namespace: str
     node_docs: Dict[str, dict]
@@ -108,6 +115,9 @@ class DesiredState:
     # persisted state predates support-manifest persistence (no "support/" dir) --
     # support-infra reconciliation is then skipped entirely (back-compat no-op).
     support_manifests: Optional[Dict[str, List[dict]]] = None
+    # Current snapshots persist a Service + StatefulSet in
+    # agent-controller.yaml. None keeps old naked-Pod snapshots compatible.
+    agent_controller_manifests: Optional[List[dict]] = None
 
 
 @dataclass
@@ -194,7 +204,6 @@ def load_desired_state(state_dir: str) -> DesiredState:
     """
     metadata_path = os.path.join(state_dir, "metadata.json")
     nodes_path = os.path.join(state_dir, "nodes.yaml")
-    agents_path = os.path.join(state_dir, "agents.yaml")
 
     if not os.path.isfile(metadata_path):
         raise ReconcileError(f"missing desired-state metadata: {metadata_path}")
@@ -207,6 +216,9 @@ def load_desired_state(state_dir: str) -> DesiredState:
         raise ReconcileError(
             f"invalid desired-state metadata {metadata_path}: expected a JSON object"
         )
+    agents_path = os.path.join(
+        state_dir, metadata.get("agent_manifest", "agents.yaml")
+    )
 
     namespace = metadata.get("agent_namespace")
     if not isinstance(namespace, str) or not namespace:
@@ -217,11 +229,22 @@ def load_desired_state(state_dir: str) -> DesiredState:
     node_docs = _load_yaml_docs(nodes_path, "Node")
     agent_docs = _load_yaml_docs(agents_path, "Pod")
 
+    identity_source = metadata.get("agent_identity_source", "serves-node-label")
+    if identity_source not in ("serves-node-label", "pod-name"):
+        raise ReconcileError(
+            f"desired-state metadata {metadata_path} has unsupported "
+            f"agent_identity_source={identity_source!r}"
+        )
+
     agent_for_node: Dict[str, str] = {}
     for agent_name, doc in agent_docs.items():
         doc_metadata = doc.get("metadata") or {}
         labels = doc_metadata.get("labels") if isinstance(doc_metadata, dict) else None
-        served = labels.get(SERVES_NODE_LABEL) if isinstance(labels, dict) else None
+        served = (
+            agent_name
+            if identity_source == "pod-name"
+            else labels.get(SERVES_NODE_LABEL) if isinstance(labels, dict) else None
+        )
         if not served:
             raise ReconcileError(
                 f"agent {agent_name!r} in {agents_path} missing '{SERVES_NODE_LABEL}' label"
@@ -258,6 +281,40 @@ def load_desired_state(state_dir: str) -> DesiredState:
             for key, filename in SUPPORT_MANIFEST_FILES.items()
         }
 
+    agent_controller_manifests: Optional[List[dict]] = None
+    controller_manifest = metadata.get("agent_controller_manifest")
+    if controller_manifest:
+        if not isinstance(controller_manifest, str):
+            raise ReconcileError(
+                f"desired-state metadata {metadata_path} has invalid "
+                "'agent_controller_manifest'"
+            )
+        agent_controller_manifests = _load_multidoc_yaml(
+            os.path.join(state_dir, controller_manifest)
+        )
+        statefulset = _find_doc(agent_controller_manifests, "StatefulSet")
+        service = _find_doc(agent_controller_manifests, "Service")
+        if statefulset is None or service is None:
+            raise ReconcileError(
+                f"persisted agent controller {controller_manifest} must contain "
+                "one Service and one StatefulSet"
+            )
+        sts_metadata = statefulset.get("metadata") or {}
+        sts_spec = statefulset.get("spec") or {}
+        if sts_metadata.get("namespace", namespace) != namespace:
+            raise ReconcileError(
+                f"persisted agent StatefulSet namespace does not match {namespace!r}"
+            )
+        if sts_spec.get("replicas") != len(agent_docs):
+            raise ReconcileError(
+                "persisted agent StatefulSet replicas does not match the "
+                f"{len(agent_docs)} expected agent Pods"
+            )
+        if identity_source != "pod-name":
+            raise ReconcileError(
+                "controller-owned agent state requires agent_identity_source='pod-name'"
+            )
+
     return DesiredState(
         namespace=namespace,
         node_docs=node_docs,
@@ -265,6 +322,7 @@ def load_desired_state(state_dir: str) -> DesiredState:
         agent_for_node=agent_for_node,
         metadata=metadata,
         support_manifests=support_manifests,
+        agent_controller_manifests=agent_controller_manifests,
     )
 
 
@@ -1016,6 +1074,165 @@ def reconcile_support_infra(
 
 
 # ---------------------------------------------------------------------------
+# Durable mock-agent controller reconciliation
+# ---------------------------------------------------------------------------
+
+def _agent_controller_name(desired: DesiredState) -> Optional[str]:
+    if desired.agent_controller_manifests is None:
+        return None
+    statefulset = _find_doc(desired.agent_controller_manifests, "StatefulSet")
+    return (statefulset.get("metadata") or {}).get("name") if statefulset else None
+
+
+def agent_controller_is_healthy(
+    kubeconfig: str, desired: DesiredState, timeout_seconds: float
+) -> Tuple[bool, List[str]]:
+    """Verify the persisted Service/StatefulSet desired subset.
+
+    Pod readiness is intentionally judged by the main convergence loop. A
+    temporarily unavailable ordinal must not make this helper continuously
+    re-apply an otherwise healthy controller while it is already recreating
+    that Pod.
+    """
+    manifests = desired.agent_controller_manifests
+    if manifests is None:
+        return True, []
+
+    problems: List[str] = []
+    for desired_doc in manifests:
+        kind = desired_doc.get("kind")
+        metadata = desired_doc.get("metadata") or {}
+        name = metadata.get("name")
+        namespace = metadata.get("namespace", desired.namespace)
+        resource = {
+            "Service": "service",
+            "StatefulSet": "statefulset",
+        }.get(kind)
+        if resource is None:
+            raise ReconcileError(
+                f"unsupported agent-controller manifest kind {kind!r}"
+            )
+        try:
+            live = kubectl_get_json(
+                kubeconfig, [resource, name], timeout_seconds, namespace=namespace
+            )
+        except ReconcileError as exc:
+            problems.append(f"{kind} {namespace}/{name} unavailable: {exc}")
+            continue
+
+        desired_metadata = {}
+        for field_name in ("labels", "annotations"):
+            if field_name in metadata:
+                desired_metadata[field_name] = metadata[field_name]
+        if desired_metadata:
+            problems.extend(
+                subset_diff(
+                    desired_metadata,
+                    live.get("metadata") or {},
+                    f"{kind} {namespace}/{name}.metadata",
+                )
+            )
+        problems.extend(
+            subset_diff(
+                desired_doc.get("spec") or {},
+                live.get("spec") or {},
+                f"{kind} {namespace}/{name}.spec",
+            )
+        )
+    return (not problems, problems)
+
+
+def apply_agent_controller(
+    kubeconfig: str, desired: DesiredState, timeout_seconds: float
+) -> None:
+    manifests = desired.agent_controller_manifests
+    if manifests is None:
+        return
+    kubectl_apply_docs(
+        kubeconfig,
+        manifests,
+        timeout_seconds,
+        namespace=desired.namespace,
+    )
+
+
+def reconcile_agent_controller(
+    kubeconfig: str,
+    desired: DesiredState,
+    attempts: int,
+    settle_seconds: float,
+    request_timeout_seconds: float,
+) -> Tuple[List[str], List[str]]:
+    """Restore the persisted Service/StatefulSet before inspecting agent Pods."""
+    if desired.agent_controller_manifests is None:
+        return [], []
+
+    repaired_reasons: List[str] = []
+    for attempt in range(1, attempts + 1):
+        healthy, problems = agent_controller_is_healthy(
+            kubeconfig, desired, request_timeout_seconds
+        )
+        if healthy:
+            return repaired_reasons, []
+
+        repaired_reasons = sorted(set(repaired_reasons) | set(problems))
+        try:
+            apply_agent_controller(
+                kubeconfig, desired, request_timeout_seconds
+            )
+        except ReconcileError as exc:
+            if attempt >= attempts:
+                return repaired_reasons, [str(exc)]
+        if attempt < attempts:
+            time.sleep(settle_seconds)
+
+    healthy, problems = agent_controller_is_healthy(
+        kubeconfig, desired, request_timeout_seconds
+    )
+    if healthy:
+        return repaired_reasons, []
+    return (
+        repaired_reasons,
+        problems
+        or ["mock-agent controller repair attempts exhausted without converging"],
+    )
+
+
+def _served_node_for_agent(
+    desired: DesiredState, agent_name: str, pod: dict
+) -> Optional[str]:
+    if desired.metadata.get("agent_identity_source") == "pod-name":
+        return agent_name
+    labels = ((pod.get("metadata") or {}).get("labels") or {})
+    return labels.get(SERVES_NODE_LABEL)
+
+
+def desired_agent_is_healthy(
+    desired: DesiredState,
+    agent_name: str,
+    pod: dict,
+    real_nodes: Dict[str, dict],
+) -> Tuple[bool, List[str]]:
+    healthy, problems = agent_is_healthy(
+        pod, desired.agent_docs[agent_name], real_nodes
+    )
+    controller_name = _agent_controller_name(desired)
+    if controller_name:
+        owner_references = (pod.get("metadata") or {}).get("ownerReferences") or []
+        if not any(
+            isinstance(owner, dict)
+            and owner.get("kind") == "StatefulSet"
+            and owner.get("name") == controller_name
+            and owner.get("controller") is True
+            for owner in owner_references
+        ):
+            problems.append(
+                f"not owned by StatefulSet {controller_name!r}"
+            )
+    return (healthy and not problems, problems)
+
+
+# ---------------------------------------------------------------------------
 # Planning + repair
 # ---------------------------------------------------------------------------
 
@@ -1037,7 +1254,9 @@ def plan_repairs(
     agents_to_recreate = set()
     for name, doc in desired.agent_docs.items():
         pod = agent_pods.get(name)
-        if pod is None or not agent_is_healthy(pod, doc, real_nodes)[0]:
+        if pod is None or not desired_agent_is_healthy(
+            desired, name, pod, real_nodes
+        )[0]:
             agents_to_recreate.add(name)
 
     # A recreated Node gets a fresh identity (podCIDR/providerID reapplied) --
@@ -1080,7 +1299,9 @@ def repair_diagnostics(
         problems = (
             ["missing"]
             if pod is None
-            else agent_is_healthy(pod, desired.agent_docs[name], real_nodes)[1]
+            else desired_agent_is_healthy(
+                desired, name, pod, real_nodes
+            )[1]
         )
         if not problems:
             problems = ["paired-with-node-repair"]
@@ -1164,6 +1385,109 @@ def _repair_batches(names: List[str]):
         yield names[start:start + REPAIR_BATCH_SIZE]
 
 
+def capture_agent_repair_diagnostics(
+    kubeconfig: str,
+    desired: DesiredState,
+    role: str,
+    attempt: int,
+    agent_names: List[str],
+    agent_pods: Dict[str, dict],
+    timeout_seconds: float,
+    diagnostics_root: Optional[str],
+) -> Tuple[List[str], List[str]]:
+    """Capture Pod state, placement, events, and logs before replacement."""
+    if not diagnostics_root:
+        return [], []
+
+    present_names = sorted(name for name in agent_names if name in agent_pods)
+    if not present_names:
+        return [], []
+
+    output_dir = os.path.join(
+        diagnostics_root,
+        role,
+        f"attempt-{attempt:02d}",
+    )
+    os.makedirs(output_dir, exist_ok=True)
+    errors: List[str] = []
+
+    events = []
+    try:
+        events_payload = kubectl_get_json(
+            kubeconfig,
+            ["events"],
+            timeout_seconds,
+            namespace=desired.namespace,
+        )
+        event_items = events_payload.get("items")
+        if not isinstance(event_items, list):
+            raise ReconcileError(
+                "kubectl get events returned no usable 'items' list"
+            )
+        present_set = set(present_names)
+        events = [
+            event
+            for event in event_items
+            if (
+                ((event.get("involvedObject") or {}).get("name"))
+                in present_set
+            )
+        ]
+    except ReconcileError as exc:
+        errors.append(f"event capture failed: {exc}")
+
+    pods = []
+    for name in present_names:
+        pod = agent_pods[name]
+        metadata = pod.get("metadata") or {}
+        spec = pod.get("spec") or {}
+        pods.append(
+            {
+                "name": name,
+                "served_node": _served_node_for_agent(desired, name, pod),
+                "host_node": spec.get("nodeName"),
+                "deletion_timestamp": metadata.get("deletionTimestamp"),
+                "owner_references": metadata.get("ownerReferences") or [],
+                "status": pod.get("status") or {},
+            }
+        )
+
+        for previous, suffix in ((False, "current"), (True, "previous")):
+            cmd = _base_cmd(
+                kubeconfig, timeout_seconds, desired.namespace
+            ) + ["logs", name, "--tail=500"]
+            if previous:
+                cmd.append("--previous")
+            path = os.path.join(output_dir, f"{name}.{suffix}.log")
+            try:
+                content = _run_kubectl(cmd, timeout_seconds)
+            except ReconcileError as exc:
+                content = f"diagnostic capture failed: {exc}\n"
+                errors.append(f"{name} {suffix} log capture failed: {exc}")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+
+    diagnostic_path = os.path.join(output_dir, "repair-state.json")
+    payload = {
+        "schema_version": 1,
+        "captured_at": datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "role": role,
+        "attempt": attempt,
+        "namespace": desired.namespace,
+        "agents": pods,
+        "events": events,
+        "errors": errors,
+    }
+    tmp_path = f"{diagnostic_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp_path, diagnostic_path)
+    return [diagnostic_path], errors
+
+
 def apply_repairs(
     kubeconfig: str,
     desired: DesiredState,
@@ -1172,17 +1496,48 @@ def apply_repairs(
     agent_pods: Dict[str, dict],
     timeout_seconds: float,
 ) -> None:
-    # Delete first (Node identity fields like podCIDR/providerID are immutable,
-    # so a drifted/unhealthy object must be deleted before it can be reapplied).
     # Never issue DELETEs for already-missing objects: kubectl expands a
     # multi-name delete into one request per name, so deleting 100 absent Pods
-    # can consume the whole command timeout and prevent the subsequent apply.
+    # can consume the whole command timeout and prevent the subsequent repair.
     present_agents = [
         name for name in plan.agents_to_recreate if name in agent_pods
     ]
     present_nodes = [
         name for name in plan.nodes_to_recreate if name in kwok_nodes
     ]
+
+    if desired.agent_controller_manifests is not None:
+        # With durable ownership, restore immutable Node identity first and
+        # only then recycle its paired Pod. Deleting a StatefulSet Pod before
+        # the Node is back would let the controller immediately recreate an
+        # agent against a temporarily absent logical Node.
+        for batch in _repair_batches(present_nodes):
+            kubectl_delete_many(
+                kubeconfig,
+                "node",
+                batch,
+                timeout_seconds,
+            )
+        for batch in _repair_batches(plan.nodes_to_recreate):
+            kubectl_apply_docs(
+                kubeconfig,
+                (desired.node_docs[name] for name in batch),
+                timeout_seconds,
+            )
+        for batch in _repair_batches(present_agents):
+            kubectl_delete_many(
+                kubeconfig,
+                "pod",
+                batch,
+                timeout_seconds,
+                namespace=desired.namespace,
+            )
+        # Missing ordinals are deliberately not applied as naked Pods. The
+        # already-reconciled StatefulSet owns their recreation.
+        return
+
+    # Legacy desired-state snapshots predate StatefulSet ownership. Preserve
+    # their original direct delete/re-apply behavior for safe resume support.
     for batch in _repair_batches(present_agents):
         kubectl_delete_many(
             kubeconfig,
@@ -1273,23 +1628,25 @@ def validate_converged(
         pod = agent_pods.get(name)
         if pod is None:
             continue
-        healthy, reasons = agent_is_healthy(pod, doc, real_nodes)
+        healthy, reasons = desired_agent_is_healthy(
+            desired, name, pod, real_nodes
+        )
         if not healthy:
             errors.append(f"agent {name} unhealthy: {', '.join(reasons)}")
-        pod_metadata = pod.get("metadata") or {}
-        labels = pod_metadata.get("labels") or {}
-        served = labels.get(SERVES_NODE_LABEL)
+        served = _served_node_for_agent(desired, name, pod)
         if served:
             served_by.setdefault(served, []).append(name)
 
     served_nodes = set(served_by)
     if served_nodes != desired_node_names:
         errors.append(
-            "serves-node coverage is not a unique one-to-one mapping onto the desired nodes"
+            "logical agent coverage is not a unique one-to-one mapping onto the desired nodes"
         )
     for served, agents in served_by.items():
         if len(agents) > 1:
-            errors.append(f"duplicate serves-node coverage for {served}: agents {sorted(agents)}")
+            errors.append(
+                f"duplicate logical coverage for {served}: agents {sorted(agents)}"
+            )
 
     return errors
 
@@ -1307,6 +1664,7 @@ def reconcile_cluster(
     settle_seconds: float,
     request_timeout_seconds: float,
     run_id: Optional[str] = None,
+    diagnostics_root: Optional[str] = None,
 ) -> dict:
     result = {
         "role": role,
@@ -1316,7 +1674,10 @@ def reconcile_cluster(
         "recreated_agents": [],
         "repaired_secrets": [],
         "repaired_support": [],
+        "repaired_agent_controller": [],
         "repair_diagnostics": {},
+        "diagnostic_files": [],
+        "diagnostic_errors": [],
         "errors": [],
     }
 
@@ -1328,10 +1689,59 @@ def reconcile_cluster(
         _progress(role, "desired-state", f"FAILED to load: {exc}")
         return result
 
+    persisted_migration_diagnostics = os.path.join(
+        state_dir, "legacy-agent-migration"
+    )
+    if diagnostics_root and os.path.isdir(persisted_migration_diagnostics):
+        migration_destination = os.path.join(
+            diagnostics_root, role, "legacy-migration"
+        )
+        try:
+            os.makedirs(os.path.dirname(migration_destination), exist_ok=True)
+            shutil.copytree(
+                persisted_migration_diagnostics,
+                migration_destination,
+                dirs_exist_ok=True,
+            )
+            shutil.rmtree(persisted_migration_diagnostics)
+            result["diagnostic_files"].extend(
+                str(path)
+                for path in sorted(
+                    (
+                        os.path.join(root, filename)
+                        for root, _dirs, filenames in os.walk(
+                            migration_destination
+                        )
+                        for filename in filenames
+                    )
+                )
+            )
+        except OSError as exc:
+            result["diagnostic_errors"].append(
+                f"failed to publish persisted legacy migration diagnostics: {exc}"
+            )
+
+    persisted_self_heal_probe = os.path.join(
+        state_dir, "self-heal-probe.json"
+    )
+    if diagnostics_root and os.path.isfile(persisted_self_heal_probe):
+        probe_destination = os.path.join(
+            diagnostics_root, role, "self-heal-probe.json"
+        )
+        try:
+            os.makedirs(os.path.dirname(probe_destination), exist_ok=True)
+            shutil.move(persisted_self_heal_probe, probe_destination)
+            result["diagnostic_files"].append(probe_destination)
+        except OSError as exc:
+            result["diagnostic_errors"].append(
+                f"failed to publish mock self-heal probe evidence: {exc}"
+            )
+
     _progress(
         role, "desired-state",
         f"loaded {len(desired.node_docs)} node(s)/{len(desired.agent_docs)} agent(s); "
         f"support_manifests={'present' if desired.support_manifests is not None else 'absent'}; "
+        f"agent_controller={'present' if desired.agent_controller_manifests is not None else 'legacy-naked-pods'}; "
         f"consume_clustermesh={bool(desired.metadata.get('consume_clustermesh'))}",
     )
 
@@ -1408,6 +1818,34 @@ def reconcile_cluster(
             role, "secrets",
             f"in sync (repaired {len(result['repaired_secrets'])} of "
             f"{len(CLUSTERMESH_SECRET_NAMES)} names)",
+        )
+
+    if desired.agent_controller_manifests is not None:
+        _progress(role, "agent-controller", "checking Service/StatefulSet")
+        repaired_controller, controller_errors = reconcile_agent_controller(
+            kubeconfig,
+            desired,
+            attempts,
+            settle_seconds,
+            request_timeout_seconds,
+        )
+        result["repaired_agent_controller"] = repaired_controller
+        if controller_errors:
+            result["errors"] = controller_errors
+            _progress(
+                role,
+                "agent-controller",
+                f"FAILED: {'; '.join(controller_errors)}",
+            )
+            return result
+        _progress(
+            role,
+            "agent-controller",
+            (
+                f"healthy (repaired {len(repaired_controller)} reason(s))"
+                if repaired_controller
+                else "healthy (no repair needed)"
+            ),
         )
 
     recreated_nodes: set = set()
@@ -1513,6 +1951,27 @@ def reconcile_cluster(
             )
             break
 
+        diagnostic_files, diagnostic_errors = capture_agent_repair_diagnostics(
+            kubeconfig,
+            desired,
+            role,
+            attempt,
+            plan.agents_to_recreate,
+            agent_pods,
+            request_timeout_seconds,
+            diagnostics_root,
+        )
+        result["diagnostic_files"] = sorted(
+            set(result["diagnostic_files"]) | set(diagnostic_files)
+        )
+        result["diagnostic_errors"].extend(diagnostic_errors)
+        if diagnostic_files:
+            _progress(
+                role,
+                "diagnostics",
+                f"captured pre-repair agent state in {diagnostic_files[0]}",
+            )
+
         try:
             apply_repairs(
                 kubeconfig,
@@ -1584,6 +2043,7 @@ def reconcile_all(
     settle_seconds: float,
     request_timeout_seconds: float,
     run_id: Optional[str] = None,
+    diagnostics_root: Optional[str] = None,
     on_result=None,
 ) -> List[dict]:
     """Reconcile every cluster (bounded concurrency), returning all results.
@@ -1615,6 +2075,7 @@ def reconcile_all(
                 settle_seconds,
                 request_timeout_seconds,
                 run_id,
+                diagnostics_root,
             )
             futures[future] = role
         for future in concurrent.futures.as_completed(futures):
@@ -1654,7 +2115,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--state-root", required=True,
         help="Base dir containing <state-root>/<role>/{nodes.yaml,agents.yaml,"
-             "metadata.json} as persisted by provision-kwok-layer.sh (MOCK_STATE_DIR).",
+             "metadata.json[,agent-controller.yaml]} as persisted by "
+             "provision-kwok-layer.sh (MOCK_STATE_DIR).",
     )
     parser.add_argument(
         "--expected-mock-count", type=int, default=None,
@@ -1683,6 +2145,11 @@ def parse_args(argv=None):
     parser.add_argument(
         "--request-timeout-seconds", type=float, default=30.0,
         help="Bounded timeout for each kubectl invocation.",
+    )
+    parser.add_argument(
+        "--diagnostics-dir", default=None,
+        help="Optional root directory for per-role pre-repair Pod state, events, "
+             "current logs, and previous logs.",
     )
     return parser.parse_args(argv)
 
@@ -1762,6 +2229,7 @@ def main(argv=None) -> int:
         settle_seconds=args.settle_seconds,
         request_timeout_seconds=args.request_timeout_seconds,
         run_id=args.run_id,
+        diagnostics_root=args.diagnostics_dir,
         on_result=_write_incremental_summary,
     )
 

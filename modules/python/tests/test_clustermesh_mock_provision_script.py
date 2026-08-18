@@ -42,9 +42,19 @@ FAKE_KUBECTL = textwrap.dedent("""\
         ;;
       *"get pods"*"-l app=mock-cilium-agent"*)
         n="${FAKE_NODE_COUNT:-0}"
-        for ((i = 0; i < n; i++)); do
-          printf 'mock-cilium-agent-%d   1/1   Running   0   1m\\n' "$i"
-        done
+        if [[ " $args " == *" -o json "* ]]; then
+          printf '{"items":['
+          sep=""
+          for ((i = 0; i < n; i++)); do
+            printf '%s{"metadata":{"name":"kwok-node-%d","ownerReferences":[{"kind":"StatefulSet","name":"kwok-node","controller":true}]}}' "$sep" "$i"
+            sep=","
+          done
+          printf ']}\\n'
+        else
+          for ((i = 0; i < n; i++)); do
+            printf 'kwok-node-%d   1/1   Running   0   1m\\n' "$i"
+          done
+        fi
         ;;
       *)
         : # cilium-config reads / apply / rollout status: succeed, no output.
@@ -171,21 +181,37 @@ class TestMockStateDirPersistence(unittest.TestCase):
 
             nodes_yaml = (state_dir / "nodes.yaml").read_text(encoding="utf-8")
             agents_yaml = (state_dir / "agents.yaml").read_text(encoding="utf-8")
+            controller_yaml = (
+                state_dir / "agent-controller.yaml"
+            ).read_text(encoding="utf-8")
             metadata = json.loads((state_dir / "metadata.json").read_text(encoding="utf-8"))
 
             self.assertIn("name: kwok-node-0", nodes_yaml)
             self.assertIn("name: kwok-node-1", nodes_yaml)
             self.assertEqual(nodes_yaml.count("kind: Node"), 2)
-            self.assertIn("name: mock-cilium-agent-0", agents_yaml)
-            self.assertIn("name: mock-cilium-agent-1", agents_yaml)
+            self.assertIn("name: kwok-node-0", agents_yaml)
+            self.assertIn("name: kwok-node-1", agents_yaml)
             self.assertEqual(agents_yaml.count("kind: Pod"), 2)
+            self.assertIn("kind: StatefulSet", controller_yaml)
+            self.assertIn("name: kwok-node", controller_yaml)
+            self.assertIn("podManagementPolicy: Parallel", controller_yaml)
+            self.assertIn("replicas: 2", controller_yaml)
+            self.assertIn("fieldPath: metadata.name", controller_yaml)
+            self.assertIn("targetPort: prometheus", controller_yaml)
 
-            self.assertEqual(metadata["schema_version"], 2)
+            self.assertEqual(metadata["schema_version"], 3)
             self.assertEqual(metadata["node_count"], 2)
             self.assertEqual(metadata["cluster_name"], "mesh-1")
             self.assertEqual(metadata["cluster_id"], "1")
             self.assertEqual(metadata["agent_namespace"], "mock-clustermesh")
             self.assertEqual(metadata["agent_image"], "fake.azurecr.io/mock-cilium-agent:v26")
+            self.assertEqual(metadata["agent_identity_source"], "pod-name")
+            self.assertEqual(metadata["agent_controller_kind"], "StatefulSet")
+            self.assertEqual(metadata["agent_controller_name"], "kwok-node")
+            self.assertEqual(
+                metadata["agent_controller_manifest"],
+                "agent-controller.yaml",
+            )
             self.assertEqual(metadata["run_id"], "run-abc123")
             self.assertIs(metadata["consume_clustermesh"], False)
             self.assertEqual(metadata["support_manifest_dir"], "support")

@@ -7,8 +7,8 @@ telescope repo). They are invoked by
 
 | Script | Purpose |
 |--------|---------|
-| `provision-kwok-layer.sh` | Per-cluster deployer: installs KWOK, creates N virtual nodes (per-cluster podCIDRs + distinct node IPs), deploys one mock-cilium-agent per node (Prometheus on :9962, clustermesh consume secrets), inherits the control-plane subset of the managed cilium-config. |
-| `attrition-check.sh` | Non-fatal liveness check: compares Running mock-cilium-agents vs KWOK nodes; always exits 0. |
+| `provision-kwok-layer.sh` | Per-cluster deployer: installs KWOK, creates N virtual nodes, and owns one mock-cilium-agent per node with a Parallel StatefulSet whose stable Pod names match the KWOK Nodes. |
+| `attrition-check.sh` | Non-fatal liveness check: compares StatefulSet readiness and Running mock agents with KWOK-node coverage; always exits 0. |
 
 ## Keeping these in sync
 

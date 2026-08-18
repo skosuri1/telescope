@@ -127,7 +127,7 @@ steps:
       # for the whole function — so every fallible step uses explicit
       # `|| return 1` rather than relying on errexit.
       deploy_one_cluster() {
-        local row="$1" name rg role kubeconfig kubelet_oid deadline running
+        local row="$1" name rg role kubeconfig kubelet_oid deadline running ready
         name=$(echo "$row" | jq -r '.name')
         rg=$(echo "$row"   | jq -r '.rg')
         role=$(echo "$row" | jq -r '.role')
@@ -184,19 +184,83 @@ steps:
             running=$(KUBECONFIG="$kubeconfig" kubectl -n mock-clustermesh get pods \
               -l app=mock-cilium-agent --field-selector=status.phase=Running \
               --no-headers 2>/dev/null | wc -l)
-            if [ "$running" -ge "$want" ]; then
-              echo "$role: $running/$want mock-cilium-agents Running"
-              return 0
+            ready=$(KUBECONFIG="$kubeconfig" kubectl -n mock-clustermesh get \
+              statefulset kwok-node -o jsonpath='{.status.readyReplicas}' \
+              2>/dev/null || echo 0)
+            ready="${ready:-0}"
+            if [ "$running" -ge "$want" ] && [ "$ready" -ge "$want" ]; then
+              echo "$role: $running/$want mock-cilium-agents Running; StatefulSet Ready=$ready/$want"
+              break
             fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "$role: ONLY $running/$want mock-cilium-agents Running after ${MOCK_READINESS_TIMEOUT_S:-600}s"
+              echo "$role: ONLY $running/$want mock-cilium-agents Running and $ready/$want StatefulSet Ready after ${MOCK_READINESS_TIMEOUT_S:-600}s"
               KUBECONFIG="$kubeconfig" kubectl -n mock-clustermesh get pods -l app=mock-cilium-agent \
                 -o jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{": "}{.status.containerStatuses[0].state}{"\n"}{end}' 2>/dev/null | head || true
               return 1
             fi
-            echo "$role: $running/$want Running, waiting..."
+            echo "$role: $running/$want Running; StatefulSet Ready=$ready/$want, waiting..."
             sleep 15
           done
+
+          if [ "${MOCK_SELF_HEAL_PROBE_ENABLED:-false}" = "true" ]; then
+            local probe_pod="kwok-node-0" before_uid after_uid pod_ready
+            local deleted_at recovered_at probe_deadline probe_delay
+            probe_delay="${MOCK_SELF_HEAL_PROBE_DELAY_SECONDS:-30}"
+            if ! [[ "$probe_delay" =~ ^[0-9]+$ ]]; then
+              echo "$role: invalid MOCK_SELF_HEAL_PROBE_DELAY_SECONDS=$probe_delay"
+              return 1
+            fi
+            echo "$role: waiting ${probe_delay}s before deleting $probe_pod for the StatefulSet self-heal probe"
+            sleep "$probe_delay"
+            before_uid=$(KUBECONFIG="$kubeconfig" kubectl -n mock-clustermesh \
+              get pod "$probe_pod" -o jsonpath='{.metadata.uid}' 2>/dev/null) ||
+              return 1
+            deleted_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            KUBECONFIG="$kubeconfig" kubectl -n mock-clustermesh delete pod \
+              "$probe_pod" --wait=true --timeout=120s >/dev/null || return 1
+            probe_deadline=$(( $(date +%s) + ${MOCK_SELF_HEAL_PROBE_TIMEOUT_SECONDS:-300} ))
+            while true; do
+              after_uid=$(KUBECONFIG="$kubeconfig" kubectl -n mock-clustermesh \
+                get pod "$probe_pod" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+              pod_ready=$(KUBECONFIG="$kubeconfig" kubectl -n mock-clustermesh \
+                get pod "$probe_pod" -o jsonpath='{.status.containerStatuses[0].ready}' \
+                2>/dev/null || true)
+              ready=$(KUBECONFIG="$kubeconfig" kubectl -n mock-clustermesh get \
+                statefulset kwok-node -o jsonpath='{.status.readyReplicas}' \
+                2>/dev/null || echo 0)
+              if [ -n "$after_uid" ] &&
+                 [ "$after_uid" != "$before_uid" ] &&
+                 [ "$pod_ready" = "true" ] &&
+                 [ "${ready:-0}" -ge "$want" ]; then
+                recovered_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                jq -n \
+                  --arg role "$role" \
+                  --arg pod "$probe_pod" \
+                  --arg before_uid "$before_uid" \
+                  --arg after_uid "$after_uid" \
+                  --arg deleted_at "$deleted_at" \
+                  --arg recovered_at "$recovered_at" \
+                  '{
+                    schema_version: 1,
+                    success: true,
+                    role: $role,
+                    pod: $pod,
+                    before_uid: $before_uid,
+                    after_uid: $after_uid,
+                    deleted_at: $deleted_at,
+                    recovered_at: $recovered_at
+                  }' > "$mock_state_dir/self-heal-probe.json"
+                echo "$role: StatefulSet self-heal probe passed for $probe_pod ($before_uid -> $after_uid)"
+                break
+              fi
+              if [ "$(date +%s)" -ge "$probe_deadline" ]; then
+                echo "$role: StatefulSet self-heal probe timed out for $probe_pod"
+                return 1
+              fi
+              sleep 5
+            done
+          fi
+          return 0
         } > "$statedir/$role.log" 2>&1
       }
 

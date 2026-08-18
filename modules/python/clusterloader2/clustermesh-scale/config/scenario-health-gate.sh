@@ -198,6 +198,8 @@ observe_cluster() {
   local mock_node_count=0 mock_ready_node_count=0 mock_schedulable_node_count=0
   local mock_node_names='[]'
   local mock_agent_count=0 mock_running_agent_count=0 mock_ready_agent_count=0
+  local mock_controller_desired=-1 mock_controller_current=-1
+  local mock_controller_ready=-1 mock_controller_owned_agent_count=0
   local mock_coverage_served_count=0 mock_coverage_unique_count=0
   local mock_coverage_duplicate_count=0
   local mock_coverage_missing_nodes='[]' mock_coverage_orphan_agents='[]'
@@ -358,6 +360,27 @@ observe_cluster() {
 
   local mock_nodes_available=false
   if [ "$expected_mock_count" -gt 0 ]; then
+    if kube "$kubeconfig" "$context" -n mock-clustermesh get \
+        statefulset kwok-node -o json; then
+      if jq -e 'type == "object"' <<<"$K_OUT" >/dev/null 2>&1; then
+        mock_controller_desired=$(jq -r '.spec.replicas // 0' <<<"$K_OUT")
+        mock_controller_current=$(jq -r '.status.currentReplicas // 0' <<<"$K_OUT")
+        mock_controller_ready=$(jq -r '.status.readyReplicas // 0' <<<"$K_OUT")
+        if [ "$mock_controller_desired" -ne "$expected_mock_count" ] ||
+           [ "$mock_controller_current" -ne "$expected_mock_count" ] ||
+           [ "$mock_controller_ready" -ne "$expected_mock_count" ]; then
+          failures=$(append_failure "$failures" \
+            "mock-agent StatefulSet desired/current/Ready expected=${expected_mock_count}, observed=${mock_controller_desired}/${mock_controller_current}/${mock_controller_ready}")
+        fi
+      else
+        failures=$(append_failure "$failures" \
+          "mock-agent StatefulSet response was not a Kubernetes object")
+      fi
+    else
+      failures=$(append_failure "$failures" \
+        "get mock-agent StatefulSet failed: $K_ERROR")
+    fi
+
     if kube "$kubeconfig" "$context" get nodes -l type=kwok -o json; then
       if jq -e '.items | type == "array"' <<<"$K_OUT" >/dev/null 2>&1; then
         mock_nodes_available=true
@@ -403,22 +426,42 @@ observe_cluster() {
            | select(all(.status.containerStatuses[]; .ready == true))]
           | length
         ' <<<"$K_OUT")
+        mock_controller_owned_agent_count=$(jq '
+          [.items[]
+           | select(any(.metadata.ownerReferences[]?;
+               .kind == "StatefulSet" and
+               .name == "kwok-node" and
+               (.controller // false) == true))]
+          | length
+        ' <<<"$K_OUT")
         if [ "$mock_agent_count" -ne "$expected_mock_count" ] ||
            [ "$mock_running_agent_count" -ne "$expected_mock_count" ] ||
-           [ "$mock_ready_agent_count" -ne "$expected_mock_count" ]; then
+           [ "$mock_ready_agent_count" -ne "$expected_mock_count" ] ||
+           [ "$mock_controller_owned_agent_count" -ne "$expected_mock_count" ]; then
           failures=$(append_failure "$failures" \
-            "mock Cilium agents expected/present/Running/Ready=${expected_mock_count}/${mock_agent_count}/${mock_running_agent_count}/${mock_ready_agent_count}")
+            "mock Cilium agents expected/present/Running/Ready/controller-owned=${expected_mock_count}/${mock_agent_count}/${mock_running_agent_count}/${mock_ready_agent_count}/${mock_controller_owned_agent_count}")
         fi
 
-        # mock-clustermesh/serves-node coverage: every agent must serve a
-        # nonempty, unique node name; the set of served names must exactly
-        # match the live KWOK node names -- no duplicates (two agents
-        # claiming the same node), no orphans (an agent serving a node that
-        # no longer exists or has no label), and no missing coverage (a
-        # node with no serving agent).
+        # Logical node coverage: current StatefulSet Pods are named exactly
+        # like the KWOK Node they serve. The legacy serves-node label remains
+        # a read-only fallback so diagnostics stay intelligible during a
+        # controlled migration, but controller ownership above is mandatory.
         mock_coverage_json=$(jq -c --argjson nodes "$mock_node_names" '
           (.items | length) as $total_agents
-          | ([.items[] | ((.metadata.labels // {})["mock-clustermesh/serves-node"] // empty)]) as $served
+          | ([.items[]
+              | (
+                  ((.metadata.labels // {})["mock-clustermesh/serves-node"])
+                  // (
+                    if any(.metadata.ownerReferences[]?;
+                        .kind == "StatefulSet" and
+                        .name == "kwok-node" and
+                        (.controller // false) == true)
+                    then .metadata.name
+                    else empty
+                    end
+                  )
+                )
+            ]) as $served
           | ($served | length) as $served_count
           | ($served | unique) as $unique_served
           | ($unique_served | length) as $unique_count
@@ -449,7 +492,7 @@ observe_cluster() {
         if [ "$mock_nodes_available" = "true" ] &&
            [ "$mock_coverage_exact_match" != "true" ]; then
           failures=$(append_failure "$failures" \
-            "mock-clustermesh/serves-node coverage mismatch: served=${mock_coverage_served_count} unique=${mock_coverage_unique_count} duplicates=${mock_coverage_duplicate_count} missing_nodes=$(jq -r 'join(",")' <<<"$mock_coverage_missing_nodes") orphan_agents=$(jq -r 'join(",")' <<<"$mock_coverage_orphan_agents")")
+            "mock-agent logical-node coverage mismatch: served=${mock_coverage_served_count} unique=${mock_coverage_unique_count} duplicates=${mock_coverage_duplicate_count} missing_nodes=$(jq -r 'join(",")' <<<"$mock_coverage_missing_nodes") orphan_agents=$(jq -r 'join(",")' <<<"$mock_coverage_orphan_agents")")
         fi
       else
         failures=$(append_failure "$failures" \
@@ -541,9 +584,13 @@ observe_cluster() {
     --argjson mock_node_count "$mock_node_count" \
     --argjson mock_ready_node_count "$mock_ready_node_count" \
     --argjson mock_schedulable_node_count "$mock_schedulable_node_count" \
+    --argjson mock_controller_desired "$mock_controller_desired" \
+    --argjson mock_controller_current "$mock_controller_current" \
+    --argjson mock_controller_ready "$mock_controller_ready" \
     --argjson mock_agent_count "$mock_agent_count" \
     --argjson mock_running_agent_count "$mock_running_agent_count" \
     --argjson mock_ready_agent_count "$mock_ready_agent_count" \
+    --argjson mock_controller_owned_agent_count "$mock_controller_owned_agent_count" \
     --argjson mock_coverage_served_count "$mock_coverage_served_count" \
     --argjson mock_coverage_unique_count "$mock_coverage_unique_count" \
     --argjson mock_coverage_duplicate_count "$mock_coverage_duplicate_count" \
@@ -585,9 +632,15 @@ observe_cluster() {
         nodes: $mock_node_count,
         ready_nodes: $mock_ready_node_count,
         schedulable_nodes: $mock_schedulable_node_count,
+        controller: {
+          desired: $mock_controller_desired,
+          current: $mock_controller_current,
+          ready: $mock_controller_ready
+        },
         agents: $mock_agent_count,
         running_agents: $mock_running_agent_count,
         ready_agents: $mock_ready_agent_count,
+        controller_owned_agents: $mock_controller_owned_agent_count,
         serves_node_coverage: {
           served_count: $mock_coverage_served_count,
           unique_count: $mock_coverage_unique_count,

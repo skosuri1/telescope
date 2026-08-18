@@ -7,8 +7,10 @@
 #   1. Installs the KWOK controller (pinned to the real node pool) + lifecycle Stages.
 #   2. Creates N KWOK virtual nodes, each with a DISTINCT podCIDR (10.245.<i>.0/24)
 #      so KWOK assigns globally-unique Pod IPs within the cluster.
-#   3. Deploys N mock-cilium-agents (one per virtual node, on the real pool),
-#      each with K8S_NODE_NAME=<node> and Prometheus metrics enabled.
+#   3. Deploys one controller-owned mock-cilium-agent per virtual node on the
+#      real pool. A Parallel StatefulSet gives every agent a stable Pod name
+#      identical to the KWOK Node it serves, so deleted/evicted agents are
+#      recreated automatically without an out-of-band repair pass.
 #
 # Design notes baked in (from prior findings):
 #   - KWOK gives each Pod a unique IP from node.spec.podCIDR on the real
@@ -42,16 +44,16 @@
 #                     remote identities/endpoints/nodes/services). Set false for
 #                     a publish-only layer.
 #   MOCK_STATE_DIR    when set, the EXACT generated desired-state manifests
-#                     (KWOK Nodes + mock-cilium-agent Pods), the already-rendered
-#                     KWOK support manifests (patched kwok-controller Deployment,
+#                     (KWOK Nodes + expected controller-owned agent Pods + the
+#                     agent Service/StatefulSet), the already-rendered KWOK
+#                     support manifests (patched kwok-controller Deployment,
 #                     stage-fast, APF PriorityLevel/FlowSchema, agent RBAC) under
 #                     a support/ subdir, plus a metadata.json describing them,
 #                     are persisted here ATOMICALLY after a successful
 #                     provisioning pass, so an out-of-band reconciler can later
-#                     recreate/repair only these deterministic, owned objects
-#                     without re-deriving OR re-downloading the desired state
-#                     itself. Unset (default): no persistence; behavior is
-#                     unchanged.
+#                     repair only these deterministic, owned objects without
+#                     re-deriving OR re-downloading desired state. Unset
+#                     (default): no persistence; behavior is unchanged.
 #   MOCK_RUN_ID       the pipeline RUN_ID this provisioning pass belongs to.
 #                     Persisted verbatim into metadata.json's "run_id" field so
 #                     an out-of-band reconciler (given an --run-id) can detect
@@ -71,6 +73,8 @@ METRICS_PORT="${METRICS_PORT:-9962}"
 CONSUME_CLUSTERMESH="${CONSUME_CLUSTERMESH:-true}"
 MOCK_STATE_DIR="${MOCK_STATE_DIR:-}"
 MOCK_RUN_ID="${MOCK_RUN_ID:-}"
+AGENT_CONTROLLER_NAME="kwok-node"
+AGENT_SERVICE_NAME="kwok-node"
 
 K() { kubectl --kubeconfig="$KUBECONFIG_FILE" "$@"; }
 
@@ -281,10 +285,11 @@ kretry K apply -f "${WORK}/rbac.yaml" >/dev/null
 # scales with (agents x mesh state) and is otherwise frozen at ~1 real agent.
 #
 # Why this is needed: Fleet only patches the MANAGED cilium DaemonSet to mount
-# clustermesh-secrets; our mock agents are bare Pods it never reconciles, so we
-# plumb the same secrets ourselves. The mesh-22-style config file points at the
-# LOCAL service (clustermesh-apiserver.kube-system.svc:2379), so no cross-cluster
-# networking is involved. The FORK stays agnostic — this is deploy-layer only.
+# clustermesh-secrets; our mock-agent StatefulSet is outside Fleet ownership, so
+# we plumb the same secrets ourselves. The mesh-22-style config file points at
+# the LOCAL service (clustermesh-apiserver.kube-system.svc:2379), so no
+# cross-cluster networking is involved. The FORK stays agnostic — this is
+# deploy-layer only.
 # ---------------------------------------------------------------------------
 CM_ARG=""; CM_MOUNT=""; CM_VOLUME=""; CONSUME_CLUSTERMESH_ACTIVE=false
 if [[ "${CONSUME_CLUSTERMESH}" == "true" ]]; then
@@ -343,6 +348,7 @@ echo ">>> Step 3: Generating ${NODE_COUNT} virtual node(s) + agent(s)..."
 # small N (multi-cluster tiers) this is identical output, just faster.
 NODES_FILE="${WORK}/kwok-nodes.yaml"
 AGENTS_FILE="${WORK}/mock-agents.yaml"
+AGENT_CONTROLLER_FILE="${WORK}/mock-agent-controller.yaml"
 : > "$NODES_FILE"
 : > "$AGENTS_FILE"
 if [ "${NODE_COUNT}" -gt 32768 ]; then
@@ -433,21 +439,24 @@ status:
   nodeInfo: { architecture: amd64, kubeletVersion: fake-kwok-${KWOK_VER}, operatingSystem: linux }
 EOF
 
-  # --- mock-cilium-agent for this node ---
+  # --- expected controller-owned mock-cilium-agent Pod for this node ---
+  # This per-ordinal desired Pod is persisted for exact reconciliation but is
+  # NOT applied directly. The StatefulSet rendered after this loop owns the
+  # live Pods and recreates them after eviction/deletion. Naming the Pod exactly
+  # like the KWOK Node lets K8S_NODE_NAME come directly from metadata.name.
   #   - prometheus.io/* annotations so a standard Prometheus scrapes per-pod metrics.
   #   - --prometheus-serve-addr=:${METRICS_PORT} exposes cilium_process_* + control-plane
   #     metrics (no collision: hostNetwork=false → own Pod IP).
-  #   - serves-node label = the explicit node->agent reverse link (agent-only label).
   cat >> "$AGENTS_FILE" <<EOF
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: mock-cilium-agent-${i}
+  name: ${NODE}
   namespace: ${AGENT_NS}
   labels:
     app: mock-cilium-agent
-    mock-clustermesh/serves-node: ${NODE}
+    mock-clustermesh/agent-controller: ${AGENT_CONTROLLER_NAME}
   annotations:
     prometheus.io/scrape: "true"
     prometheus.io/port: "${METRICS_PORT}"
@@ -499,7 +508,10 @@ ${CM_ARG}
     - { name: prometheus, containerPort: ${METRICS_PORT} }
     env:
     - { name: MOCK_CLUSTERMESH_SKIP_ROOT_CHECK, value: "1" }
-    - { name: K8S_NODE_NAME, value: ${NODE} }
+    - name: K8S_NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - { name: KUBE_FEATURE_GATES, value: "WatchListClient=false" }
     resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: 500m, memory: 1Gi } }
     volumeMounts:
@@ -510,16 +522,171 @@ ${CM_MOUNT}
   - { name: run-state, emptyDir: {} }
   - { name: lib-state, emptyDir: {} }
 ${CM_VOLUME}
-  restartPolicy: OnFailure
+  restartPolicy: Always
 EOF
   if [ "$(( i % 2000 ))" -eq 0 ]; then echo "   ...generated manifests for ${i}/${NODE_COUNT}"; fi
 done
 
-# Bulk apply: split each manifest file into ~500-doc chunks and apply with bounded
+# Render one selectorless headless Service + Parallel StatefulSet from the first
+# expected Pod. Selectorless avoids creating mesh-visible agent EndpointSlices.
+# Every ordinal gets the same template, and metadata.name supplies the logical
+# KWOK-node identity (`kwok-node-0`, `kwok-node-1`, ...). The per-Pod desired
+# manifests above remain the reconciler's exact validation contract.
+python3 - "$AGENTS_FILE" "$AGENT_CONTROLLER_FILE" "$NODE_COUNT" \
+  "$AGENT_NS" "$AGENT_CONTROLLER_NAME" "$AGENT_SERVICE_NAME" <<'PY'
+import copy
+import sys
+
+import yaml
+
+agents_path, output_path, replicas, namespace, controller_name, service_name = sys.argv[1:]
+with open(agents_path, "r", encoding="utf-8") as handle:
+    agent_docs = [doc for doc in yaml.safe_load_all(handle) if doc is not None]
+if not agent_docs:
+    raise SystemExit("no expected agent Pods were generated")
+
+first = agent_docs[0]
+metadata = first["metadata"]
+template_metadata = {
+    "labels": copy.deepcopy(metadata.get("labels") or {}),
+    "annotations": copy.deepcopy(metadata.get("annotations") or {}),
+}
+template = {
+    "metadata": template_metadata,
+    "spec": copy.deepcopy(first["spec"]),
+}
+labels = copy.deepcopy(template_metadata["labels"])
+container_port = first["spec"]["containers"][0]["ports"][0]["containerPort"]
+documents = [
+    {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": service_name, "namespace": namespace},
+        "spec": {
+            "clusterIP": "None",
+            "publishNotReadyAddresses": True,
+            "ports": [
+                {
+                    "name": "prometheus",
+                    "port": container_port,
+                    "targetPort": "prometheus",
+                }
+            ],
+        },
+    },
+    {
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {"name": controller_name, "namespace": namespace},
+        "spec": {
+            "serviceName": service_name,
+            "replicas": int(replicas),
+            "podManagementPolicy": "Parallel",
+            "selector": {"matchLabels": labels},
+            "updateStrategy": {"type": "RollingUpdate"},
+            "template": template,
+        },
+    },
+]
+with open(output_path, "w", encoding="utf-8") as handle:
+    yaml.safe_dump_all(
+        documents,
+        handle,
+        default_flow_style=False,
+        explicit_start=True,
+        sort_keys=False,
+    )
+PY
+
+# Controlled migration from the historical naked Pods. If a partial prior
+# migration left the StatefulSet present, remove it first so old and new agents
+# can never serve the same virtual Node concurrently. Capture the legacy Pods,
+# namespace events, current logs, and previous logs before deleting them.
+MIGRATION_DIAG_DIR="${WORK}/legacy-agent-migration"
+legacy_agents_json="${WORK}/legacy-agents.json"
+if ! kretry K -n "${AGENT_NS}" get pods -l app=mock-cilium-agent \
+    -o json > "$legacy_agents_json"; then
+  echo "ERROR: unable to inventory existing mock-agent Pods safely." >&2
+  exit 1
+fi
+mapfile -t LEGACY_AGENT_NAMES < <(
+  jq -r --arg controller "$AGENT_CONTROLLER_NAME" '
+    .items[]
+    | select(
+        ((.metadata.ownerReferences // [])
+         | any(.kind == "StatefulSet" and .name == $controller))
+        | not
+      )
+    | .metadata.name
+  ' "$legacy_agents_json"
+)
+
+if [ "${#LEGACY_AGENT_NAMES[@]}" -gt 0 ]; then
+  for legacy_agent in "${LEGACY_AGENT_NAMES[@]}"; do
+    if [[ ! "$legacy_agent" =~ ^mock-cilium-agent-([0-9]+)$ ]] ||
+       [ "${BASH_REMATCH[1]}" -ge "$NODE_COUNT" ]; then
+      echo "ERROR: refusing to migrate unexpected unowned mock-agent Pod ${legacy_agent}." >&2
+      exit 1
+    fi
+    legacy_index="${BASH_REMATCH[1]}"
+    legacy_served_node=$(jq -r --arg name "$legacy_agent" '
+      .items[]
+      | select(.metadata.name == $name)
+      | ((.metadata.labels // {})["mock-clustermesh/serves-node"] // "")
+    ' "$legacy_agents_json")
+    if [ "$legacy_served_node" != "kwok-node-${legacy_index}" ]; then
+      echo "ERROR: refusing to migrate ${legacy_agent}: serves-node=${legacy_served_node:-missing}, expected kwok-node-${legacy_index}." >&2
+      exit 1
+    fi
+  done
+  echo ">>> Step 3: migrating ${#LEGACY_AGENT_NAMES[@]} legacy naked mock-agent Pod(s) to StatefulSet ownership..."
+  mkdir -p "$MIGRATION_DIAG_DIR/logs"
+  jq --arg controller "$AGENT_CONTROLLER_NAME" '
+    .items |= map(select(
+      ((.metadata.ownerReferences // [])
+       | any(.kind == "StatefulSet" and .name == $controller))
+      | not
+    ))
+  ' "$legacy_agents_json" > "${MIGRATION_DIAG_DIR}/pods.json"
+  K -n "${AGENT_NS}" get events -o json \
+    > "${MIGRATION_DIAG_DIR}/events.json" 2>&1 || true
+  mapfile -t LEGACY_DIAGNOSTIC_AGENT_NAMES < <(
+    jq -r '
+      .items[]
+      | select(
+          .metadata.deletionTimestamp != null
+          or .status.phase != "Running"
+          or ((.status.containerStatuses // []) | length == 0)
+          or any(.status.containerStatuses[]?; .ready != true)
+        )
+      | .metadata.name
+    ' "${MIGRATION_DIAG_DIR}/pods.json"
+  )
+  for legacy_agent in "${LEGACY_DIAGNOSTIC_AGENT_NAMES[@]}"; do
+    K -n "${AGENT_NS}" logs "$legacy_agent" --tail=500 \
+      > "${MIGRATION_DIAG_DIR}/logs/${legacy_agent}.log" 2>&1 || true
+    K -n "${AGENT_NS}" logs "$legacy_agent" --previous --tail=500 \
+      > "${MIGRATION_DIAG_DIR}/logs/${legacy_agent}.previous.log" 2>&1 || true
+  done
+
+  if K -n "${AGENT_NS}" get statefulset "$AGENT_CONTROLLER_NAME" \
+      >/dev/null 2>&1; then
+    kretry K -n "${AGENT_NS}" delete statefulset "$AGENT_CONTROLLER_NAME" \
+      --wait=true --timeout=300s >/dev/null
+  fi
+  for ((legacy_start = 0; legacy_start < ${#LEGACY_AGENT_NAMES[@]}; legacy_start += 20)); do
+    legacy_batch=("${LEGACY_AGENT_NAMES[@]:legacy_start:20}")
+    kretry K -n "${AGENT_NS}" delete pod "${legacy_batch[@]}" \
+      --grace-period=0 --force --wait=true --timeout=300s >/dev/null
+  done
+fi
+rm -f "$legacy_agents_json"
+
+# Bulk apply: split the Node manifest into ~500-doc chunks and apply with bounded
 # parallelism (xargs -P). One kubectl process per chunk (connection reuse) instead
-# of NODE_COUNT*2 separate `apply -f -` calls. Nodes FIRST — each agent references
-# its kwok node via K8S_NODE_NAME. Per-chunk errors are tolerated; the readiness
-# gate in deploy-mock-layer.yml is the real backstop.
+# of NODE_COUNT separate `apply -f -` calls. Nodes land before the StatefulSet.
+# Per-chunk errors are tolerated; the readiness gate in deploy-mock-layer.yml is
+# the real backstop.
 apply_bulk() {
   local src="$1" tag="$2"
   # Chunk once; the retry loop below re-applies the same chunks (idempotent).
@@ -550,7 +717,7 @@ max_attempts="${MOCK_APPLY_MAX_ATTEMPTS:-6}"
 while :; do
   echo ">>> Step 3: apply attempt ${attempt}/${max_attempts} (parallelism=${MOCK_APPLY_PARALLELISM:-4})..."
   apply_bulk "$NODES_FILE" nodes
-  apply_bulk "$AGENTS_FILE" agents
+  kretry K apply -f "$AGENT_CONTROLLER_FILE" >/dev/null
   sleep 15   # let the apiserver settle before counting (avoids throttled reads)
   set +e
   got_nodes=$(K get nodes -l type=kwok --no-headers 2>/dev/null | wc -l)
@@ -572,17 +739,12 @@ done
 # ---------------------------------------------------------------------------
 # STEP 3.5: persist the desired-state snapshot (optional).
 #
-# Copies the EXACT manifests just applied above (not re-derived — byte-for-byte
-# the same $NODES_FILE / $AGENTS_FILE this run generated), the EXACT already-
-# rendered KWOK support manifests from Steps 1/1.5/2 (kwok-patched.yaml,
-# stage-fast.yaml, kwok-apf.yaml, rbac.yaml — never redownloaded/rederived by
-# a later reconciler), plus a metadata.json describing this deploy, into
-# MOCK_STATE_DIR. This lets a separate reconciler recreate/repair only these
-# deterministic, owned objects later (e.g. after node churn, attrition, or a
-# kwok-controller crash) WITHOUT re-deriving the desired state (podCIDR/nodeIP
-# scheme, cluster identity, inherited cilium-config, ...) or re-fetching the
-# support manifests — both only happen here, once, right after a
-# verified-successful apply.
+# Copies the EXACT desired manifests generated above (Nodes, expected Pods, and
+# Service/StatefulSet), the EXACT already-rendered KWOK support manifests from
+# Steps 1/1.5/2 (kwok-patched.yaml, stage-fast.yaml, kwok-apf.yaml, rbac.yaml —
+# never redownloaded/rederived by a later reconciler), plus metadata.json into
+# MOCK_STATE_DIR. This lets a separate reconciler repair only deterministic,
+# owned objects later WITHOUT re-deriving the desired state.
 #
 # Published safely, NOT via an instantaneous atomic swap: built in a sibling
 # temp dir on the SAME filesystem as MOCK_STATE_DIR (so a crash/interrupt
@@ -604,6 +766,10 @@ if [[ -n "${MOCK_STATE_DIR}" ]]; then
   STATE_TMP="$(mktemp -d "${STATE_PARENT}/.mock-layer-state.XXXXXX")"
   cp "${NODES_FILE}" "${STATE_TMP}/nodes.yaml"
   cp "${AGENTS_FILE}" "${STATE_TMP}/agents.yaml"
+  cp "${AGENT_CONTROLLER_FILE}" "${STATE_TMP}/agent-controller.yaml"
+  if [ -d "$MIGRATION_DIAG_DIR" ]; then
+    cp -R "$MIGRATION_DIAG_DIR" "${STATE_TMP}/legacy-agent-migration"
+  fi
   mkdir -p "${STATE_TMP}/support"
   cp "${WORK}/kwok-patched.yaml" "${STATE_TMP}/support/kwok-controller.yaml"
   cp "${WORK}/stage-fast.yaml"   "${STATE_TMP}/support/stage-fast.yaml"
@@ -613,7 +779,7 @@ if [[ -n "${MOCK_STATE_DIR}" ]]; then
 import json, sys
 dst = sys.argv[1]
 metadata = {
-    "schema_version": 2,
+    "schema_version": 3,
     "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
     "run_id": "${MOCK_RUN_ID}",
     "cluster_name": "${CLUSTER_NAME}",
@@ -623,7 +789,10 @@ metadata = {
     "agent_service_account": "${AGENT_SA}",
     "agent_label_selector": "app=mock-cilium-agent",
     "node_label_selector": "type=kwok",
-    "serves_node_label": "mock-clustermesh/serves-node",
+    "agent_identity_source": "pod-name",
+    "agent_controller_kind": "StatefulSet",
+    "agent_controller_name": "${AGENT_CONTROLLER_NAME}",
+    "agent_service_name": "${AGENT_SERVICE_NAME}",
     "kwok_node_annotation": {"key": "kwok.x-k8s.io/node", "value": "fake"},
     "acr_host": "${ACR_HOST}",
     "agent_tag": "${AGENT_TAG}",
@@ -633,6 +802,7 @@ metadata = {
     "consume_clustermesh": $( [ "${CONSUME_CLUSTERMESH_ACTIVE}" = "true" ] && echo True || echo False ),
     "node_manifest": "nodes.yaml",
     "agent_manifest": "agents.yaml",
+    "agent_controller_manifest": "agent-controller.yaml",
     "support_manifest_dir": "support",
     "support_manifests": {
         "kwok_controller": "support/kwok-controller.yaml",
@@ -651,7 +821,7 @@ PY
   fi
   mv -T "${STATE_TMP}" "${MOCK_STATE_DIR}"
   rm -rf "${MOCK_STATE_DIR}.stale"
-  echo ">>> Step 3.5: persisted nodes.yaml + agents.yaml + support/ + metadata.json to ${MOCK_STATE_DIR}"
+  echo ">>> Step 3.5: persisted nodes.yaml + agents.yaml + agent-controller.yaml + support/ + metadata.json to ${MOCK_STATE_DIR}"
 fi
 
 rm -rf "${WORK}"

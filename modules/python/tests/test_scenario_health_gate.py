@@ -129,6 +129,9 @@ def _write_fake_tools(tmp_path: Path) -> tuple[Path, Path, Path]:
             elif [[ " $args " == *" -n kube-system get daemonset cilium -o json "* ]]; then
               printf '%s\\n' \
                 '{"status":{"desiredNumberScheduled":1,"numberReady":1}}'
+            elif [[ " $args " == *" -n mock-clustermesh get statefulset kwok-node -o json "* ]]; then
+              printf '%s\\n' \
+                '{"spec":{"replicas":2},"status":{"currentReplicas":2,"readyReplicas":2}}'
             elif [[ " $args " == *" get nodes -l type=kwok -o json "* ]]; then
               if [ -n "${FAKE_MOCK_NODES_JSON:-}" ] && [ -f "$FAKE_MOCK_NODES_JSON" ]; then
                 cat "$FAKE_MOCK_NODES_JSON"
@@ -145,7 +148,7 @@ def _write_fake_tools(tmp_path: Path) -> tuple[Path, Path, Path]:
                 cat "$FAKE_MOCK_AGENTS_JSON"
               else
                 printf '%s\\n' \
-                  '{"items":[{"metadata":{"labels":{"mock-clustermesh/serves-node":"kwok-node-1"}},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}},{"metadata":{"labels":{"mock-clustermesh/serves-node":"kwok-node-2"}},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}}]}'
+                  '{"items":[{"metadata":{"name":"kwok-node-1","ownerReferences":[{"kind":"StatefulSet","name":"kwok-node","controller":true}]},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}},{"metadata":{"name":"kwok-node-2","ownerReferences":[{"kind":"StatefulSet","name":"kwok-node","controller":true}]},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}}]}'
               fi
             elif [[ " $args " == *" -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status "* ]]; then
               printf '%s\\n' 'ClusterMesh: 0/0 remote clusters ready.'
@@ -275,7 +278,9 @@ def test_health_gate_succeeds_after_transient_cleanup(tmp_path):
     )
     assert summary["clusters"][0]["mock"]["ready_nodes"] == 2
     assert summary["clusters"][0]["mock"]["schedulable_nodes"] == 2
+    assert summary["clusters"][0]["mock"]["controller"]["ready"] == 2
     assert summary["clusters"][0]["mock"]["ready_agents"] == 2
+    assert summary["clusters"][0]["mock"]["controller_owned_agents"] == 2
     coverage = summary["clusters"][0]["mock"]["serves_node_coverage"]
     assert coverage["served_count"] == 2
     assert coverage["unique_count"] == 2
@@ -355,7 +360,17 @@ def _healthy_agents_json() -> str:
             "items": [
                 {
                     "metadata": {
-                        "labels": {"mock-clustermesh/serves-node": "kwok-node-1"}
+                        "name": "kwok-node-1",
+                        "labels": {
+                            "mock-clustermesh/serves-node": "kwok-node-1"
+                        },
+                        "ownerReferences": [
+                            {
+                                "kind": "StatefulSet",
+                                "name": "kwok-node",
+                                "controller": True,
+                            }
+                        ],
                     },
                     "status": {
                         "phase": "Running",
@@ -364,7 +379,17 @@ def _healthy_agents_json() -> str:
                 },
                 {
                     "metadata": {
-                        "labels": {"mock-clustermesh/serves-node": "kwok-node-2"}
+                        "name": "kwok-node-2",
+                        "labels": {
+                            "mock-clustermesh/serves-node": "kwok-node-2"
+                        },
+                        "ownerReferences": [
+                            {
+                                "kind": "StatefulSet",
+                                "name": "kwok-node",
+                                "controller": True,
+                            }
+                        ],
                     },
                     "status": {
                         "phase": "Running",
@@ -420,7 +445,8 @@ def test_health_gate_detects_unready_mock_agent_container(tmp_path):
     assert cluster["mock"]["running_agents"] == 2
     assert cluster["mock"]["ready_agents"] == 1
     assert any(
-        "mock Cilium agents expected/present/Running/Ready=2/2/2/1" in failure
+        "mock Cilium agents expected/present/Running/Ready/controller-owned="
+        "2/2/2/1/2" in failure
         for failure in cluster["failures"]
     )
 
@@ -451,7 +477,7 @@ def test_health_gate_detects_duplicate_and_missing_serves_node_coverage(tmp_path
     assert coverage["orphan_agents"] == []
     assert coverage["exact_match"] is False
     assert any(
-        "mock-clustermesh/serves-node coverage mismatch" in failure
+        "mock-agent logical-node coverage mismatch" in failure
         for failure in summary["clusters"][0]["failures"]
     )
 

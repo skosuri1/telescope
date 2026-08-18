@@ -8,8 +8,9 @@
 #
 # By design this NEVER fails the caller: it always exits 0 and only prints
 # OK / WARN lines, so it is safe to drop into a scale-test loop or cron without
-# aborting the run on transient attrition. (Mock agents are bare Pods, so a lost
-# pod or a failed real-VM does NOT self-heal — re-run provision-kwok-layer.sh.)
+# aborting the run on transient attrition. Current agents are owned by the
+# kwok-node StatefulSet, so gaps should self-heal; this check reports whether
+# controller convergence has actually happened.
 #
 # Usage:
 #   KUBECONFIG_FILE=~/.kube/mockmesh3-1 ./attrition-check.sh
@@ -20,7 +21,7 @@
 #   AGENT_NS      agent namespace                   (default mock-clustermesh)
 #   AGENT_LABEL   agent pod label selector          (default app=mock-cilium-agent)
 #   NODE_LABEL    KWOK node label selector          (default type=kwok)
-#   SERVES_LABEL  per-agent "serves node" label key (default mock-clustermesh/serves-node)
+#   SERVES_LABEL  legacy per-agent serves-node label key (migration fallback)
 #
 # Deliberately NO `set -e`: this check must never abort whatever invoked it.
 set -uo pipefail
@@ -59,23 +60,49 @@ for KC in "${KCS[@]}"; do
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | sed '/^$/d' | sort)
   expected="${#NODES[@]}"
 
-  # Served = distinct nodes that currently have a Running agent.
-  mapfile -t SERVED < <(K -n "${AGENT_NS}" get pods -l "${AGENT_LABEL}" \
-      --field-selector=status.phase=Running \
-      -o jsonpath="{range .items[*]}{.metadata.labels['${SERVES_LABEL}']}{\"\n\"}{end}" 2>/dev/null \
-      | sed '/^$/d' | sort -u)
+  agents_json=$(K -n "${AGENT_NS}" get pods -l "${AGENT_LABEL}" -o json \
+    2>/dev/null || echo '{"items":[]}')
+
+  # Served = distinct logical Nodes that currently have a Running agent.
+  # StatefulSet Pods use metadata.name (kwok-node-N); the old serves-node
+  # label is accepted only as a migration-era diagnostic fallback.
+  mapfile -t SERVED < <(
+    jq -r --arg serves_label "$SERVES_LABEL" '
+      .items[]
+      | select(.status.phase == "Running")
+      | (
+          ((.metadata.labels // {})[$serves_label])
+          // (
+            if any(.metadata.ownerReferences[]?;
+                .kind == "StatefulSet" and
+                .name == "kwok-node" and
+                (.controller // false) == true)
+            then .metadata.name
+            else empty
+            end
+          )
+        )
+    ' <<<"$agents_json" | sed '/^$/d' | sort -u
+  )
   running="${#SERVED[@]}"
 
   # Agent pods that are NOT Running.
-  mapfile -t NOTREADY < <(K -n "${AGENT_NS}" get pods -l "${AGENT_LABEL}" \
-      -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.status.phase}{"\n"}{end}' 2>/dev/null \
-      | grep -v '=Running$' | sed '/^$/d')
+  mapfile -t NOTREADY < <(
+    jq -r '.items[] | "\(.metadata.name)=\(.status.phase // "Unknown")"' \
+      <<<"$agents_json" | grep -v '=Running$' | sed '/^$/d'
+  )
+  controller_ready=$(K -n "${AGENT_NS}" get statefulset kwok-node \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+  controller_ready="${controller_ready:-0}"
 
   echo "── ${CTX} ───────────────────────────────"
   echo "   KWOK nodes (expected agents) : ${expected}"
   echo "   agents Running (node served) : ${running}"
+  echo "   StatefulSet Ready replicas   : ${controller_ready}/${expected}"
 
-  if (( running >= expected )) && (( ${#NOTREADY[@]} == 0 )); then
+  if (( running == expected )) &&
+     (( controller_ready == expected )) &&
+     (( ${#NOTREADY[@]} == 0 )); then
     echo "   OK: every virtual node has a Running agent."
   else
     overall_gap=1
@@ -85,7 +112,7 @@ for KC in "${KCS[@]}"; do
     for n in "${NODES[@]}"; do [[ -z "${have[$n]:-}" ]] && missing+=("$n"); done
     if (( ${#missing[@]} > 0 )); then
       echo "   WARN: ${#missing[@]} node(s) with NO Running agent: ${missing[*]}"
-      echo "         -> re-run provision-kwok-layer.sh to restore coverage."
+      echo "         -> inspect StatefulSet/kwok-node convergence."
     fi
     if (( ${#NOTREADY[@]} > 0 )); then
       echo "   WARN: ${#NOTREADY[@]} agent pod(s) not Running: ${NOTREADY[*]}"
