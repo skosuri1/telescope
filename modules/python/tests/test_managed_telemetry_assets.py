@@ -1437,6 +1437,10 @@ def test_scripts_use_current_aks_profile_and_full_export():
     assert "log-analytics query" not in audit
     assert '"$PLATFORM_EXPORT_SCRIPT"' in audit
     assert "AKS_AMW_CAPACITY_AUDITED]$capacity_audit_ok" in audit
+    assert "AKS_CONTROL_PLANE_METRICS_CONCURRENCY" in audit
+    assert "capture_workspace_capacity" in audit
+    assert "export_platform_cluster" in audit
+    assert "platform_export_ok" in audit
     assert "Reconstruct managed Prometheus TSDB" not in collect_template
     assert "--arg end " not in common
     assert "--arg window_end " in common

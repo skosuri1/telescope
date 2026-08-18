@@ -16,9 +16,20 @@ fi
 initialize_managed_telemetry
 load_collection_window
 
+collection_concurrency="${AKS_CONTROL_PLANE_METRICS_CONCURRENCY:-4}"
+if ! [[ "$collection_concurrency" =~ ^[1-9][0-9]*$ ]] ||
+   [ "$collection_concurrency" -gt 16 ]; then
+  echo "AKS_CONTROL_PLANE_METRICS_CONCURRENCY must be an integer from 1 through 16." >&2
+  exit 1
+fi
+audit_work_state=$(mktemp -d)
+trap 'rm -rf "$audit_work_state"' EXIT
+
 capacity_audit_ok=true
 capacity_end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-while IFS= read -r workspace; do
+capture_workspace_capacity() {
+  local workspace="$1" workspace_slot workspace_id capacity_window_start
+  local workspace_dir capacity_raw capacity_summary capacity_status=0
   workspace_slot=$(echo "$workspace" | jq -r '.slot // .name')
   workspace_id=$(echo "$workspace" | jq -r '.id')
   capacity_window_start=$(echo "$workspace" | jq -r \
@@ -30,7 +41,6 @@ while IFS= read -r workspace; do
   mkdir -p "$workspace_dir"
   capacity_raw="$workspace_dir/amw-capacity.json"
   capacity_summary="$workspace_dir/amw-capacity-summary.json"
-  capacity_status=0
   if ! capture_amw_capacity \
       "$workspace_id" \
       "$capacity_window_start" \
@@ -47,6 +57,36 @@ while IFS= read -r workspace; do
       "$workspace_dir/amw-capacity-summary.md"
   fi
   if [ "$capacity_status" -ne 0 ]; then
+    return "$capacity_status"
+  fi
+  return 0
+}
+
+capacity_batch=0
+while IFS= read -r workspace; do
+  workspace_slot=$(echo "$workspace" | jq -r '.slot // .name')
+  workspace_key=$(printf '%s' "$workspace_slot" | sed -E 's/[^a-zA-Z0-9_.-]+/_/g')
+  (
+    if capture_workspace_capacity "$workspace" \
+        > "$audit_work_state/capacity-${workspace_key}.log" 2>&1; then
+      echo ok > "$audit_work_state/capacity-${workspace_key}.status"
+    else
+      echo fail > "$audit_work_state/capacity-${workspace_key}.status"
+    fi
+  ) &
+  capacity_batch=$((capacity_batch + 1))
+  if [ "$capacity_batch" -ge "$collection_concurrency" ]; then
+    wait
+    capacity_batch=0
+  fi
+done < <(echo "$workspaces_json" | jq -c '.[]')
+wait
+
+while IFS= read -r workspace; do
+  workspace_slot=$(echo "$workspace" | jq -r '.slot // .name')
+  workspace_key=$(printf '%s' "$workspace_slot" | sed -E 's/[^a-zA-Z0-9_.-]+/_/g')
+  cat "$audit_work_state/capacity-${workspace_key}.log" 2>/dev/null || true
+  if [ "$(cat "$audit_work_state/capacity-${workspace_key}.status" 2>/dev/null || echo fail)" != "ok" ]; then
     capacity_audit_ok=false
     echo "##vso[task.logissue type=error;] AMW capacity audit failed for workspace slot $workspace_slot."
   fi
@@ -86,7 +126,14 @@ if [ "$audit_rc" -ne 0 ]; then
   echo "##vso[task.logissue type=warning;] Managed Prometheus telemetry audit returned $audit_rc; inspect the published audit."
 fi
 
-while IFS= read -r cluster; do
+platform_export_state="$audit_work_state/platform"
+mkdir -p "$platform_export_state"
+jq -c '.clusters[]' "$MANIFEST_PATH" > "$platform_export_state/clusters.jsonl"
+platform_cluster_count=$(wc -l < "$platform_export_state/clusters.jsonl")
+echo "Exporting live platform metrics for ${platform_cluster_count} cluster(s), concurrency=${collection_concurrency}"
+
+export_platform_cluster() {
+  local cluster="$1" role cluster_id cluster_alias
   role=$(echo "$cluster" | jq -r '.role')
   cluster_id=$(echo "$cluster" | jq -r '.id')
   cluster_alias=$(echo "$cluster" | jq -r '.prometheus_cluster_alias')
@@ -97,9 +144,42 @@ while IFS= read -r cluster; do
     --end "$end_time" \
     --output "$OUTPUT_DIR/aks-platform-${role}.openmetrics" \
     --manifest "$OUTPUT_DIR/aks-platform-${role}.json"
-done < <(jq -c '.clusters[]' "$MANIFEST_PATH")
+}
+
+platform_batch=0
+while IFS= read -r cluster; do
+  [ -n "$cluster" ] || continue
+  role=$(echo "$cluster" | jq -r '.role')
+  (
+    if export_platform_cluster "$cluster" \
+        > "$platform_export_state/${role}.log" 2>&1; then
+      echo ok > "$platform_export_state/${role}.status"
+    else
+      echo fail > "$platform_export_state/${role}.status"
+    fi
+  ) &
+  platform_batch=$((platform_batch + 1))
+  if [ "$platform_batch" -ge "$collection_concurrency" ]; then
+    wait
+    platform_batch=0
+  fi
+done < "$platform_export_state/clusters.jsonl"
+wait
+
+platform_export_ok=true
+while IFS= read -r cluster; do
+  [ -n "$cluster" ] || continue
+  role=$(echo "$cluster" | jq -r '.role')
+  status=$(cat "$platform_export_state/${role}.status" 2>/dev/null || echo fail)
+  if [ "$status" != "ok" ]; then
+    platform_export_ok=false
+    echo "##vso[task.logissue type=error;] Platform metric export failed for ${role}; log tail:"
+    tail -50 "$platform_export_state/${role}.log" 2>/dev/null || true
+  fi
+done < "$platform_export_state/clusters.jsonl"
 
 echo "Managed telemetry audit and live-coupled platform metrics written to $OUTPUT_DIR"
-if [ "$capacity_audit_ok" != "true" ]; then
+if [ "$capacity_audit_ok" != "true" ] ||
+   [ "$platform_export_ok" != "true" ]; then
   exit 1
 fi

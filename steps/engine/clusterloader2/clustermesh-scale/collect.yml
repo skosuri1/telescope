@@ -463,6 +463,18 @@ steps:
         cp "$lifecycle_file" "$dest_dir/"
         lifecycle_count=$((lifecycle_count + 1))
       done
+      while IFS= read -r -d '' diagnostic_file; do
+        rel=${diagnostic_file#"$CL2_REPORT_DIR/"}
+        dest_dir="$STAGING_DIR/$(dirname "$rel")"
+        mkdir -p "$dest_dir"
+        cp "$diagnostic_file" "$dest_dir/"
+        lifecycle_count=$((lifecycle_count + 1))
+      done < <(
+        find "$CL2_REPORT_DIR" \
+          -type f \
+          -path '*/mock-layer-diagnostics*/*' \
+          -print0 | sort -z
+      )
       echo "Staged $count prometheus snapshot tarball(s), total ${total_bytes} bytes, plus $audit_count telemetry audit file(s), $acns_count ACNS file(s), and $lifecycle_count lifecycle file(s), into $STAGING_DIR"
       ls -laR "$STAGING_DIR" || true
     env:
@@ -529,10 +541,32 @@ steps:
         audit_count=0
         acns_count=0
         lifecycle_count=0
+        skipped_preserved_count=0
+        scenario_artifacts_already_preserved() {
+          local scenario="$1"
+          local early_summary="$CL2_REPORT_DIR/$scenario/artifact-preservation-summary.json"
+          local final_summary="$CL2_REPORT_DIR/$scenario/artifact-preservation-final-summary.json"
+          [ -s "$early_summary" ] &&
+            [ -s "$final_summary" ] &&
+            jq -e '
+              .infrastructure_failure == false and
+              .scenario_incomplete == false
+            ' \
+              "$early_summary" >/dev/null 2>&1 &&
+            jq -e '
+              .infrastructure_failure == false and
+              .scenario_incomplete == false
+            ' \
+              "$final_summary" >/dev/null 2>&1
+        }
         if [ "$SNAPSHOT_RELABEL_READY" = "true" ]; then
           for snap in "$CL2_REPORT_DIR"/**/prom-snapshot-*.tar.gz; do
             rel=${snap#"$CL2_REPORT_DIR/"}
             scenario_seg=$(dirname "$rel" | cut -d/ -f1)
+            if scenario_artifacts_already_preserved "$scenario_seg"; then
+              skipped_preserved_count=$((skipped_preserved_count + 1))
+              continue
+            fi
             blob_name="${BUILD_BRANCH}/${scenario_seg}/${RUN_ID}/$(basename "$snap")"
             size=$(stat -c%s "$snap" 2>/dev/null || echo 0)
             echo "Uploading $snap (${size} bytes) -> ${STORAGE_ACCOUNT_NAME}/${CONTAINER_NAME}/${blob_name}"
@@ -552,6 +586,10 @@ steps:
         for audit in "$CL2_REPORT_DIR"/**/telemetry/telemetry-audit-self-hosted.{json,md}; do
           rel=${audit#"$CL2_REPORT_DIR/"}
           scenario_seg=$(echo "$rel" | cut -d/ -f1)
+          if scenario_artifacts_already_preserved "$scenario_seg"; then
+            skipped_preserved_count=$((skipped_preserved_count + 1))
+            continue
+          fi
           role_seg=$(basename "$(dirname "$(dirname "$audit")")")
           extension=${audit##*.}
           blob_name="${BUILD_BRANCH}/telemetry-audit-self-hosted/${scenario_seg}/${RUN_ID}/telemetry-audit-self-hosted-${role_seg}.${extension}"
@@ -569,6 +607,10 @@ steps:
           [ -f "$acns_file" ] || continue
           rel=${acns_file#"$CL2_REPORT_DIR/"}
           scenario_seg=$(echo "$rel" | cut -d/ -f1)
+          if scenario_artifacts_already_preserved "$scenario_seg"; then
+            skipped_preserved_count=$((skipped_preserved_count + 1))
+            continue
+          fi
           role_seg=$(echo "$rel" | cut -d/ -f2)
           blob_name="${BUILD_BRANCH}/acns/${scenario_seg}/${RUN_ID}/${role_seg}/$(basename "$acns_file")"
           echo "Uploading $acns_file -> ${STORAGE_ACCOUNT_NAME}/${CONTAINER_NAME}/${blob_name}"
@@ -600,6 +642,11 @@ steps:
           rel=${lifecycle_file#"$CL2_REPORT_DIR/"}
           scenario_seg=$(echo "$rel" | cut -d/ -f1)
           lifecycle_basename=$(basename "$lifecycle_file")
+          if [ "$lifecycle_basename" != "artifact-preservation-final-summary.json" ] &&
+             scenario_artifacts_already_preserved "$scenario_seg"; then
+            skipped_preserved_count=$((skipped_preserved_count + 1))
+            continue
+          fi
           case "$lifecycle_basename" in
             EventThroughputEvidence.json|PodChurnEvidence.json|PolicyScaleEvidence.json)
               # These basenames repeat once per role's CL2 report
@@ -624,7 +671,30 @@ steps:
             --overwrite >/dev/null
           lifecycle_count=$((lifecycle_count + 1))
         done
-        echo "Uploaded $count snapshot tarball(s), total ${total_bytes} bytes, plus $audit_count telemetry audit file(s), $acns_count ACNS file(s), and $lifecycle_count lifecycle file(s), to ${STORAGE_ACCOUNT_NAME}/${CONTAINER_NAME}"
+        while IFS= read -r -d '' diagnostic_file; do
+          rel=${diagnostic_file#"$CL2_REPORT_DIR/"}
+          scenario_seg=$(echo "$rel" | cut -d/ -f1)
+          if scenario_artifacts_already_preserved "$scenario_seg"; then
+            skipped_preserved_count=$((skipped_preserved_count + 1))
+            continue
+          fi
+          blob_name="${BUILD_BRANCH}/lifecycle/${scenario_seg}/${RUN_ID}/${rel#"$scenario_seg/"}"
+          echo "Uploading $diagnostic_file -> ${STORAGE_ACCOUNT_NAME}/${CONTAINER_NAME}/${blob_name}"
+          az storage blob upload \
+            --account-name "$STORAGE_ACCOUNT_NAME" \
+            --container-name "$CONTAINER_NAME" \
+            --name "$blob_name" \
+            --file "$diagnostic_file" \
+            --auth-mode login \
+            --overwrite >/dev/null
+          lifecycle_count=$((lifecycle_count + 1))
+        done < <(
+          find "$CL2_REPORT_DIR" \
+            -type f \
+            -path '*/mock-layer-diagnostics*/*' \
+            -print0 | sort -z
+        )
+        echo "Uploaded $count snapshot tarball(s), total ${total_bytes} bytes, plus $audit_count telemetry audit file(s), $acns_count ACNS file(s), and $lifecycle_count lifecycle file(s), to ${STORAGE_ACCOUNT_NAME}/${CONTAINER_NAME}; skipped $skipped_preserved_count file(s) already verified by per-scenario preservation."
         if [ "$count" -gt 0 ]; then
           rm -f "$CL2_REPORT_DIR"/**/prom-snapshot-*.tar.gz
           find "$STAGING_DIR" -type f -name 'prom-snapshot-*.tar.gz' -delete

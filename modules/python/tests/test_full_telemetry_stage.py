@@ -188,6 +188,31 @@ def test_dedicated_full_telemetry_stage_is_isolated():
     assert "destroy_retry_attempt_count: 0" in stage
     assert 'CMP_AUTO_RECOVERY_ENABLED: "true"' in stage
 
+
+def test_ui_selected_n2_gate_injects_mock_agent_self_heal_probe():
+    pipeline = PIPELINE_PATH.read_text(encoding="utf-8")
+    start = pipeline.index(
+        "- stage: azure_eastus2_n2_mock_full_telemetry_aksstandalone2"
+    )
+    end = pipeline.index(
+        "\n  - stage: azure_centraluseuap_n2_mock_full_telemetry",
+        start,
+    )
+    stage = pipeline[start:end]
+    deploy = (
+        REPOSITORY_ROOT
+        / "steps"
+        / "topology"
+        / "clustermesh-scale-mock"
+        / "deploy-mock-layer.yml"
+    ).read_text(encoding="utf-8")
+
+    assert 'MOCK_SELF_HEAL_PROBE_ENABLED: "true"' in stage
+    assert 'MOCK_SELF_HEAL_PROBE_DELAY_SECONDS: "60"' in stage
+    assert 'probe_pod="kwok-node-0"' in deploy
+    assert 'after_uid" != "$before_uid' in deploy
+    assert "self-heal-probe.json" in deploy
+
     tfvars = N2_TFVARS_PATH.read_text(encoding="utf-8")
     assert 'deletion_delay = "24h"' in tfvars
     assert tfvars.count('name                 = "churnpool"') == 1
@@ -595,6 +620,8 @@ def test_native_snapshots_are_relabelled_before_publish_and_upload():
     assert "/telemetry/acns/" in template
     assert 'blob_name="${BUILD_BRANCH}/acns/' in template
     assert 'blob_name="${BUILD_BRANCH}/lifecycle/' in template
+    assert "scenario_artifacts_already_preserved" in template
+    assert "skipped_preserved_count" in template
     assert "CL2_PROM_RELABEL_TIMEOUT_SECONDS" in template
     assert "timeout --signal=TERM --kill-after=30s" in template
 
@@ -610,12 +637,13 @@ def test_acns_probe_runs_before_snapshot_and_is_collected_before_teardown():
     ).read_text(encoding="utf-8")
 
     setup = worker.index("setup-acns-telemetry.sh")
+    reconcile = worker.index("mock-layer-reconcile-worker-")
     audit = worker.index("audit_self_hosted.py")
     collect = worker.index("collect-acns-telemetry.sh")
     snapshot = worker.index("prometheus TSDB snapshot -------")
     final_readiness = worker.index("readiness-final.json")
     accepted_gap_check = worker.index(".accepted_gap == true")
-    assert setup < audit < collect < snapshot
+    assert setup < reconcile < audit < collect < snapshot
     assert final_readiness < accepted_gap_check < audit
     assert "--require-acns" in worker
     assert "ACNS_VERIFY_ONLY=true" in worker
@@ -726,7 +754,21 @@ def test_native_snapshot_admin_api_is_retried_with_diagnostics():
     assert "refusing to archive or retry" in worker
     assert "snapshot_server_error" in worker
     assert "snapshot_error_cleanup_ok" in worker
+    assert "restart_prom_port_forward_for_retry" in worker
+    assert "/-/ready" in worker
     assert "enableAdminAPI=${prom_admin_api:-unknown}" in worker
+
+
+def test_result_blob_upload_is_idempotent():
+    upload = (
+        REPOSITORY_ROOT
+        / "steps"
+        / "cloud"
+        / "azure"
+        / "upload-storage-account.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "--overwrite true" in upload
 
 
 def test_policy_regeneration_counter_uses_current_cilium_metric_name():
