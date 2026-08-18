@@ -252,30 +252,46 @@ def kubectl_delete(kubeconfig, kind, name, timeout_seconds, namespace=None, wait
 def discover_monitoring_resource_types(kubeconfig, timeout_seconds) -> dict:
     cmd = _base_cmd(kubeconfig, timeout_seconds) + [
         "api-resources", f"--api-group={MONITORING_API_GROUP}",
-        "--verbs=list", "--namespaced=true", "-o", "json",
+        "--verbs=list", "--namespaced=true", "-o", "wide", "--no-headers",
     ]
     stdout = _run_kubectl(cmd, timeout_seconds)
-    try:
-        payload = json.loads(stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise ReconcileError(
-            f"kubectl returned invalid monitoring API discovery JSON: {exc}"
-        ) from exc
-    resources = payload.get("resources")
-    if not isinstance(resources, list):
-        raise ReconcileError(
-            "monitoring API discovery response was not an APIResourceList"
-        )
 
     resource_by_kind = {}
-    for item in resources:
-        name = item.get("name")
-        kind = item.get("kind")
-        if not isinstance(name, str) or not name or "/" in name:
+    for line_number, line in enumerate(stdout.splitlines(), start=1):
+        fields = line.split()
+        if not fields:
             continue
-        if not isinstance(kind, str) or not kind:
+        namespaced_index = next(
+            (
+                index
+                for index, field in enumerate(fields)
+                if field in ("true", "false")
+            ),
+            None,
+        )
+        if namespaced_index is None or namespaced_index + 1 >= len(fields):
+            raise ReconcileError(
+                "kubectl returned an unexpected monitoring API discovery row "
+                f"at line {line_number}: {line!r}"
+            )
+
+        name = fields[0]
+        namespaced = fields[namespaced_index]
+        kind = fields[namespaced_index + 1]
+        if namespaced != "true":
             continue
-        resource = f"{name}.{MONITORING_API_GROUP}"
+        if not name or "/" in name or not kind:
+            raise ReconcileError(
+                "kubectl returned an invalid monitoring API discovery row "
+                f"at line {line_number}: {line!r}"
+            )
+
+        group_suffix = f".{MONITORING_API_GROUP}"
+        resource = (
+            name
+            if name.endswith(group_suffix)
+            else f"{name}{group_suffix}"
+        )
         existing = resource_by_kind.get(kind)
         if existing is not None and existing != resource:
             raise ReconcileError(

@@ -60,6 +60,7 @@ class FakeCleanupCluster:
         self.transient_get_failures = transient_get_failures
         self.stuck_namespaces = set(stuck_namespaces)
         self.delete_calls = []
+        self.api_resource_commands = []
 
     def add_namespace(self, name):
         self.namespaces.add(name)
@@ -80,23 +81,17 @@ class FakeCleanupCluster:
              timeout=None, check=False):
         del input, capture_output, text, timeout, check  # unused; fake honors them implicitly
         if "api-resources" in cmd:
-            return _completed(
-                json.dumps(
-                    {
-                        "kind": "APIResourceList",
-                        "apiVersion": "v1",
-                        "resources": [
-                            {
-                                "name": resource,
-                                "kind": kind,
-                                "namespaced": True,
-                                "verbs": ["delete", "get", "list"],
-                            }
-                            for resource, kind in self.monitoring_discovered_types
-                        ],
-                    }
+            self.api_resource_commands.append(list(cmd))
+            if "-o" in cmd and cmd[cmd.index("-o") + 1] == "json":
+                return _failed("error: --output json is not available")
+            rows = [
+                (
+                    f"{resource} {reconciler.MONITORING_API_GROUP}/v1 "
+                    f"true {kind} [delete get list]"
                 )
-            )
+                for resource, kind in self.monitoring_discovered_types
+            ]
+            return _completed("\n".join(rows) + ("\n" if rows else ""))
         if "get" in cmd:
             if self.transient_get_failures > 0:
                 self.transient_get_failures -= 1
@@ -336,6 +331,29 @@ def test_monitoring_allowlist_deleted_protected_baseline_remains(monkeypatch):
 # ---------------------------------------------------------------------------
 # 6. Monitoring CR deletion uses the fully qualified API resource
 # ---------------------------------------------------------------------------
+
+def test_monitoring_discovery_supports_kubectl_v1_31(monkeypatch):
+    cluster = FakeCleanupCluster()
+    cluster.monitoring_discovered_types = [
+        ("podmonitors", "PodMonitor"),
+        ("servicemonitors", "ServiceMonitor"),
+    ]
+    monkeypatch.setattr(reconciler.subprocess, "run", cluster.run)
+
+    discovered = reconciler.discover_monitoring_resource_types(
+        "/kube/mesh-1.config", timeout_seconds=5
+    )
+
+    assert discovered == {
+        "PodMonitor": "podmonitors.monitoring.coreos.com",
+        "ServiceMonitor": "servicemonitors.monitoring.coreos.com",
+    }
+    assert len(cluster.api_resource_commands) == 1
+    command = cluster.api_resource_commands[0]
+    assert command[command.index("-o") + 1] == "wide"
+    assert "--no-headers" in command
+    assert "json" not in command
+
 
 def test_monitoring_cr_deletion_uses_fully_qualified_resource(monkeypatch):
     """AKS also installs azmonitoring.coreos.com PodMonitor resources.
