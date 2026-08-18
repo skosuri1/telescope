@@ -111,6 +111,9 @@ N2_TFVARS_PATH = (
     / "terraform-inputs"
     / "azure-2-mock-shared-dsv4.tfvars"
 )
+N2_EASTUS2EUAP_TFVARS_PATH = N2_TFVARS_PATH.with_name(
+    "azure-2-mock.tfvars"
+)
 N100_TFVARS_PATH = (
     REPOSITORY_ROOT
     / "scenarios"
@@ -245,6 +248,45 @@ def test_ui_selected_n2_gate_injects_mock_agent_self_heal_probe():
         )
         == 2
     )
+
+
+def test_original_subscription_n2_gate_matches_n100_environment():
+    pipeline = PIPELINE_PATH.read_text(encoding="utf-8")
+    start = pipeline.index("- stage: azure_eastus2euap_n2_mock")
+    end = pipeline.index(
+        "\n  - stage: azure_eastus2euap_n20_mock",
+        start,
+    )
+    stage = pipeline[start:end]
+
+    for expected in (
+        "- eastus2euap",
+        "azure-2-mock.tfvars",
+        'AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}',
+        'CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: '
+        '"37deca37-c375-4a14-b90a-043849bd2bf1"',
+        "CLUSTERMESH_VM_FAMILY_QUOTA_NAME: standardDSv5Family",
+        'CLUSTERMESH_REQUIRED_FAMILY_VCPUS: "112"',
+        'CLUSTERMESH_REQUIRED_MANAGED_CLUSTERS: "2"',
+        'MOCK_SELF_HEAL_PROBE_ENABLED: "true"',
+        'AKS_CONTROL_PLANE_METRICS_ENABLED: "false"',
+        'CL2_REQUIRED_SELF_HOSTED_TELEMETRY: "true"',
+        'cl2_prom_snapshot_storage_account: "cmshscaleprom"',
+        'share_infra_scenarios: "propagation-probe,event-throughput,'
+        'policy-scale,pod-churn-combined,apiserver-failure,isolation,'
+        'node-churn-combined,upper-bound"',
+        "suite_total_budget_seconds: 43200",
+        "timeout_in_minutes: 840",
+        "cancel_timeout_in_minutes: 60",
+        "destroy_retry_attempt_count: 0",
+    ):
+        assert expected in stage
+
+    tfvars = N2_EASTUS2EUAP_TFVARS_PATH.read_text(encoding="utf-8")
+    assert 'deletion_delay = "24h"' in tfvars
+    assert tfvars.count('{ name = "network-policy", value = "cilium" }') == 2
+    assert tfvars.count('vm_size              = "Standard_D8s_v5"') == 5
+    assert tfvars.count('name                 = "churnpool"') == 1
 
 
 def test_n2_full_telemetry_stage_enables_bounded_amw_rotation():
