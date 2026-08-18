@@ -148,6 +148,7 @@ def test_candidate_dsv3_topology_matches_n2_shape():
 
     assert tfvars.count('aks_name                      = "clustermesh-') == 2
     assert tfvars.count('{ name = "enable-acns", value = "" }') == 2
+    assert tfvars.count('{ name = "network-policy", value = "cilium" }') == 2
     assert tfvars.count('vm_size              = "Standard_D8s_v3"') == 5
     assert tfvars.count('name                 = "prompool"') == 2
     assert tfvars.count('name                 = "churnpool"') == 1
@@ -242,6 +243,8 @@ def test_candidate_n100_dsv3_topology_matches_dsv4_shape():
 
     assert dsv3 == expected
     assert dsv3.count('vm_size              = "Standard_D8s_v3"') == 201
+    assert dsv3.count('{ name = "network-policy", value = "cilium" }') == 100
+    assert dsv4.count('{ name = "network-policy", value = "cilium" }') == 100
     assert 'vm_size              = "Standard_D8s_v4"' not in dsv3
     assert dsv3.count('name                 = "churnpool"') == 1
     assert "node_count           = 12" in dsv3
