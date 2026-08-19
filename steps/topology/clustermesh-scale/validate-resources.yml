@@ -178,6 +178,49 @@ steps:
       chmod +r "$HOME/.kube/lib/fetch-kubeconfig.sh"
     displayName: "Enumerate clustermesh clusters"
 
+  # A preserved AKS resource can report Succeeded/Running while its backing
+  # VMSS instances are absent or no longer registered as Kubernetes Nodes.
+  # Recover only confirmed unhealthy real workers before waiting on any
+  # cluster-side Fleet projection. Fresh runs leave this disabled.
+  - script: |
+      set -euo pipefail
+
+      if [ "${CLUSTERMESH_PRESERVED_WORKER_RECOVERY_ENABLED:-false}" != "true" ]; then
+        echo "Preserved worker recovery disabled; skipping."
+        exit 0
+      fi
+
+      # shellcheck source=/dev/null
+      source "$HOME/.kube/lib/fetch-kubeconfig.sh"
+      clusters=$(cat "$HOME/.kube/clustermesh-clusters.json")
+      for row in $(echo "$clusters" | jq -c '.[]'); do
+        name=$(echo "$row" | jq -r '.name')
+        rg=$(echo "$row" | jq -r '.rg')
+        role=$(echo "$row" | jq -r '.role')
+        ensure_kubeconfig "$rg" "$name" "$HOME/.kube/$role.config"
+      done
+
+      summary_dir="${BUILD_ARTIFACTSTAGINGDIRECTORY:-$(pwd)}/preserved-resume-recovery"
+      mkdir -p "$summary_dir"
+      summary_file="$summary_dir/worker-reconcile.json"
+      set +e
+      python3 "$PRESERVED_WORKER_RECONCILER" \
+        --clusters "$HOME/.kube/clustermesh-clusters.json" \
+        --summary-file "$summary_file" \
+        --max-repair-clusters "${CLUSTERMESH_DEBUG_MAX_WORKER_REPAIR_CLUSTERS:-5}" \
+        --max-concurrent-probes "${CLUSTERMESH_DEBUG_WORKER_PROBE_CONCURRENCY:-5}" \
+        --max-concurrent-repairs "${CLUSTERMESH_DEBUG_WORKER_REPAIR_CONCURRENCY:-2}" \
+        --probe-attempts "${CLUSTERMESH_DEBUG_WORKER_PROBE_ATTEMPTS:-5}" \
+        --probe-retry-seconds "${CLUSTERMESH_DEBUG_WORKER_PROBE_RETRY_SECONDS:-60}" \
+        --recovery-timeout-seconds "${CLUSTERMESH_DEBUG_WORKER_RECOVERY_TIMEOUT_SECONDS:-1800}"
+      worker_rc=$?
+      set -e
+      echo "##vso[task.uploadfile]$summary_file"
+      exit "$worker_rc"
+    displayName: "Recover preserved real AKS workers"
+    env:
+      PRESERVED_WORKER_RECONCILER: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_worker_reconcile.py
+
   # ----------------------------------------------------------------------------
   # Pre-gate: wait for every cluster's clustermesh-apiserver Deployment to be
   # Available AND its Service to have an external LoadBalancer IP, in parallel.
@@ -244,7 +287,7 @@ steps:
         rg=$(echo   "$row" | jq -r '.rg')
         role=$(echo "$row" | jq -r '.role')
         kc="$HOME/.kube/$role.config"
-        fetch_kubeconfig "$rg" "$name" "$kc"
+        ensure_kubeconfig "$rg" "$name" "$kc"
       done
 
       # Fleet RG = same as cluster RG (terraform module.fleet runs in the
@@ -761,6 +804,81 @@ steps:
       echo "All $cluster_count clustermesh-apiserver Deployments+LBs ready; Fleet can now push peer configs"
     displayName: "Wait for clustermesh-apiserver Deployments + LBs (parallel)"
 
+  # Fleet's control-plane member state can remain Connected while Cilium has a
+  # missing or stale remote configuration. Probe every real Cilium agent in
+  # parallel, map unhealthy remote cluster names back to Fleet roles, and
+  # rejoin only that bounded member set. A second live probe is authoritative.
+  - script: |
+      set -euo pipefail
+
+      if [ "${CLUSTERMESH_LIVE_DATA_PLANE_REPAIR_ENABLED:-false}" != "true" ]; then
+        echo "Live ClusterMesh data-plane repair disabled; skipping."
+        exit 0
+      fi
+      if [ "${CLUSTERMESH_FLEET_ENABLED:-true}" = "false" ]; then
+        echo "Fleet disabled; skipping live ClusterMesh data-plane repair."
+        exit 0
+      fi
+
+      clusters_file="$HOME/.kube/clustermesh-clusters.json"
+      cluster_count=$(jq 'length' "$clusters_file")
+      summary_dir="${BUILD_ARTIFACTSTAGINGDIRECTORY:-$(pwd)}/preserved-resume-recovery"
+      mkdir -p "$summary_dir"
+      initial_summary="$summary_dir/live-overlay-initial.json"
+      initial_roles="$summary_dir/live-overlay-repair-roles.txt"
+
+      set +e
+      python3 "$PRESERVED_LIVE_OVERLAY_PROBE" \
+        --clusters "$clusters_file" \
+        --summary-file "$initial_summary" \
+        --repair-roles-file "$initial_roles" \
+        --attempts "${CLUSTERMESH_DEBUG_LIVE_PROBE_ATTEMPTS:-5}" \
+        --retry-seconds "${CLUSTERMESH_DEBUG_LIVE_PROBE_RETRY_SECONDS:-30}" \
+        --command-timeout-seconds "${CLUSTERMESH_DEBUG_LIVE_PROBE_COMMAND_TIMEOUT_SECONDS:-30}" \
+        --max-concurrent "${CLUSTERMESH_DEBUG_LIVE_PROBE_CONCURRENCY:-10}"
+      probe_rc=$?
+      set -e
+      echo "##vso[task.uploadfile]$initial_summary"
+      if [ "$probe_rc" -eq 0 ]; then
+        echo "Live ClusterMesh overlay is healthy; no member rejoin required."
+        exit 0
+      fi
+      if [ "$probe_rc" -ne 2 ]; then
+        echo "##vso[task.logissue type=error;] Live ClusterMesh overlay probe failed unsafely; refusing Fleet mutation."
+        exit 1
+      fi
+
+      echo "Live probe selected bounded Fleet repair roles:"
+      cat "$initial_roles"
+      CLUSTERMESH_DEBUG_TARGET_RUN_ID="$RUN_ID" \
+      CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT="$cluster_count" \
+      CLUSTERMESH_DEBUG_MAX_REPAIR_MEMBERS="${CLUSTERMESH_DEBUG_MAX_REPAIR_MEMBERS:-20}" \
+      CLUSTERMESH_DEBUG_FORCE_REPAIR_ROLES_FILE="$initial_roles" \
+        bash "$FLEET_REPAIR_SCRIPT"
+
+      verify_summary="$summary_dir/live-overlay-after-repair.json"
+      verify_roles="$summary_dir/live-overlay-after-repair-roles.txt"
+      set +e
+      python3 "$PRESERVED_LIVE_OVERLAY_PROBE" \
+        --clusters "$clusters_file" \
+        --summary-file "$verify_summary" \
+        --repair-roles-file "$verify_roles" \
+        --attempts "${CLUSTERMESH_DEBUG_LIVE_VERIFY_ATTEMPTS:-40}" \
+        --retry-seconds "${CLUSTERMESH_DEBUG_LIVE_VERIFY_RETRY_SECONDS:-30}" \
+        --command-timeout-seconds "${CLUSTERMESH_DEBUG_LIVE_PROBE_COMMAND_TIMEOUT_SECONDS:-30}" \
+        --max-concurrent "${CLUSTERMESH_DEBUG_LIVE_PROBE_CONCURRENCY:-10}"
+      verify_rc=$?
+      set -e
+      echo "##vso[task.uploadfile]$verify_summary"
+      if [ "$verify_rc" -ne 0 ]; then
+        echo "##vso[task.logissue type=error;] Live ClusterMesh overlay did not converge after bounded member repair."
+        exit 1
+      fi
+    displayName: "Repair stale live ClusterMesh peers"
+    env:
+      PRESERVED_LIVE_OVERLAY_PROBE: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_live_overlay.py
+      FLEET_REPAIR_SCRIPT: $(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/reuse/repair-existing-fleet-overlay.sh
+
   # ----------------------------------------------------------------------------
   # n=20 debug enhancement 2026-05-16: VNet peering inventory.
   # At N=20 we expect N*(N-1) = 380 VNet peerings (one pair each way). Terraform
@@ -868,6 +986,12 @@ steps:
         exit 1
       fi
       node_readiness_warnings=0
+      node_readiness_selector="${CLUSTERMESH_NODE_READINESS_SELECTOR:-}"
+      node_selector_args=()
+      if [ -n "$node_readiness_selector" ]; then
+        node_selector_args=(-l "$node_readiness_selector")
+        echo "Node readiness selector: $node_readiness_selector"
+      fi
 
       # Fleet-side peer-list dump (N>=10 only — at smaller N Fleet always
       # converges cleanly so the noise isn't worth it). Build 67525 evidence:
@@ -1104,7 +1228,7 @@ steps:
         export KUBECONFIG="$kubeconfig"
 
         echo "--- nodes ---"
-        kubectl --request-timeout=30s get nodes -o wide
+        kubectl --request-timeout=30s get nodes "${node_selector_args[@]}" -o wide
         # Wait until ALL nodes reach Ready. Originally a single
         # `kubectl wait --timeout=5m` call, but a 5min hard timeout is
         # brittle when 1-2 of N nodes flap NotReady transiently at
@@ -1150,7 +1274,7 @@ steps:
           xtrace_state=$-
           set +x
           snapshot=$(
-            kubectl --request-timeout=25s get nodes -o json 2>&1
+            kubectl --request-timeout=25s get nodes "${node_selector_args[@]}" -o json 2>&1
           ) || snapshot_rc=$?
           [[ "$xtrace_state" != *x* ]] || set -x
           if [ "$snapshot_rc" -ne 0 ]; then
@@ -1235,12 +1359,12 @@ steps:
             set +e
             nr_nodes=""
             for _t in 1 2 3 4 5; do
-              nr_nodes=$(kubectl --request-timeout=25s get nodes --no-headers 2>/dev/null | awk '$2 != "Ready" {print $1}')
+              nr_nodes=$(kubectl --request-timeout=25s get nodes "${node_selector_args[@]}" --no-headers 2>/dev/null | awk '$2 != "Ready" {print $1}')
               if [ -n "$nr_nodes" ]; then break; fi
-              if kubectl --request-timeout=25s get nodes >/dev/null 2>&1; then break; fi  # genuinely all-Ready now
+              if kubectl --request-timeout=25s get nodes "${node_selector_args[@]}" >/dev/null 2>&1; then break; fi  # genuinely all-Ready now
               echo "  [diag] apiserver unreachable, retry $_t/5 in 10s..."; sleep 10
             done
-            echo "--- all nodes ---"; kdiag get nodes -o wide
+            echo "--- readiness-selected nodes ---"; kdiag get nodes "${node_selector_args[@]}" -o wide
             if [ -z "$nr_nodes" ]; then
               echo "  [diag] no NotReady node names captured (apiserver flaky, or nodes recovered after the deadline)"
             fi
@@ -1286,7 +1410,11 @@ steps:
             active_deadline="$node_ready_final_deadline"
           fi
           if [ "$node_snapshot_rc" -eq 1 ]; then
-            echo "$(date -u +%H:%M:%S): ${NODE_NOT_READY_COUNT}/${NODE_READY_TOTAL} node(s) NotReady, waiting (deadline at $(date -u -d @${active_deadline} +%H:%M:%S))"
+            if [ "$NODE_READY_TOTAL" -eq 0 ]; then
+              echo "$(date -u +%H:%M:%S): no nodes matched readiness selector '${node_readiness_selector:-<all>}', waiting (deadline at $(date -u -d @${active_deadline} +%H:%M:%S))"
+            else
+              echo "$(date -u +%H:%M:%S): ${NODE_NOT_READY_COUNT}/${NODE_READY_TOTAL} node(s) NotReady, waiting (deadline at $(date -u -d @${active_deadline} +%H:%M:%S))"
+            fi
           else
             echo "$(date -u +%H:%M:%S): node readiness unavailable, waiting (deadline at $(date -u -d @${active_deadline} +%H:%M:%S))"
           fi

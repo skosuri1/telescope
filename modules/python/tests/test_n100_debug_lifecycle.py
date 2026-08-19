@@ -24,6 +24,29 @@ CREATE_SCRIPT = REUSE_DIR / "create-staged-fleet-overlay.sh"
 REPAIR_SCRIPT = REUSE_DIR / "repair-existing-fleet-overlay.sh"
 DELETE_SCRIPT = REUSE_DIR / "delete-preserved-rg.sh"
 MANIFEST_SCRIPT = REUSE_DIR / "write-resume-manifest.sh"
+BASE_VALIDATE_PATH = (
+    REPOSITORY_ROOT
+    / "steps"
+    / "topology"
+    / "clustermesh-scale"
+    / "validate-resources.yml"
+)
+LIVE_OVERLAY_SCRIPT = (
+    REPOSITORY_ROOT
+    / "modules"
+    / "python"
+    / "clusterloader2"
+    / "clustermesh-scale"
+    / "preserved_live_overlay.py"
+)
+WORKER_RECONCILE_SCRIPT = (
+    REPOSITORY_ROOT
+    / "modules"
+    / "python"
+    / "clusterloader2"
+    / "clustermesh-scale"
+    / "preserved_worker_reconcile.py"
+)
 SET_RUN_ID_PATH = REPOSITORY_ROOT / "steps" / "set-run-id.yml"
 N100_TFVARS_PATH = (
     REPOSITORY_ROOT
@@ -133,6 +156,10 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert 'AKS_AMW_REBALANCE_SETTLE_SECONDS: "600"' in resume
     assert 'AKS_AMW_MAX_ACTIVE_TIME_SERIES: "1000000"' in resume
     assert 'AKS_AMW_MAX_EVENTS_PER_MINUTE: "1000000"' in resume
+    assert 'CLUSTERMESH_PRESERVED_WORKER_RECOVERY_ENABLED: "true"' in resume
+    assert 'CLUSTERMESH_DEBUG_MAX_WORKER_REPAIR_CLUSTERS: "5"' in resume
+    assert 'CLUSTERMESH_LIVE_DATA_PLANE_REPAIR_ENABLED: "true"' in resume
+    assert 'CLUSTERMESH_NODE_READINESS_SELECTOR: "type!=kwok"' in resume
     assert "parameters.debugMode" in resume
 
     assert "CLUSTERMESH_DEBUG_MODE'], 'cleanup'" in cleanup
@@ -233,6 +260,8 @@ def test_fleet_reset_and_resume_do_not_mutate_aks_lifecycle():
     assert "repair profile apply" in repair.lower()
     assert "ResourceNotFinalState" in repair
     assert "Fleet surgical repair completed" in repair
+    assert "CLUSTERMESH_DEBUG_FORCE_REPAIR_ROLES_FILE" in repair
+    assert "live-data-plane unhealthy member(s)" in repair
     assert '--slurpfile members "$member_file"' in repair
     assert '--slurpfile applied "$profile_member_file"' in repair
     assert '--slurpfile clusters "$cluster_file"' in repair
@@ -260,6 +289,48 @@ def test_preserved_rg_validation_is_fail_closed():
         assert expected in validation
 
     assert "az group update" not in manifest
+
+
+def test_preserved_resume_recovery_runs_before_authoritative_validation():
+    validation = BASE_VALIDATE_PATH.read_text(encoding="utf-8")
+
+    enumerate_pos = validation.index('displayName: "Enumerate clustermesh clusters"')
+    worker_pos = validation.index(
+        'displayName: "Recover preserved real AKS workers"'
+    )
+    apiserver_pos = validation.index(
+        'displayName: "Wait for clustermesh-apiserver Deployments + LBs (parallel)"'
+    )
+    live_pos = validation.index(
+        'displayName: "Repair stale live ClusterMesh peers"'
+    )
+    validate_pos = validation.index(
+        'displayName: "Validate Cilium + ClusterMesh on every cluster"'
+    )
+
+    assert enumerate_pos < worker_pos < apiserver_pos < live_pos < validate_pos
+    assert "preserved_worker_reconcile.py" in validation
+    assert "preserved_live_overlay.py" in validation
+    assert 'node_selector_args=(-l "$node_readiness_selector")' in validation
+    assert (
+        'get nodes "${node_selector_args[@]}" -o json'
+        in validation
+    )
+    assert "ensure_kubeconfig" in validation
+
+
+def test_preserved_resume_repair_is_bounded_and_non_destructive():
+    worker = WORKER_RECONCILE_SCRIPT.read_text(encoding="utf-8")
+    live = LIVE_OVERLAY_SCRIPT.read_text(encoding="utf-8")
+
+    for forbidden in ("az aks delete", "az group delete", "az fleet delete"):
+        assert forbidden not in worker
+        assert forbidden not in live
+    assert "max-repair-clusters" in worker
+    assert "delete-instances" in worker
+    assert "stale_instance_ids" in worker
+    assert "repair_roles_for_drift" in live
+    assert "cluster-mesh" in live
 
 
 def test_destructive_scripts_require_exact_confirmation(tmp_path):
@@ -306,6 +377,155 @@ def test_destructive_scripts_require_exact_confirmation(tmp_path):
     assert reset_result.returncode != 0
     assert "confirmation mismatch" in reset_result.stderr.lower()
     assert not az_log.exists()
+
+
+def test_connected_member_can_be_forced_through_surgical_repair(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    az_log = tmp_path / "az.log"
+    fake_az = fake_bin / "az"
+    fake_az.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'echo "$*" >> "$AZ_LOG"\n'
+        'case "$*" in\n'
+        '  "fleet show "*) echo "{}" ;;\n'
+        '  "fleet clustermeshprofile show "*) echo "{}" ;;\n'
+        '  "fleet member list "*) cat <<\'JSON\'\n'
+        '[{"name":"mesh-1","clusterResourceId":"/subscriptions/s/mesh-1",'
+        '"labels":{"mesh":"true"}},'
+        '{"name":"mesh-2","clusterResourceId":"/subscriptions/s/mesh-2",'
+        '"labels":{"mesh":"true"}}]\n'
+        "JSON\n"
+        "    ;;\n"
+        '  "fleet clustermeshprofile list-members "*) cat <<\'JSON\'\n'
+        '[{"name":"mesh-1","meshProperties":{"status":{"state":"Connected"}}},'
+        '{"name":"mesh-2","meshProperties":{"status":{"state":"Connected"}}}]\n'
+        "JSON\n"
+        "    ;;\n"
+        '  "resource list "*) cat <<\'JSON\'\n'
+        '[{"name":"mesh-1","clusterResourceId":"/subscriptions/s/mesh-1"},'
+        '{"name":"mesh-2","clusterResourceId":"/subscriptions/s/mesh-2"}]\n'
+        "JSON\n"
+        "    ;;\n"
+        '  "fleet member update "*|"fleet clustermeshprofile apply "*|'
+        '"group update "*) ;;\n'
+        '  *) echo "unexpected az command: $*" >&2; exit 98 ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o755)
+    fake_sleep = fake_bin / "sleep"
+    fake_sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_sleep.chmod(0o755)
+    forced_roles = tmp_path / "roles.txt"
+    forced_roles.write_text("mesh-2\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "AZ_LOG": str(az_log),
+            "CLUSTERMESH_DEBUG_TARGET_RUN_ID": "12345-deadbeef",
+            "CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT": "2",
+            "CLUSTERMESH_DEBUG_MAX_REPAIR_MEMBERS": "2",
+            "CLUSTERMESH_DEBUG_FORCE_REPAIR_ROLES_FILE": str(forced_roles),
+            "CLUSTERMESH_DEBUG_REPAIR_DETACH_SETTLE_SECONDS": "1",
+            "CLUSTERMESH_DEBUG_REPAIR_WAIT_SECONDS": "2",
+            "CLUSTERMESH_DEBUG_REPAIR_POLL_SECONDS": "1",
+            "CLUSTERMESH_DEBUG_REPAIR_APPLY_RETRY_SECONDS": "1",
+            "CLUSTERMESH_DEBUG_REPAIR_APPLY_ATTEMPTS": "1",
+            "BUILD_ARTIFACTSTAGINGDIRECTORY": str(tmp_path / "artifacts"),
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(REPAIR_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log = az_log.read_text(encoding="utf-8")
+    assert log.count("fleet member update") == 2
+    assert "fleet member update" in log
+    assert "--name mesh-2" in log
+    assert "--name mesh-1 --labels" not in log
+
+
+def test_surgical_repair_restores_labels_when_detach_fails(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    az_log = tmp_path / "az.log"
+    fake_az = fake_bin / "az"
+    fake_az.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'echo "$*" >> "$AZ_LOG"\n'
+        'case "$*" in\n'
+        '  "fleet show "*) echo "{}" ;;\n'
+        '  "fleet clustermeshprofile show "*) echo "{}" ;;\n'
+        '  "fleet member list "*) cat <<\'JSON\'\n'
+        '[{"name":"mesh-1","clusterResourceId":"/subscriptions/s/mesh-1",'
+        '"labels":{"mesh":"true"}},'
+        '{"name":"mesh-2","clusterResourceId":"/subscriptions/s/mesh-2",'
+        '"labels":{"mesh":"true"}}]\n'
+        "JSON\n"
+        "    ;;\n"
+        '  "fleet clustermeshprofile list-members "*) cat <<\'JSON\'\n'
+        '[{"name":"mesh-1","meshProperties":{"status":{"state":"Connected"}}},'
+        '{"name":"mesh-2","meshProperties":{"status":{"state":"Connected"}}}]\n'
+        "JSON\n"
+        "    ;;\n"
+        '  "resource list "*) cat <<\'JSON\'\n'
+        '[{"name":"mesh-1","clusterResourceId":"/subscriptions/s/mesh-1"},'
+        '{"name":"mesh-2","clusterResourceId":"/subscriptions/s/mesh-2"}]\n'
+        "JSON\n"
+        "    ;;\n"
+        '  "fleet member update "*"--name mesh-2"*"--labels mesh=repairing"*) '
+        "exit 42 ;;\n"
+        '  "fleet member update "*|"fleet clustermeshprofile apply "*) ;;\n'
+        '  *) echo "unexpected az command: $*" >&2; exit 98 ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o755)
+    fake_sleep = fake_bin / "sleep"
+    fake_sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_sleep.chmod(0o755)
+    forced_roles = tmp_path / "roles.txt"
+    forced_roles.write_text("mesh-1\nmesh-2\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "AZ_LOG": str(az_log),
+            "CLUSTERMESH_DEBUG_TARGET_RUN_ID": "12345-deadbeef",
+            "CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT": "2",
+            "CLUSTERMESH_DEBUG_MAX_REPAIR_MEMBERS": "2",
+            "CLUSTERMESH_DEBUG_FORCE_REPAIR_ROLES_FILE": str(forced_roles),
+            "CLUSTERMESH_DEBUG_REPAIR_DETACH_SETTLE_SECONDS": "1",
+            "CLUSTERMESH_DEBUG_REPAIR_WAIT_SECONDS": "2",
+            "CLUSTERMESH_DEBUG_REPAIR_POLL_SECONDS": "1",
+            "CLUSTERMESH_DEBUG_REPAIR_APPLY_RETRY_SECONDS": "1",
+            "CLUSTERMESH_DEBUG_REPAIR_APPLY_ATTEMPTS": "1",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(REPAIR_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    log = az_log.read_text(encoding="utf-8")
+    assert "--name mesh-1 --labels mesh=true" in log
+    assert "--name mesh-2 --labels mesh=true" in log
+    assert "Repair interrupted; restoring Fleet selector labels" in result.stderr
 
 
 def test_pipeline_and_debug_templates_parse_as_yaml():

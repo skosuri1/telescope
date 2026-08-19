@@ -69,6 +69,12 @@ nodes Ready and runs before the mock layer is added), then runs `deploy-mock-lay
 which loops every cluster and invokes the vendored `mock/provision-kwok-layer.sh`.
 The CL2 execute/collect steps delegate to the base scenario unchanged.
 
+Preserved debug resumes can already contain synthetic Nodes from an earlier
+attempt. Those resumes validate only real workers (`type!=kwok`) in the base
+gate, repair stale live Fleet peers, and then rerun `deploy-mock-layer.yml`
+before CL2. The deploy step migrates legacy naked agents to StatefulSet
+ownership and restores the exact synthetic layer before any scenario starts.
+
 The full `CL2_MOCK_MODE` flow: a matrix var `mock_mode: true` auto-exports as
 `MOCK_MODE` → engine `execute.yml` re-exports `CL2_MOCK_MODE` → `scale.py configure
 --mock-mode` writes `CL2_MOCK_MODE: true` into the overrides → the config templates

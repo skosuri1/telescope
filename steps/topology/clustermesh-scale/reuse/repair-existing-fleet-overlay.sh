@@ -15,6 +15,7 @@ convergence_wait_seconds="${CLUSTERMESH_DEBUG_REPAIR_WAIT_SECONDS:-7200}"
 poll_seconds="${CLUSTERMESH_DEBUG_REPAIR_POLL_SECONDS:-30}"
 apply_retry_seconds="${CLUSTERMESH_DEBUG_REPAIR_APPLY_RETRY_SECONDS:-300}"
 apply_attempts="${CLUSTERMESH_DEBUG_REPAIR_APPLY_ATTEMPTS:-6}"
+force_repair_roles_file="${CLUSTERMESH_DEBUG_FORCE_REPAIR_ROLES_FILE:-}"
 
 require_positive_integer() {
   local name="$1"
@@ -53,8 +54,40 @@ inventory_dir=$(mktemp -d "${TMPDIR:-/tmp}/clustermesh-repair-inventory.XXXXXX")
 member_file="$inventory_dir/fleet-members.json"
 profile_member_file="$inventory_dir/profile-members.json"
 cluster_file="$inventory_dir/aks-clusters.json"
+repair_roles_pending_restore=()
 cleanup_inventory() {
+  local original_rc=$?
+  local final_rc="$original_rc"
+  local role restore_failed=false apply_output apply_rc
+
+  trap - EXIT
+  set +e
+  if [ "${#repair_roles_pending_restore[@]}" -gt 0 ] &&
+    declare -F update_member_label >/dev/null; then
+    echo "Repair interrupted; restoring Fleet selector labels on: ${repair_roles_pending_restore[*]}" >&2
+    for role in "${repair_roles_pending_restore[@]}"; do
+      if ! update_member_label "$role" "$selected_value"; then
+        echo "Failed to restore Fleet selector label on $role during cleanup." >&2
+        restore_failed=true
+      fi
+    done
+    if [ "$restore_failed" = "false" ]; then
+      apply_output=""
+      apply_rc=0
+      apply_output=$(timeout --foreground 900s az fleet clustermeshprofile apply \
+        --resource-group "$target_run_id" --fleet-name "$fleet_name" \
+        --name "$profile_name" --output none --only-show-errors 2>&1) || apply_rc=$?
+      if [ "$apply_rc" -ne 0 ]; then
+        echo "Cleanup restored labels but profile apply failed: $apply_output" >&2
+        restore_failed=true
+      fi
+    fi
+    if [ "$restore_failed" = "true" ]; then
+      final_rc=1
+    fi
+  fi
   rm -rf "$inventory_dir"
+  exit "$final_rc"
 }
 trap cleanup_inventory EXIT
 
@@ -97,12 +130,41 @@ if ! jq -e -n \
   exit 1
 fi
 
+forced_roles=()
+if [ -n "$force_repair_roles_file" ]; then
+  if [ ! -f "$force_repair_roles_file" ]; then
+    echo "Forced repair role file does not exist: $force_repair_roles_file" >&2
+    exit 1
+  fi
+  while IFS= read -r role || [ -n "$role" ]; do
+    role="${role%$'\r'}"
+    [ -n "$role" ] || continue
+    if ! [[ "$role" =~ ^mesh-[1-9][0-9]*$ ]]; then
+      echo "Invalid forced repair role '$role' in $force_repair_roles_file." >&2
+      exit 1
+    fi
+    if ! jq -e --arg role "$role" 'any(.[]; .name == $role)' \
+        "$profile_member_file" >/dev/null ||
+      ! jq -e --arg role "$role" 'any(.[]; .name == $role)' \
+        "$member_file" >/dev/null; then
+      echo "Forced repair role $role is not present in the validated Fleet/profile inventory." >&2
+      exit 1
+    fi
+    forced_roles+=("$role")
+  done < "$force_repair_roles_file"
+fi
+
 mapfile -t repair_roles < <(
-  jq -r '
-    [.[] | select((.meshProperties.status.state // "unknown") != "Connected") | .name]
-    | sort_by(ltrimstr("mesh-") | tonumber)
-    | .[]
-  ' "$profile_member_file"
+  {
+    jq -r '
+      .[]
+      | select((.meshProperties.status.state // "unknown") != "Connected")
+      | .name
+    ' "$profile_member_file"
+    printf '%s\n' "${forced_roles[@]}"
+  } |
+    awk 'NF' |
+    sort -t- -k2,2n -u
 )
 
 if [ "${#repair_roles[@]}" -eq 0 ]; then
@@ -114,7 +176,7 @@ if [ "${#repair_roles[@]}" -gt "$max_repair_members" ]; then
   exit 1
 fi
 
-echo "Surgically rejoining ${#repair_roles[@]} non-Connected member(s): ${repair_roles[*]}"
+echo "Surgically rejoining ${#repair_roles[@]} control-plane or live-data-plane unhealthy member(s): ${repair_roles[*]}"
 
 update_member_label() {
   local role="$1"
@@ -135,12 +197,14 @@ update_member_label() {
 }
 
 for role in "${repair_roles[@]}"; do
+  repair_roles_pending_restore+=("$role")
   update_member_label "$role" "$repair_value"
 done
 sleep "$detach_settle_seconds"
 for role in "${repair_roles[@]}"; do
   update_member_label "$role" "$selected_value"
 done
+repair_roles_pending_restore=()
 
 apply_accepted=false
 for attempt in $(seq 1 "$apply_attempts"); do
