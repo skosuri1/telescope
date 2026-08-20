@@ -1,5 +1,6 @@
 """Static and guard checks for the reusable n=100 debug lifecycle."""
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -56,6 +57,136 @@ N100_TFVARS_PATH = (
     / "terraform-inputs"
     / "azure-100-mock-shared.tfvars"
 )
+
+
+def _write_validation_fixture(tmp_path, *, include_second_node_group):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    az_log = tmp_path / "az.log"
+    fixture_path = tmp_path / "fixture.json"
+    parent_rg = "12345-deadbeef"
+    cluster_ids = {
+        role: (
+            f"/subscriptions/test-subscription/resourceGroups/{parent_rg}/"
+            "providers/Microsoft.ContainerService/managedClusters/"
+            f"clustermesh-{index}"
+        )
+        for index, role in enumerate(("mesh-1", "mesh-2"), start=1)
+    }
+    clusters = [
+        {
+            "name": f"clustermesh-{index}",
+            "rg": parent_rg,
+            "role": role,
+            "location": "eastus2euap",
+        }
+        for index, role in enumerate(("mesh-1", "mesh-2"), start=1)
+    ]
+    aks = [
+        {
+            "id": cluster_ids[role],
+            "name": f"clustermesh-{index}",
+            "location": "eastus2euap",
+            "nodeResourceGroup": (
+                f"MC_{parent_rg}_clustermesh-{index}_eastus2euap"
+            ),
+            "powerState": {"code": "Running"},
+            "provisioningState": "Succeeded",
+            "tags": {"role": role},
+        }
+        for index, role in enumerate(("mesh-1", "mesh-2"), start=1)
+    ]
+    groups = [
+        {
+            "name": f"MC_{parent_rg}_clustermesh-1_eastus2euap",
+            "location": "eastus2euap",
+            "managedBy": cluster_ids["mesh-1"],
+            "deletion_due_time": "2000-01-01T00:00:00Z",
+        }
+    ]
+    if include_second_node_group:
+        groups.append(
+            {
+                "name": f"MC_{parent_rg}_clustermesh-2_eastus2euap",
+                "location": "eastus2euap",
+                "managedBy": cluster_ids["mesh-2"],
+                "deletion_due_time": "2099-01-01T00:00:00Z",
+            }
+        )
+    fixture_path.write_text(
+        json.dumps(
+            {
+                "parent": {
+                    "location": "eastus2euap",
+                    "tags": {
+                        "clustermesh_debug_preserved": "true",
+                        "run_id": parent_rg,
+                        "scenario": "perf-eval-clustermesh-scale",
+                        "clustermesh_debug_expected_clusters": "2",
+                        "clustermesh_debug_tfvars_sha256": "test-sha",
+                        "deletion_due_time": "2000-01-01T00:00:00Z",
+                    },
+                },
+                "clusters": clusters,
+                "aks": aks,
+                "groups": groups,
+                "fleet_count": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_az = fake_bin / "az"
+    fake_az.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "with open(os.environ['AZ_LOG'], 'a', encoding='utf-8') as log:\n"
+        "    log.write(' '.join(args) + '\\n')\n"
+        "with open(os.environ['AZ_FIXTURE'], encoding='utf-8') as handle:\n"
+        "    fixture = json.load(handle)\n"
+        "if args[:2] == ['account', 'show']:\n"
+        "    print('test-subscription')\n"
+        "elif args[:2] == ['group', 'show']:\n"
+        "    print(json.dumps(fixture['parent']))\n"
+        "elif args[:2] == ['resource', 'list']:\n"
+        "    resource_type = args[args.index('--resource-type') + 1]\n"
+        "    if resource_type == 'Microsoft.ContainerService/managedClusters':\n"
+        "        print(json.dumps(fixture['clusters']))\n"
+        "    elif resource_type == 'Microsoft.ContainerService/fleets':\n"
+        "        print(fixture['fleet_count'])\n"
+        "    else:\n"
+        "        raise SystemExit(f'unexpected resource type: {resource_type}')\n"
+        "elif args[:2] == ['aks', 'list']:\n"
+        "    print(json.dumps(fixture['aks']))\n"
+        "elif args[:2] == ['group', 'list']:\n"
+        "    print(json.dumps(fixture['groups']))\n"
+        "elif args[:2] == ['group', 'update']:\n"
+        "    print('{}')\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected az command: {args}')\n",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "AZ_FIXTURE": str(fixture_path),
+            "AZ_LOG": str(az_log),
+            "BUILD_BUILDID": "999",
+            "CLUSTERMESH_DEBUG_TARGET_RUN_ID": parent_rg,
+            "CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID": "test-subscription",
+            "CLUSTERMESH_DEBUG_EXPECTED_REGION": "eastus2euap",
+            "CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT": "2",
+            "CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256": "test-sha",
+            "CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS": "24",
+            "CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET": "false",
+            "CLUSTERMESH_DEBUG_MANIFEST_PATH": str(tmp_path / "manifest.json"),
+        }
+    )
+    return env, az_log, tmp_path / "manifest.json"
 
 
 def _stage_block(name: str, next_name: str) -> str:
@@ -285,10 +416,67 @@ def test_preserved_rg_validation_is_fail_closed():
         "Preserving later existing lease",
         "requested_deletion_due_time",
         "existing_deletion_due_time",
+        "nodeResourceGroup",
+        "managedBy",
+        "node_resource_group_count",
+        "cannot be repaired in place",
     ):
         assert expected in validation
 
     assert "az group update" not in manifest
+
+
+def test_preserved_validation_rejects_missing_node_resource_group(tmp_path):
+    env, az_log, _ = _write_validation_fixture(
+        tmp_path,
+        include_second_node_group=False,
+    )
+
+    result = subprocess.run(
+        ["bash", str(VALIDATE_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "node resource groups are missing" in result.stderr
+    assert "MC_12345-deadbeef_clustermesh-2_eastus2euap" in result.stderr
+    assert "cannot be repaired in place" in result.stderr
+    assert "group update" not in az_log.read_text(encoding="utf-8")
+
+
+def test_preserved_validation_extends_child_leases_before_parent(tmp_path):
+    env, az_log, manifest_path = _write_validation_fixture(
+        tmp_path,
+        include_second_node_group=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(VALIDATE_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    updates = [
+        line
+        for line in az_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("group update ")
+    ]
+    assert len(updates) == 2
+    assert "--name MC_12345-deadbeef_clustermesh-1_eastus2euap" in updates[0]
+    assert "--name 12345-deadbeef" in updates[1]
+    assert not any("clustermesh-2" in update for update in updates)
+    assert "Preserving later existing node RG lease" in result.stdout
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["node_resource_group_count"] == 2
+    assert manifest["node_resource_groups_extended"] == 1
+    assert len(manifest["node_resource_groups"]) == 2
 
 
 def test_preserved_resume_recovery_runs_before_authoritative_validation():

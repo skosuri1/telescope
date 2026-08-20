@@ -186,6 +186,26 @@ def test_kwok_nodes_are_ignored_by_provider_identity():
     assert state.pools[0].stale_instance_ids == ["0"]
 
 
+def test_missing_node_resource_group_requires_cluster_rebuild():
+    def runner(args, _timeout):
+        if args[1:3] == ["aks", "show"]:
+            return "MC_missing\n"
+        if args[1:4] == ["aks", "nodepool", "list"]:
+            return '[{"name":"default","count":1}]'
+        if args[1:3] == ["vmss", "list"]:
+            raise workers.ReconcileError(
+                "ERROR: (ResourceGroupNotFound) Resource group "
+                "'MC_missing' could not be found."
+            )
+        raise AssertionError(f"unexpected command: {args}")
+
+    with pytest.raises(
+        workers.ReconcileError,
+        match="cannot be repaired in place and must be rebuilt",
+    ):
+        workers.probe_cluster(CLUSTER, runner, query_timeout_seconds=5)
+
+
 def test_repair_pool_always_nudges_after_deleting_stale_instances():
     observed = workers.build_cluster_state(
         CLUSTER,

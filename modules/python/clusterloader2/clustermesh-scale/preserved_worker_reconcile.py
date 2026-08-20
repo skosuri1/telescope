@@ -113,6 +113,10 @@ TRANSIENT_ARM_ERROR_RE = re.compile(
     r"TooManyRequests|\b429\b|temporar|timeout|timed out",
     re.IGNORECASE,
 )
+RESOURCE_GROUP_NOT_FOUND_RE = re.compile(
+    r"ResourceGroupNotFound|resource group .* could not be found",
+    re.IGNORECASE,
+)
 
 
 def utc_now() -> str:
@@ -459,8 +463,8 @@ def probe_cluster(
         ),
         f"{cluster.role} AKS node-pool",
     )
-    vmsses_raw = parse_json(
-        runner(
+    try:
+        vmsses_output = runner(
             [
                 "az",
                 "vmss",
@@ -472,9 +476,16 @@ def probe_cluster(
                 "--only-show-errors",
             ],
             query_timeout_seconds,
-        ),
-        f"{cluster.role} VMSS",
-    )
+        )
+    except ReconcileError as exc:
+        if RESOURCE_GROUP_NOT_FOUND_RE.search(str(exc)):
+            raise ReconcileError(
+                f"{cluster.role}: AKS node resource group "
+                f"{node_resource_group} is missing; the preserved cluster "
+                "cannot be repaired in place and must be rebuilt"
+            ) from exc
+        raise
+    vmsses_raw = parse_json(vmsses_output, f"{cluster.role} VMSS")
     nodes_raw = parse_json(
         runner(
             [

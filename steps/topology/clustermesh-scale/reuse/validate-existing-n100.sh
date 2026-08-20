@@ -10,6 +10,19 @@ expected_tfvars_sha="${CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256:?CLUSTERMESH_DEB
 extend_lease_hours="${CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS:-0}"
 manifest_path="${CLUSTERMESH_DEBUG_MANIFEST_PATH:-$(pwd)/scale-reuse-validation.json}"
 require_overlay_reset="${CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET:-false}"
+validation_tmp_dir=$(mktemp -d)
+node_resource_groups_file="$validation_tmp_dir/node-resource-groups.json"
+subscription_groups_file="$validation_tmp_dir/subscription-groups.json"
+node_resource_group_manifest_file="$validation_tmp_dir/node-resource-group-manifest.json"
+
+cleanup_validation_tmp_dir() {
+  rm -f \
+    "$node_resource_groups_file" \
+    "$subscription_groups_file" \
+    "$node_resource_group_manifest_file"
+  rmdir "$validation_tmp_dir" 2>/dev/null || true
+}
+trap cleanup_validation_tmp_dir EXIT
 
 if ! [[ "$target_run_id" =~ ^[0-9]+-[0-9a-f]{8}$ ]]; then
   echo "Invalid preserved RUN_ID '$target_run_id'; expected <build-id>-<8 hex>." >&2
@@ -105,6 +118,89 @@ if [ "$(jq 'length' <<< "$unhealthy")" -ne 0 ]; then
   exit 1
 fi
 
+node_resource_groups=$(jq -c '
+  [.[] | {
+    name: (.nodeResourceGroup // ""),
+    cluster_name: (.name // ""),
+    cluster_id: (.id // ""),
+    role: (.tags.role // ""),
+    location: (.location // "")
+  }]
+' <<< "$aks")
+if ! jq -e --argjson expected "$expected_count" '
+    length == $expected and
+    all(.[];
+      ((.name | type) == "string" and (.name | length) > 0) and
+      ((.cluster_name | type) == "string" and (.cluster_name | length) > 0) and
+      ((.cluster_id | type) == "string" and (.cluster_id | length) > 0) and
+      ((.role | type) == "string" and (.role | test("^mesh-[0-9]+$")))
+    )
+  ' <<< "$node_resource_groups" >/dev/null; then
+  echo "Preserved AKS inventory has invalid nodeResourceGroup metadata." >&2
+  exit 1
+fi
+if ! jq -e '
+    ([.[].name | ascii_downcase] | length) ==
+    ([.[].name | ascii_downcase] | unique | length)
+  ' <<< "$node_resource_groups" >/dev/null; then
+  echo "Preserved AKS inventory has duplicate nodeResourceGroup names." >&2
+  exit 1
+fi
+
+printf '%s\n' "$node_resource_groups" > "$node_resource_groups_file"
+az group list \
+  --query '[].{name:name,location:location,managedBy:managedBy,deletion_due_time:tags.deletion_due_time}' \
+  -o json \
+  --only-show-errors > "$subscription_groups_file"
+node_resource_group_inventory=$(jq -cn \
+  --slurpfile expected "$node_resource_groups_file" \
+  --slurpfile actual "$subscription_groups_file" '
+    ($actual[0] | INDEX(.name | ascii_downcase)) as $by_name
+    | [$expected[0][] as $item
+      | ($by_name[($item.name | ascii_downcase)] // null) as $group
+      | $item + {
+          exists: ($group != null),
+          actual_location: ($group.location // ""),
+          managed_by: ($group.managedBy // ""),
+          deletion_due_time: ($group.deletion_due_time // "")
+        }]
+  ')
+missing_node_resource_groups=$(jq -c '
+  [.[] | select(.exists | not) | {
+    role,
+    cluster_name,
+    node_resource_group: .name
+  }]
+' <<< "$node_resource_group_inventory")
+missing_node_resource_group_count=$(jq 'length' <<< "$missing_node_resource_groups")
+if [ "$missing_node_resource_group_count" -ne 0 ]; then
+  missing_node_resource_group_sample=$(jq -c '.[0:20]' <<< "$missing_node_resource_groups")
+  echo "Preserved AKS node resource groups are missing: count=$missing_node_resource_group_count sample=$missing_node_resource_group_sample. These clusters cannot be repaired in place; rebuild the preserved environment." >&2
+  exit 1
+fi
+
+invalid_node_resource_groups=$(jq -c --arg region "$expected_region" '
+  [.[] | select(
+    ((.actual_location | ascii_downcase) != ($region | ascii_downcase)) or
+    ((.managed_by | ascii_downcase) != (.cluster_id | ascii_downcase))
+  ) | {
+    role,
+    cluster_name,
+    node_resource_group: .name,
+    expected_cluster_id: .cluster_id,
+    managed_by,
+    expected_location: $region,
+    actual_location
+  }]
+' <<< "$node_resource_group_inventory")
+invalid_node_resource_group_count=$(jq 'length' <<< "$invalid_node_resource_groups")
+if [ "$invalid_node_resource_group_count" -ne 0 ]; then
+  invalid_node_resource_group_sample=$(jq -c '.[0:20]' <<< "$invalid_node_resource_groups")
+  echo "Preserved AKS node resource groups do not match their clusters: count=$invalid_node_resource_group_count sample=$invalid_node_resource_group_sample" >&2
+  exit 1
+fi
+node_resource_group_count=$(jq 'length' <<< "$node_resource_group_inventory")
+
 fleet_count=$(az resource list \
   --resource-group "$target_run_id" \
   --resource-type Microsoft.ContainerService/fleets \
@@ -115,6 +211,7 @@ if [ "${require_overlay_reset,,}" = "true" ] && [ "$fleet_count" -ne 0 ]; then
 fi
 
 existing_deletion_due_time=$(jq -r '.tags.deletion_due_time // empty' <<< "$rg_json")
+node_resource_groups_extended=0
 if [ "$extend_lease_hours" -gt 0 ]; then
   requested_deletion_due_time=$(date -u -d "+${extend_lease_hours} hours" +%Y-%m-%dT%H:%M:%SZ)
   requested_deletion_due_epoch=$(date -u -d "$requested_deletion_due_time" +%s)
@@ -129,6 +226,27 @@ if [ "$extend_lease_hours" -gt 0 ]; then
   else
     deletion_due_time="$requested_deletion_due_time"
   fi
+  deletion_due_epoch=$(date -u -d "$deletion_due_time" +%s)
+
+  while IFS= read -r node_rg_row; do
+    node_rg=$(jq -r '.name' <<< "$node_rg_row")
+    existing_node_deletion_due_time=$(jq -r '.deletion_due_time // empty' <<< "$node_rg_row")
+    existing_node_deletion_due_epoch=""
+    if [ -n "$existing_node_deletion_due_time" ]; then
+      existing_node_deletion_due_epoch=$(date -u -d "$existing_node_deletion_due_time" +%s 2>/dev/null || true)
+    fi
+    if [[ "$existing_node_deletion_due_epoch" =~ ^[0-9]+$ ]] &&
+      [ "$existing_node_deletion_due_epoch" -ge "$deletion_due_epoch" ]; then
+      echo "Preserving later existing node RG lease $existing_node_deletion_due_time on $node_rg."
+      continue
+    fi
+    az group update --name "$node_rg" \
+      --set tags.deletion_due_time="$deletion_due_time" \
+            tags.clustermesh_debug_last_validation_build="${BUILD_BUILDID:-manual}" \
+      --only-show-errors >/dev/null
+    node_resource_groups_extended=$((node_resource_groups_extended + 1))
+  done < <(jq -c '.[]' <<< "$node_resource_group_inventory")
+
   az group update --name "$target_run_id" \
     --set tags.deletion_due_time="$deletion_due_time" \
           tags.clustermesh_debug_last_validation_build="${BUILD_BUILDID:-manual}" \
@@ -136,6 +254,12 @@ if [ "$extend_lease_hours" -gt 0 ]; then
 else
   deletion_due_time="$existing_deletion_due_time"
 fi
+
+node_resource_group_manifest=$(jq -c \
+  --arg required_deletion_due_time "$deletion_due_time" '
+    map(. + {required_deletion_due_time: $required_deletion_due_time})
+  ' <<< "$node_resource_group_inventory")
+printf '%s\n' "$node_resource_group_manifest" > "$node_resource_group_manifest_file"
 
 mkdir -p "$(dirname "$manifest_path")"
 jq -n \
@@ -146,6 +270,9 @@ jq -n \
   --argjson cluster_count "$cluster_count" \
   --argjson fleet_count "$fleet_count" \
   --argjson clusters "$clusters" \
+  --argjson node_resource_group_count "$node_resource_group_count" \
+  --argjson node_resource_groups_extended "$node_resource_groups_extended" \
+  --slurpfile node_resource_groups "$node_resource_group_manifest_file" \
   '{
     target_run_id: $target_run_id,
     subscription_id: $subscription_id,
@@ -153,7 +280,10 @@ jq -n \
     deletion_due_time: $deletion_due_time,
     cluster_count: $cluster_count,
     fleet_count: $fleet_count,
-    clusters: $clusters
+    clusters: $clusters,
+    node_resource_group_count: $node_resource_group_count,
+    node_resource_groups_extended: $node_resource_groups_extended,
+    node_resource_groups: $node_resource_groups[0]
   }' > "$manifest_path"
 
-echo "Validated preserved scale RG $target_run_id: expected=$expected_count clusters=$cluster_count fleet=$fleet_count lease=$deletion_due_time"
+echo "Validated preserved scale RG $target_run_id: expected=$expected_count clusters=$cluster_count node_rgs=$node_resource_group_count node_rgs_extended=$node_resource_groups_extended fleet=$fleet_count lease=$deletion_due_time"
