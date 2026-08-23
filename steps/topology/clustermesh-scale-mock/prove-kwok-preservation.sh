@@ -221,7 +221,7 @@ phase_two() {
     kubectl --kubeconfig "$kubeconfig" delete node \
       "${deleted_nodes[@]}" --wait=true --timeout=180s >/dev/null
     kubectl --kubeconfig "$kubeconfig" -n mock-clustermesh delete pod \
-      "${deleted_agents[@]}" --wait=true --timeout=180s >/dev/null
+      "${deleted_agents[@]}" --wait=false --grace-period=0 --force >/dev/null
   done
   log "injected loss: five KWOK Nodes and five mock-agent Pods per cluster"
 

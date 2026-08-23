@@ -181,6 +181,7 @@ def test_kwok_preservation_proof_reuses_standalone_stage():
         "all 200 KWOK Node and 200 mock-agent UIDs survived",
         "idempotent resume apply preserved every existing UID",
         "injected loss: five KWOK Nodes and five mock-agent Pods per cluster",
+        "--wait=false --grace-period=0 --force",
         "mock_layer_reconcile.py",
         "phase_boundary_kwok_uids_preserved:200",
         "phase_boundary_agent_uids_preserved:200",
