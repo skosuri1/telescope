@@ -151,6 +151,7 @@ root = sys.argv[1]
 roles = ("mesh-1", "mesh-2")
 deleted_agents = {f"kwok-node-{index}" for index in range(5)}
 deleted_nodes = {f"kwok-node-{index}" for index in range(10, 15)}
+expected_changed_agents = deleted_agents | deleted_nodes
 
 
 def load_map(path):
@@ -173,7 +174,7 @@ for role in roles:
             raise SystemExit(f"{role}: unexpected KWOK UID result for {name}")
     for name in before_agents:
         changed = before_agents[name] != final_agents[name]
-        if changed != (name in deleted_agents):
+        if changed != (name in expected_changed_agents):
             raise SystemExit(f"{role}: unexpected mock-agent UID result for {name}")
 PY
 }
@@ -256,6 +257,8 @@ phase_two() {
       idempotent_resume_preserved_all_uids:true,
       injected_missing_kwok_nodes:10,
       injected_deleted_agent_pods:10,
+      paired_agents_recreated_with_nodes:10,
+      final_agent_uid_changes:20,
       exact_reconcile:true,
       real_clustermesh_healthy:true
     }' > "$artifact_dir/summary.json"

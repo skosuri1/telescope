@@ -185,6 +185,8 @@ def test_kwok_preservation_proof_reuses_standalone_stage():
         "mock_layer_reconcile.py",
         "phase_boundary_kwok_uids_preserved:200",
         "phase_boundary_agent_uids_preserved:200",
+        "paired_agents_recreated_with_nodes:10",
+        "final_agent_uid_changes:20",
         "exact_reconcile:true",
     ):
         assert expected in script
