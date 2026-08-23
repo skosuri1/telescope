@@ -91,7 +91,8 @@ jobs:
   timeoutInMinutes: ${{ parameters.timeout_in_minutes }}
   cancelTimeoutInMinutes: ${{ parameters.cancel_timeout_in_minutes }}
   condition: >-
-    and(eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], ''),
+    and(or(eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], ''),
+    ${{ eq(parameters.mock_preservation_proof, true) }}),
     or(eq(variables['Build.Reason'], 'Manual'),
     and(eq(variables['Build.Reason'], 'Schedule'),
     eq(variables['Build.SourceBranchName'], 'main'))))

@@ -172,6 +172,7 @@ def test_kwok_preservation_proof_reuses_standalone_stage():
     assert "skip_publish:" in stage
     assert "azure-2-mock-shared-dsv3.tfvars" in stage
     assert "- name: mock_preservation_proof" in competitive
+    assert "${{ eq(parameters.mock_preservation_proof, true) }}" in competitive
     assert "deploy-mock-layer.yml" in competitive
     assert "Publish KWOK preservation proof" in competitive
 
