@@ -1933,6 +1933,10 @@ stages:
       MOCK_CONSUME_CLUSTERMESH: true
       MOCK_SELF_HEAL_PROBE_ENABLED: "true"
       MOCK_SELF_HEAL_PROBE_DELAY_SECONDS: "60"
+      ${{ if eq(parameters.reuseSmokeMode, 'kwok-preservation-proof') }}:
+        MOCK_PRESERVATION_PROOF_ENABLED: "true"
+      ${{ else }}:
+        MOCK_PRESERVATION_PROOF_ENABLED: "false"
       CMP_AUTO_RECOVERY_ENABLED: "true"
       CL2_PROMETHEUS_MEMORY_LIMIT_GI: "16"
       AKS_CONTROL_PLANE_METRICS_ENABLED: "true"
@@ -2045,85 +2049,9 @@ stages:
           cancel_timeout_in_minutes: 60
           credential_type: service_connection
           ssh_key_enabled: false
-          skip_publish: false
-
-  - stage: azure_eastus2_n2_kwok_preservation_aksstandalone2
-    dependsOn: []
-    condition: and(always(), eq(variables['Build.Reason'], 'Manual'), eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], 'kwok-preservation-proof'))
-    displayName: "n=2 KWOK preservation proof (AKS Standalone 2)"
-    variables:
-      AZURE_SUBSCRIPTION_ID: "18153b17-4e27-4b58-863e-f8105b8892a2"
-      MOCK_ACR_HOST: mockmeshshared11225.azurecr.io
-      MOCK_ACR_SUBSCRIPTION_ID: "37deca37-c375-4a14-b90a-043849bd2bf1"
-      MOCK_AGENT_TAG: v26
-      MOCK_NODE_COUNT: 100
-      MOCK_CONSUME_CLUSTERMESH: true
-      MOCK_DEPLOY_CONCURRENCY: 2
-      MOCK_DEPLOY_MAX_FAILURES: 0
-      MOCK_SELF_HEAL_PROBE_ENABLED: "false"
-      MOCK_PRESERVATION_PROOF_ENABLED: "true"
-      AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
-      AKS_CILIUM_POLICY_GUARD_ENABLED: "false"
-      AKS_CILIUM_POLICY_GUARD_REPAIR_ENABLED: "false"
-      AKS_PLATFORM_METRICS_REQUIRED: "false"
-      CL2_ACCEPT_CILIUM_POLICY_GAP: "true"
-      CLUSTERMESH_QUOTA_PREFLIGHT_ENABLED: "true"
-      CLUSTERMESH_REQUIRED_MANAGED_CLUSTERS: "2"
-      CLUSTERMESH_MANAGED_CLUSTER_QUOTA_HEADROOM: "2"
-      CLUSTERMESH_VM_FAMILY_QUOTA_NAME: standardDSv3Family
-      CLUSTERMESH_REQUIRED_FAMILY_VCPUS: "112"
-      CLUSTERMESH_QUOTA_HEADROOM_VCPUS: "32"
-      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "300"
-      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "60"
-      CLUSTER_COUNT: "2"
-      AGENT_DISK_MIN_FREE_GI: "10"
-      AGENT_MEMORY_MIN_FREE_GI: "4"
-      SUITE_TOTAL_BUDGET_SECONDS: "10800"
-      SUITE_FINALIZATION_RESERVE_SECONDS: "1800"
-      SUITE_JOB_TIMEOUT_BUFFER_SECONDS: "3600"
-    jobs:
-      - job: azure
-        timeoutInMinutes: 300
-        cancelTimeoutInMinutes: 60
-        steps:
-          - template: /steps/setup-tests.yml
-            parameters:
-              cloud: azure
-              region: eastus2
-              credential_type: service_connection
-              ssh_key_enabled: false
-          - template: /steps/provision-resources.yml
-            parameters:
-              cloud: azure
-              regions:
-                - eastus2
-              terraform_input_file_mapping:
-                - eastus2: "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-2-mock-shared-dsv3.tfvars"
-              retry_attempt_count: 3
-          - template: /steps/validate-resources.yml
-            parameters:
-              cloud: azure
-              regions:
-                - eastus2
-              topology: clustermesh-scale-mock
-              engine: clusterloader2
-          - template: /steps/topology/clustermesh-scale-mock/deploy-mock-layer.yml
-            parameters:
-              cloud: azure
-              regions:
-                - eastus2
-              engine: clusterloader2
-          - task: PublishPipelineArtifact@1
-            displayName: "Publish KWOK preservation proof"
-            condition: always()
-            inputs:
-              targetPath: $(Build.ArtifactStagingDirectory)/kwok-preservation-proof
-              artifact: kwok-preservation-proof-$(Build.BuildId)
-          - template: /steps/cleanup-resources.yml
-            parameters:
-              cloud: azure
-              regions:
-                - eastus2
+          mock_preservation_proof: ${{ eq(parameters.reuseSmokeMode, 'kwok-preservation-proof') }}
+          skip_execute: ${{ eq(parameters.reuseSmokeMode, 'kwok-preservation-proof') }}
+          skip_publish: ${{ eq(parameters.reuseSmokeMode, 'kwok-preservation-proof') }}
 
   # ===========================================================================
   # Full telemetry integration smoke. Keeps the scale small (2 clusters x 100

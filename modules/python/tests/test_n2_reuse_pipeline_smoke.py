@@ -7,6 +7,7 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 PIPELINE_PATH = REPOSITORY_ROOT / "pipelines/system/new-pipeline-test.yml"
+COMPETITIVE_JOB_PATH = REPOSITORY_ROOT / "jobs" / "competitive-test.yml"
 REUSE_DIR = (
     REPOSITORY_ROOT
     / "steps"
@@ -155,26 +156,24 @@ def test_reset_script_accepts_guarded_expected_count():
     assert "mesh-1..mesh-$expected_count" in reset
 
 
-def test_kwok_preservation_proof_is_manual_and_bounded():
+def test_kwok_preservation_proof_reuses_standalone_stage():
     stage = _stage_block(
-        "azure_eastus2_n2_kwok_preservation_aksstandalone2",
+        "azure_eastus2_n2_mock_full_telemetry_aksstandalone2",
         "azure_centraluseuap_n2_mock_full_telemetry",
     )
+    competitive = COMPETITIVE_JOB_PATH.read_text(encoding="utf-8")
     script = KWOK_PROOF_SCRIPT.read_text(encoding="utf-8")
 
-    assert "eq(variables['Build.Reason'], 'Manual')" in stage
-    assert (
-        "eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], "
-        "'kwok-preservation-proof')"
-        in stage
-    )
-    assert "18153b17-4e27-4b58-863e-f8105b8892a2" in stage
+    assert "eq(parameters.reuseSmokeMode, 'kwok-preservation-proof')" in stage
+    assert "MOCK_ACR_SUBSCRIPTION_ID" in stage
     assert 'MOCK_PRESERVATION_PROOF_ENABLED: "true"' in stage
+    assert "mock_preservation_proof:" in stage
+    assert "skip_execute:" in stage
+    assert "skip_publish:" in stage
     assert "azure-2-mock-shared-dsv3.tfvars" in stage
-    assert "deploy-mock-layer.yml" in stage
-    assert "Publish KWOK preservation proof" in stage
-    assert "cleanup-resources.yml" in stage
-    assert "execute-tests.yml" not in stage
+    assert "- name: mock_preservation_proof" in competitive
+    assert "deploy-mock-layer.yml" in competitive
+    assert "Publish KWOK preservation proof" in competitive
 
     for expected in (
         "phase two started in a fresh Bash process",

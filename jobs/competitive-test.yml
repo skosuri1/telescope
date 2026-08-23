@@ -63,6 +63,9 @@ parameters:
 - name: skip_execute
   type: boolean
   default: false
+- name: mock_preservation_proof
+  type: boolean
+  default: false
 - name: emit_resume_manifest
   type: boolean
   default: false
@@ -119,6 +122,18 @@ jobs:
       regions: ${{ parameters.regions }}
       topology: ${{ parameters.topology }}
       engine: ${{ parameters.engine }}
+  - ${{ if parameters.mock_preservation_proof }}:
+    - template: /steps/topology/clustermesh-scale-mock/deploy-mock-layer.yml
+      parameters:
+        cloud: ${{ parameters.cloud }}
+        engine: ${{ parameters.engine }}
+        regions: ${{ parameters.regions }}
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish KWOK preservation proof"
+      condition: always()
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/kwok-preservation-proof
+        artifact: kwok-preservation-proof-$(Build.BuildId)
   - ${{ if not(parameters.skip_execute) }}:
     - template: /steps/execute-tests.yml
       parameters:
