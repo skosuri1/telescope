@@ -18,6 +18,13 @@ PRESERVE_SCRIPT = REUSE_DIR / "run-n2-preserve-smoke.sh"
 RESUME_SCRIPT = REUSE_DIR / "resume-n2-preserved-smoke.sh"
 RESUME_EXISTING_SCRIPT = REUSE_DIR / "resume-n2-existing-smoke.sh"
 RESET_SCRIPT = REUSE_DIR / "reset-fleet-overlay.sh"
+KWOK_PROOF_SCRIPT = (
+    REPOSITORY_ROOT
+    / "steps"
+    / "topology"
+    / "clustermesh-scale-mock"
+    / "prove-kwok-preservation.sh"
+)
 
 
 def _stage_block(name: str, next_name: str) -> str:
@@ -148,6 +155,42 @@ def test_reset_script_accepts_guarded_expected_count():
     assert "mesh-1..mesh-$expected_count" in reset
 
 
+def test_kwok_preservation_proof_is_manual_and_bounded():
+    stage = _stage_block(
+        "azure_eastus2_n2_kwok_preservation_aksstandalone2",
+        "azure_centraluseuap_n2_mock_full_telemetry",
+    )
+    script = KWOK_PROOF_SCRIPT.read_text(encoding="utf-8")
+
+    assert "eq(variables['Build.Reason'], 'Manual')" in stage
+    assert (
+        "eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], "
+        "'kwok-preservation-proof')"
+        in stage
+    )
+    assert "18153b17-4e27-4b58-863e-f8105b8892a2" in stage
+    assert 'MOCK_PRESERVATION_PROOF_ENABLED: "true"' in stage
+    assert "azure-2-mock-shared-dsv3.tfvars" in stage
+    assert "deploy-mock-layer.yml" in stage
+    assert "Publish KWOK preservation proof" in stage
+    assert "cleanup-resources.yml" in stage
+    assert "execute-tests.yml" not in stage
+
+    for expected in (
+        "phase two started in a fresh Bash process",
+        "all 200 KWOK Node and 200 mock-agent UIDs survived",
+        "idempotent resume apply preserved every existing UID",
+        "injected loss: five KWOK Nodes and five mock-agent Pods per cluster",
+        "mock_layer_reconcile.py",
+        "phase_boundary_kwok_uids_preserved:200",
+        "phase_boundary_agent_uids_preserved:200",
+        "exact_reconcile:true",
+    ):
+        assert expected in script
+    assert "az aks delete" not in script
+    assert "az group delete" not in script
+
+
 def test_n2_reuse_smoke_pipeline_parses():
     pipeline = PIPELINE_PATH.read_text(encoding="utf-8")
     yaml.safe_load(pipeline)
@@ -168,6 +211,7 @@ def test_n2_reuse_smoke_pipeline_parses():
         '"${{ parameters.lifecycleSubscriptionId }}"'
     ) >= 4
     assert "clustermesh_lifecycle_mode_conflict" in pipeline
+    assert "kwok-preservation-proof" in pipeline
     assert (
         "CLUSTERMESH_DEBUG_MODE and CLUSTERMESH_REUSE_SMOKE_MODE "
         "cannot both be set"

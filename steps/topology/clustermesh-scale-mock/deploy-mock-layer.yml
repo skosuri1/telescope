@@ -339,3 +339,12 @@ steps:
     env:
       MOCK_PROVISION_SCRIPT: $(Pipeline.Workspace)/s/scenarios/perf-eval/clustermesh-scale/mock/provision-kwok-layer.sh
       MOCK_ATTRITION_SCRIPT: $(Pipeline.Workspace)/s/scenarios/perf-eval/clustermesh-scale/mock/attrition-check.sh
+
+  - script: |
+      set -euo pipefail
+      bash "$KWOK_PRESERVATION_PROOF_SCRIPT" phase1
+    displayName: "Prove KWOK preservation and exact recovery"
+    condition: and(succeeded(), eq(variables['MOCK_PRESERVATION_PROOF_ENABLED'], 'true'))
+    env:
+      KWOK_PRESERVATION_PROOF_SCRIPT: $(Pipeline.Workspace)/s/steps/topology/clustermesh-scale-mock/prove-kwok-preservation.sh
+      KWOK_PRESERVATION_ARTIFACT_DIR: $(Build.ArtifactStagingDirectory)/kwok-preservation-proof
