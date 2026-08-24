@@ -28,6 +28,12 @@ parameters:
   - name: scaleDebugClusterCount
     type: number
     default: 100
+  - name: scaleDebugRegion
+    type: string
+    default: eastus2euap
+  - name: scaleDebugVmFamilyQuotaName
+    type: string
+    default: standardDv3Family
   - name: scaleDebugTfvarsPath
     type: string
     default: scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars
@@ -2625,11 +2631,12 @@ stages:
   - stage: azure_eastus2euap_n100_debug_preserve_37deca
     dependsOn: []
     condition: and(always(), eq(variables['Build.Reason'], 'Manual'), eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], ''), eq(variables['CLUSTERMESH_DEBUG_MODE'], 'fresh-preserve'))
-    displayName: "DEBUG EUAP scale fresh provision + preserve RG (37deca)"
+    displayName: "DEBUG scale fresh provision + preserve RG"
     variables:
+      AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       SKIP_RESOURCE_DELETION: "true"
       CLUSTERMESH_DEBUG_PRESERVE: "true"
-      CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: "37deca37-c375-4a14-b90a-043849bd2bf1"
+      CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       MOCK_ACR_HOST: mockmeshshared11225.azurecr.io
       MOCK_ACR_SUBSCRIPTION_ID: "37deca37-c375-4a14-b90a-043849bd2bf1"
       MOCK_AGENT_TAG: v26
@@ -2668,7 +2675,7 @@ stages:
       CLUSTERMESH_QUOTA_PREFLIGHT_ENABLED: "true"
       CLUSTERMESH_REQUIRED_MANAGED_CLUSTERS: "${{ parameters.scaleDebugClusterCount }}"
       CLUSTERMESH_MANAGED_CLUSTER_QUOTA_HEADROOM: "5"
-      CLUSTERMESH_VM_FAMILY_QUOTA_NAME: standardDv3Family
+      CLUSTERMESH_VM_FAMILY_QUOTA_NAME: ${{ parameters.scaleDebugVmFamilyQuotaName }}
       CLUSTERMESH_REQUIRED_FAMILY_VCPUS: "${{ parameters.scaleDebugRequiredFamilyVcpus }}"
       CLUSTERMESH_QUOTA_HEADROOM_VCPUS: "128"
       CMP_AUTO_RECOVERY_ENABLED: "false"
@@ -2694,7 +2701,7 @@ stages:
         parameters:
           cloud: azure
           regions:
-            - eastus2euap
+            - ${{ parameters.scaleDebugRegion }}
           preserve_state_on_apply_failure: "true"
           destroy_retry_attempt_count: 0
           engine: clusterloader2
@@ -2704,7 +2711,7 @@ stages:
             operation_timeout: 90m
           topology: ${{ parameters.scaleDebugTopology }}
           terraform_input_file_mapping:
-            - eastus2euap: "${{ parameters.scaleDebugTfvarsPath }}"
+            - ${{ parameters.scaleDebugRegion }}: "${{ parameters.scaleDebugTfvarsPath }}"
           matrix:
             n100_debug_preserve:
               cl2_prom_snapshot_enabled: "true"
@@ -2758,17 +2765,17 @@ stages:
           skip_execute: ${{ not(parameters.scaleDebugRunWorkload) }}
           skip_publish: ${{ not(parameters.scaleDebugRunWorkload) }}
           emit_resume_manifest: true
-          resume_manifest_region: eastus2euap
+          resume_manifest_region: ${{ parameters.scaleDebugRegion }}
           resume_manifest_tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
           debug_preserve: "true"
 
   - stage: azure_eastus2euap_n100_debug_reset_fleet_37deca
     dependsOn: []
     condition: and(always(), eq(variables['Build.Reason'], 'Manual'), eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], ''), eq(variables['CLUSTERMESH_DEBUG_MODE'], 'reset-fleet'))
-    displayName: "DEBUG EUAP scale reset Fleet overlay only (37deca)"
+    displayName: "DEBUG scale reset Fleet overlay only"
     variables:
       AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
-      CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: "37deca37-c375-4a14-b90a-043849bd2bf1"
+      CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       CLUSTERMESH_QUOTA_PREFLIGHT_ENABLED: "false"
       AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
       CLUSTER_COUNT: "${{ parameters.scaleDebugClusterCount }}"
@@ -2781,7 +2788,7 @@ stages:
           - template: /steps/setup-tests.yml
             parameters:
               cloud: azure
-              region: eastus2euap
+              region: ${{ parameters.scaleDebugRegion }}
               run_id: $(CLUSTERMESH_DEBUG_TARGET_RUN_ID)
               credential_type: service_connection
               ssh_key_enabled: false
@@ -2798,7 +2805,7 @@ stages:
               CLUSTERMESH_DEBUG_TARGET_RUN_ID: $(RUN_ID)
               CLUSTERMESH_DEBUG_CONFIRM_RESET: $(CLUSTERMESH_DEBUG_CONFIRM_RESET)
               CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID: $(CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID)
-              CLUSTERMESH_DEBUG_EXPECTED_REGION: eastus2euap
+              CLUSTERMESH_DEBUG_EXPECTED_REGION: ${{ parameters.scaleDebugRegion }}
               CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: "${{ parameters.scaleDebugClusterCount }}"
               CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"
               CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET: "false"
@@ -2806,7 +2813,7 @@ stages:
           - template: /steps/topology/clustermesh-scale/reuse/write-resume-manifest.yml
             parameters:
               enabled: true
-              region: eastus2euap
+              region: ${{ parameters.scaleDebugRegion }}
               tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
 
   - stage: azure_eastus2euap_n100_debug_resume_37deca
@@ -2817,10 +2824,10 @@ stages:
       eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], ''),
       or(eq(variables['CLUSTERMESH_DEBUG_MODE'], 'resume'),
       eq(variables['CLUSTERMESH_DEBUG_MODE'], 'resume-existing')))
-    displayName: "DEBUG EUAP scale resume preserved AKS clusters (37deca)"
+    displayName: "DEBUG scale resume preserved AKS clusters"
     variables:
       AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
-      CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: "37deca37-c375-4a14-b90a-043849bd2bf1"
+      CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       MOCK_ACR_HOST: mockmeshshared11225.azurecr.io
       MOCK_ACR_SUBSCRIPTION_ID: "37deca37-c375-4a14-b90a-043849bd2bf1"
       MOCK_AGENT_TAG: v26
@@ -2887,7 +2894,7 @@ stages:
     jobs:
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
-          region: eastus2euap
+          region: ${{ parameters.scaleDebugRegion }}
           engine: clusterloader2
           engine_input:
             image: "ghcr.io/azure/clusterloader2:v20250513"
@@ -2943,20 +2950,24 @@ stages:
           cancel_timeout_in_minutes: 120
           credential_type: service_connection
           tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
-          expected_subscription_id: "37deca37-c375-4a14-b90a-043849bd2bf1"
+          expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
           expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
           run_workload: ${{ parameters.scaleDebugRunWorkload }}
           publish_results: ${{ parameters.scaleDebugRunWorkload }}
           manifest_subdir: scale-resume
           target_run_id: ${{ parameters.debugTargetRunId }}
-          overlay_mode: ${{ parameters.debugMode }}
+          ${{ if eq(parameters.debugMode, 'resume-existing') }}:
+            overlay_mode: resume-existing
+          ${{ else }}:
+            overlay_mode: resume
 
   - stage: azure_eastus2euap_n100_debug_cleanup_37deca
     dependsOn: []
     condition: and(always(), eq(variables['Build.Reason'], 'Manual'), eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], ''), eq(variables['CLUSTERMESH_DEBUG_MODE'], 'cleanup'))
-    displayName: "DEBUG EUAP scale delete preserved RG (37deca)"
+    displayName: "DEBUG scale delete preserved RG"
     variables:
-      CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: "37deca37-c375-4a14-b90a-043849bd2bf1"
+      AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
+      CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
     jobs:
       - job: delete_preserved_rg
         timeoutInMinutes: 150
@@ -2969,6 +2980,7 @@ stages:
               scriptLocation: inlineScript
               inlineScript: |
                 set -euo pipefail
+                az account set --subscription "$(CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID)"
                 export CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256
                 CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256=$(sha256sum \
                   "$(Pipeline.Workspace)/s/${{ parameters.scaleDebugTfvarsPath }}" \
@@ -2978,7 +2990,7 @@ stages:
               CLUSTERMESH_DEBUG_TARGET_RUN_ID: $(CLUSTERMESH_DEBUG_TARGET_RUN_ID)
               CLUSTERMESH_DEBUG_CONFIRM_DELETE: $(CLUSTERMESH_DEBUG_CONFIRM_DELETE)
               CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID: $(CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID)
-              CLUSTERMESH_DEBUG_EXPECTED_REGION: eastus2euap
+              CLUSTERMESH_DEBUG_EXPECTED_REGION: ${{ parameters.scaleDebugRegion }}
               CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: "${{ parameters.scaleDebugClusterCount }}"
 
   - stage: n100_debug_mode_invalid

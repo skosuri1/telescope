@@ -227,6 +227,8 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "- name: debugConfirmResume" in pipeline
     assert "- name: debugConfirmDelete" in pipeline
     assert "- name: scaleDebugClusterCount" in pipeline
+    assert "- name: scaleDebugRegion" in pipeline
+    assert "- name: scaleDebugVmFamilyQuotaName" in pipeline
     assert "- name: scaleDebugTfvarsPath" in pipeline
     assert "- name: scaleDebugTopology" in pipeline
     assert "- name: scaleDebugRequiredFamilyVcpus" in pipeline
@@ -239,14 +241,14 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert 'debug_preserve: "true"' in fresh
     assert "eq(variables['Build.Reason'], 'Manual')" in fresh
     assert "eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], '')" in fresh
-    assert "- eastus2euap" in fresh
+    assert "parameters.scaleDebugRegion" in fresh
+    assert "parameters.lifecycleSubscriptionId" in fresh
+    assert "parameters.scaleDebugVmFamilyQuotaName" in fresh
     assert "parameters.scaleDebugTfvarsPath" in fresh
     assert "parameters.scaleDebugClusterCount" in fresh
     assert "parameters.scaleDebugRequiredFamilyVcpus" in fresh
     assert "parameters.scaleDebugTopology" in fresh
     assert "parameters.scaleDebugRunWorkload" in fresh
-    assert "standardDv3Family" in fresh
-    assert "standardDSv3Family" not in fresh
     assert 'cl2_prom_snapshot_storage_account: "cmshscaleprom"' in fresh
     assert 'AKS_AMW_CLUSTERS_PER_WORKSPACE: "1"' in fresh
     assert 'AKS_AMW_FORCE_SHARD_NAMING: "true"' in fresh
@@ -260,7 +262,8 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "reset-fleet-overlay.sh" in reset
     assert "eq(variables['Build.Reason'], 'Manual')" in reset
     assert "eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], '')" in reset
-    assert "region: eastus2euap" in reset
+    assert "region: ${{ parameters.scaleDebugRegion }}" in reset
+    assert "parameters.lifecycleSubscriptionId" in reset
     assert "parameters.scaleDebugTfvarsPath" in reset
     assert "parameters.scaleDebugClusterCount" in reset
     assert 'CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"' in reset
@@ -273,7 +276,8 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "CLUSTERMESH_QUOTA_PREFLIGHT_ENABLED: \"false\"" in resume
     assert "eq(variables['Build.Reason'], 'Manual')" in resume
     assert "eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], '')" in resume
-    assert "region: eastus2euap" in resume
+    assert "region: ${{ parameters.scaleDebugRegion }}" in resume
+    assert "parameters.lifecycleSubscriptionId" in resume
     assert "parameters.scaleDebugTfvarsPath" in resume
     assert "parameters.scaleDebugClusterCount" in resume
     assert "parameters.scaleDebugTopology" in resume
@@ -292,6 +296,8 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert 'CLUSTERMESH_LIVE_DATA_PLANE_REPAIR_ENABLED: "true"' in resume
     assert 'CLUSTERMESH_NODE_READINESS_SELECTOR: "type!=kwok"' in resume
     assert "parameters.debugMode" in resume
+    assert "overlay_mode: resume-existing" in resume
+    assert "overlay_mode: resume" in resume
 
     assert "CLUSTERMESH_DEBUG_MODE'], 'cleanup'" in cleanup
     assert "CLUSTERMESH_DEBUG_CONFIRM_DELETE" in cleanup
@@ -299,7 +305,12 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "delete-preserved-rg.sh" in cleanup
     assert "eq(variables['Build.Reason'], 'Manual')" in cleanup
     assert "eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], '')" in cleanup
-    assert "CLUSTERMESH_DEBUG_EXPECTED_REGION: eastus2euap" in cleanup
+    assert (
+        "CLUSTERMESH_DEBUG_EXPECTED_REGION: "
+        "${{ parameters.scaleDebugRegion }}"
+        in cleanup
+    )
+    assert "parameters.lifecycleSubscriptionId" in cleanup
     assert "parameters.scaleDebugTfvarsPath" in cleanup
     assert "parameters.scaleDebugClusterCount" in cleanup
 
