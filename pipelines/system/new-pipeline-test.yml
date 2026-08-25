@@ -2724,9 +2724,14 @@ stages:
               share_infra_settle_seconds: 300
               agent_disk_min_free_gi: 40
               agent_memory_min_free_gi: 12
-              suite_total_budget_seconds: 158400
-              suite_finalization_reserve_seconds: 10800
-              suite_job_timeout_buffer_seconds: 21600
+              ${{ if eq(parameters.scaleDebugRunWorkload, true) }}:
+                suite_total_budget_seconds: 158400
+                suite_finalization_reserve_seconds: 10800
+                suite_job_timeout_buffer_seconds: 21600
+              ${{ else }}:
+                suite_total_budget_seconds: 7200
+                suite_finalization_reserve_seconds: 1800
+                suite_job_timeout_buffer_seconds: 3600
               cl2_config_file: ""
               cl2_max_concurrent: 12
               test_type: shared
@@ -2758,8 +2763,12 @@ stages:
               node_churn_recovery_grace_seconds: 1800
               trigger_reason: ${{ variables['Build.Reason'] }}
           max_parallel: 1
-          timeout_in_minutes: 3000
-          cancel_timeout_in_minutes: 120
+          ${{ if eq(parameters.scaleDebugRunWorkload, true) }}:
+            timeout_in_minutes: 3000
+            cancel_timeout_in_minutes: 120
+          ${{ else }}:
+            timeout_in_minutes: 600
+            cancel_timeout_in_minutes: 60
           credential_type: service_connection
           ssh_key_enabled: false
           skip_execute: ${{ not(parameters.scaleDebugRunWorkload) }}

@@ -249,6 +249,8 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "parameters.scaleDebugRequiredFamilyVcpus" in fresh
     assert "parameters.scaleDebugTopology" in fresh
     assert "parameters.scaleDebugRunWorkload" in fresh
+    assert "suite_total_budget_seconds: 7200" in fresh
+    assert "timeout_in_minutes: 600" in fresh
     assert 'cl2_prom_snapshot_storage_account: "cmshscaleprom"' in fresh
     assert 'AKS_AMW_CLUSTERS_PER_WORKSPACE: "1"' in fresh
     assert 'AKS_AMW_FORCE_SHARD_NAMING: "true"' in fresh
