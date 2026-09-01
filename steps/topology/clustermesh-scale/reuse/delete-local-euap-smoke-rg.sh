@@ -17,8 +17,8 @@ if ! [[ "$target_run_id" =~ ^local-euap-[a-z0-9-]+-[0-9a-f]{6}$ ]]; then
   echo "Invalid local EUAP smoke RG '$target_run_id'." >&2
   exit 1
 fi
-if ! [[ "$expected_count" =~ ^[1-9][0-9]*$ ]]; then
-  echo "CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT must be a positive integer." >&2
+if ! [[ "$expected_count" =~ ^(0|2)$ ]]; then
+  echo "CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT must be 0 or 2." >&2
   exit 1
 fi
 
@@ -72,18 +72,18 @@ if [ "$(jq 'length' <<< "$clusters")" -ne "$expected_count" ]; then
   echo "Expected exactly $expected_count local-smoke AKS clusters." >&2
   exit 1
 fi
-if ! jq -e --arg scenario "$expected_scenario" '
-    ([.[].name] | sort) == ["clustermesh-1", "clustermesh-2"] and
-    ([.[].role] | sort) == ["mesh-1", "mesh-2"] and
-    all(.[]; .scenario == $scenario) and
-    all(.[]; (.id | type) == "string" and (.id | length) > 0) and
-    all(.[]; (.node_resource_group | type) == "string" and
-      (.node_resource_group | length) > 0)
-  ' <<< "$clusters" >/dev/null; then
+if [ "$expected_count" -eq 2 ] && ! jq -e --arg scenario "$expected_scenario" '
+      ([.[].name] | sort) == ["clustermesh-1", "clustermesh-2"] and
+      ([.[].role] | sort) == ["mesh-1", "mesh-2"] and
+      all(.[]; .scenario == $scenario) and
+      all(.[]; (.id | type) == "string" and (.id | length) > 0) and
+      all(.[]; (.node_resource_group | type) == "string" and
+        (.node_resource_group | length) > 0)
+    ' <<< "$clusters" >/dev/null; then
   echo "Local-smoke AKS inventory does not match the expected two-cluster topology." >&2
   exit 1
 fi
-if ! jq -e '
+if [ "$expected_count" -eq 2 ] && ! jq -e '
     ([.[].node_resource_group | ascii_downcase] | unique | length) == length
   ' <<< "$clusters" >/dev/null; then
   echo "Local-smoke AKS inventory has duplicate node resource groups." >&2

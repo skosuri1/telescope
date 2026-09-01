@@ -25,6 +25,9 @@ parameters:
   - name: lifecycleDesiredStateSha
     type: string
     default: ""
+  - name: localSmokeCleanupExpectedClusterCount
+    type: number
+    default: 2
   - name: scaleDebugClusterCount
     type: number
     default: 100
@@ -1700,7 +1703,7 @@ stages:
               CLUSTERMESH_DEBUG_CONFIRM_DELETE: $(CLUSTERMESH_DEBUG_CONFIRM_DELETE)
               CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
               CLUSTERMESH_DEBUG_EXPECTED_REGION: eastus2euap
-              CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: "2"
+              CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: ${{ parameters.localSmokeCleanupExpectedClusterCount }}
 
   - stage: n2_reuse_smoke_mode_invalid
     dependsOn: []

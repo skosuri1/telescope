@@ -203,6 +203,7 @@ def test_local_euap_cleanup_is_exactly_guarded():
     script = LOCAL_SMOKE_CLEANUP_SCRIPT.read_text(encoding="utf-8")
 
     assert "cleanup-local-euap" in stage
+    assert "parameters.localSmokeCleanupExpectedClusterCount" in stage
     assert "eq(variables['Build.Reason'], 'Manual')" in stage
     assert "delete-local-euap-smoke-rg.sh" in stage
     assert "CLUSTERMESH_DEBUG_CONFIRM_DELETE" in stage
@@ -212,6 +213,7 @@ def test_local_euap_cleanup_is_exactly_guarded():
         "RG run_id tag mismatch",
         "RG scenario tag mismatch",
         "RG owner tag mismatch",
+        "must be 0 or 2",
         '["clustermesh-1", "clustermesh-2"]',
         '["mesh-1", "mesh-2"]',
         "managedBy",
