@@ -1675,6 +1675,33 @@ stages:
               CLUSTERMESH_DEBUG_DESIRED_STATE_PATH: $(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/reuse/run-n2-preserve-smoke.sh
               CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256: ${{ parameters.lifecycleDesiredStateSha }}
 
+  - stage: azure_eastus2euap_local_smoke_cleanup
+    dependsOn: []
+    condition: and(always(), eq(variables['Build.Reason'], 'Manual'), eq(variables['CLUSTERMESH_DEBUG_MODE'], ''), eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], 'cleanup-local-euap'))
+    displayName: "SMOKE guarded local EUAP cleanup"
+    variables:
+      AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
+    jobs:
+      - job: cleanup_local_euap
+        timeoutInMinutes: 90
+        steps:
+          - task: AzureCLI@2
+            displayName: "Validate and delete local EUAP smoke RG"
+            inputs:
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az account set --subscription "${{ parameters.lifecycleSubscriptionId }}"
+                bash "$(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/reuse/delete-local-euap-smoke-rg.sh"
+            env:
+              CLUSTERMESH_DEBUG_TARGET_RUN_ID: $(CLUSTERMESH_DEBUG_TARGET_RUN_ID)
+              CLUSTERMESH_DEBUG_CONFIRM_DELETE: $(CLUSTERMESH_DEBUG_CONFIRM_DELETE)
+              CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
+              CLUSTERMESH_DEBUG_EXPECTED_REGION: eastus2euap
+              CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: "2"
+
   - stage: n2_reuse_smoke_mode_invalid
     dependsOn: []
     condition: >-
@@ -1685,6 +1712,7 @@ stages:
       ne(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], 'resume'),
       ne(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], 'resume-existing'),
       ne(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], 'kwok-preservation-proof'),
+      ne(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], 'cleanup-local-euap'),
       ne(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], 'cleanup'))
     displayName: "INVALID n=2 reuse smoke mode"
     jobs:

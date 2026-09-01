@@ -19,6 +19,7 @@ PRESERVE_SCRIPT = REUSE_DIR / "run-n2-preserve-smoke.sh"
 RESUME_SCRIPT = REUSE_DIR / "resume-n2-preserved-smoke.sh"
 RESUME_EXISTING_SCRIPT = REUSE_DIR / "resume-n2-existing-smoke.sh"
 RESET_SCRIPT = REUSE_DIR / "reset-fleet-overlay.sh"
+LOCAL_SMOKE_CLEANUP_SCRIPT = REUSE_DIR / "delete-local-euap-smoke-rg.sh"
 KWOK_PROOF_SCRIPT = (
     REPOSITORY_ROOT
     / "steps"
@@ -192,6 +193,32 @@ def test_kwok_preservation_proof_reuses_standalone_stage():
         assert expected in script
     assert "az aks delete" not in script
     assert "az group delete" not in script
+
+
+def test_local_euap_cleanup_is_exactly_guarded():
+    stage = _stage_block(
+        "azure_eastus2euap_local_smoke_cleanup",
+        "n2_reuse_smoke_mode_invalid",
+    )
+    script = LOCAL_SMOKE_CLEANUP_SCRIPT.read_text(encoding="utf-8")
+
+    assert "cleanup-local-euap" in stage
+    assert "eq(variables['Build.Reason'], 'Manual')" in stage
+    assert "delete-local-euap-smoke-rg.sh" in stage
+    assert "CLUSTERMESH_DEBUG_CONFIRM_DELETE" in stage
+    for expected in (
+        "local-euap-",
+        "perf-eval-clustermesh-scale-local-smoke",
+        "RG run_id tag mismatch",
+        "RG scenario tag mismatch",
+        "RG owner tag mismatch",
+        '["clustermesh-1", "clustermesh-2"]',
+        '["mesh-1", "mesh-2"]',
+        "managedBy",
+        "az group delete",
+        "Deleted local EUAP smoke parent and managed RGs",
+    ):
+        assert expected in script
 
 
 def test_n2_reuse_smoke_pipeline_parses():
