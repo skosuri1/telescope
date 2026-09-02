@@ -71,6 +71,37 @@ jobs:
 
   - script: |
       set -euo pipefail
+      if [ "${CLUSTERMESH_PRESERVED_AKS_ARM_RECONCILE_ENABLED:-false}" != "true" ]; then
+        echo "Preserved AKS ARM state reconciliation disabled; skipping."
+        exit 0
+      fi
+      if [ "$CLUSTERMESH_DEBUG_CONFIRM_RESUME" != "$RUN_ID" ]; then
+        echo "CLUSTERMESH_DEBUG_CONFIRM_RESUME must equal $RUN_ID." >&2
+        exit 1
+      fi
+      summary_dir="$(Build.ArtifactStagingDirectory)/${{ parameters.manifest_subdir }}"
+      mkdir -p "$summary_dir"
+      expected_tfvars_sha=$(sha256sum \
+        "$(Pipeline.Workspace)/s/${{ parameters.tfvars_path }}" \
+        | awk '{print $1}')
+      python3 "$PRESERVED_AKS_ARM_RECONCILER" \
+        --resource-group "$RUN_ID" \
+        --expected-subscription "${{ parameters.expected_subscription_id }}" \
+        --expected-region "${{ parameters.region }}" \
+        --expected-count "${{ parameters.expected_cluster_count }}" \
+        --expected-tfvars-sha "$expected_tfvars_sha" \
+        --max-repair-clusters "${CLUSTERMESH_DEBUG_MAX_AKS_ARM_REPAIR_CLUSTERS:-10}" \
+        --max-concurrent "${CLUSTERMESH_DEBUG_AKS_ARM_REPAIR_CONCURRENCY:-2}" \
+        --summary-file "$summary_dir/aks-arm-reconcile.json"
+      echo "##vso[task.uploadfile]$summary_dir/aks-arm-reconcile.json"
+    displayName: "Reconcile stale preserved AKS ARM states"
+    env:
+      PRESERVED_AKS_ARM_RECONCILER: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_aks_arm_reconcile.py
+      RUN_ID: ${{ parameters.target_run_id }}
+      CLUSTERMESH_DEBUG_CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
+
+  - script: |
+      set -euo pipefail
       if [ "$CLUSTERMESH_DEBUG_CONFIRM_RESUME" != "$RUN_ID" ]; then
         echo "CLUSTERMESH_DEBUG_CONFIRM_RESUME must equal $RUN_ID." >&2
         exit 1

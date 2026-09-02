@@ -48,6 +48,14 @@ WORKER_RECONCILE_SCRIPT = (
     / "clustermesh-scale"
     / "preserved_worker_reconcile.py"
 )
+AKS_ARM_RECONCILE_SCRIPT = (
+    REPOSITORY_ROOT
+    / "modules"
+    / "python"
+    / "clusterloader2"
+    / "clustermesh-scale"
+    / "preserved_aks_arm_reconcile.py"
+)
 SET_RUN_ID_PATH = REPOSITORY_ROOT / "steps" / "set-run-id.yml"
 N100_TFVARS_PATH = (
     REPOSITORY_ROOT
@@ -302,6 +310,8 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert 'CLUSTERMESH_DEBUG_MAX_WORKER_REPAIR_CLUSTERS: "5"' in resume
     assert 'CLUSTERMESH_LIVE_DATA_PLANE_REPAIR_ENABLED: "true"' in resume
     assert 'CLUSTERMESH_NODE_READINESS_SELECTOR: "type!=kwok"' in resume
+    assert 'CLUSTERMESH_PRESERVED_AKS_ARM_RECONCILE_ENABLED: "true"' in resume
+    assert 'CLUSTERMESH_DEBUG_MAX_AKS_ARM_REPAIR_CLUSTERS: "10"' in resume
     assert "parameters.debugMode" in resume
     assert "overlay_mode: resume-existing" in resume
     assert "overlay_mode: resume" in resume
@@ -336,6 +346,13 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     assert "/steps/provision-resources.yml" not in resume
     assert "/steps/cleanup-resources.yml" not in resume
     assert "validate-existing-scale.sh" in resume
+    assert "preserved_aks_arm_reconcile.py" in resume
+    assert (
+        resume.index('displayName: "Reconcile stale preserved AKS ARM states"')
+        < resume.index(
+            'displayName: "Validate preserved scale clusters and prepare Fleet overlay"'
+        )
+    )
     assert "create-staged-fleet-overlay.sh" in resume
     assert "repair-existing-fleet-overlay.sh" in resume
     assert "/steps/validate-resources.yml" in resume
@@ -538,13 +555,17 @@ def test_preserved_resume_recovery_runs_before_authoritative_validation():
 
 
 def test_preserved_resume_repair_is_bounded_and_non_destructive():
+    arm = AKS_ARM_RECONCILE_SCRIPT.read_text(encoding="utf-8")
     worker = WORKER_RECONCILE_SCRIPT.read_text(encoding="utf-8")
     live = LIVE_OVERLAY_SCRIPT.read_text(encoding="utf-8")
 
     for forbidden in ("az aks delete", "az group delete", "az fleet delete"):
+        assert forbidden not in arm
         assert forbidden not in worker
         assert forbidden not in live
     assert "max-repair-clusters" in worker
+    assert "OverlaymgrReconcileError" in arm
+    assert '"aks",\n        "update"' in arm
     assert "delete-instances" in worker
     assert "stale_instance_ids" in worker
     assert "repair_roles_for_drift" in live
