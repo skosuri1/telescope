@@ -65,6 +65,23 @@ locals {
         default_node_pool                 = local.aks_cli_system_node_pool != null ? local.aks_cli_system_node_pool : aks.default_node_pool
         extra_node_pool                   = local.aks_cli_user_node_pool != null ? local.aks_cli_user_node_pool : aks.extra_node_pool
         enable_apiserver_vnet_integration = local.enable_apiserver_vnet_integration
+        optional_parameters = concat(
+          aks.optional_parameters,
+          local.aks_network_dataplane != null && !contains(
+            [for parameter in aks.optional_parameters : parameter.name],
+            "network-dataplane",
+            ) ? [{
+              name  = "network-dataplane"
+              value = local.aks_network_dataplane
+          }] : [],
+          local.aks_network_policy != null && !contains(
+            [for parameter in aks.optional_parameters : parameter.name],
+            "network-policy",
+            ) ? [{
+              name  = "network-policy"
+              value = local.aks_network_policy
+          }] : [],
+        )
       }
     )
   ] : []

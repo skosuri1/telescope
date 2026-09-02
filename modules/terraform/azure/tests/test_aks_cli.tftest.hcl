@@ -47,7 +47,7 @@ run "test_aks_cli2" {
   assert {
     # Check if the generated command matches the expected AKS CLI command format
     condition = length(regex(
-      "az aks create -g 123456789 -n test --location eastus --tier Standard --tags SkipAKSCluster=1 creation_time=.* deletion_due_time=.* owner=aks role=client run_id=123456789 scenario=perf-eval-my_scenario --no-ssh-key --enable-managed-identity --nodepool-name default --node-count 2 --node-vm-size Standard_D2s_v3 --vm-set-type VirtualMachineScaleSets --node-osdisk-type Managed\\s*$",
+      "az aks create -g 123456789 -n test --location eastus --tier Standard --tags SkipAKSCluster=1 creation_time=.* deletion_due_time=.* owner=aks role=client run_id=123456789 scenario=perf-eval-my_scenario telescope_provisioner=aks-cli --no-ssh-key --enable-managed-identity --nodepool-name default --node-count 2 --node-vm-size Standard_D2s_v3 --vm-set-type VirtualMachineScaleSets --node-osdisk-type Managed\\s*$",
       replace(module.aks-cli["client"].aks_cli_command, "/\\s+/", " ") # normalize whitespace for comparison
     )) > 0
     error_message = "Actual: ${replace(module.aks-cli["client"].aks_cli_command, "\\s+", " ")}"
@@ -83,10 +83,50 @@ run "test_aks_cli_automatic" {
 
   assert {
     condition = length(regex(
-      "az aks create -g 123456789 -n test --location eastus --tier Standard --tags SkipAKSCluster=1 creation_time=.* deletion_due_time=.* owner=aks role=client run_id=123456789 scenario=perf-eval-my_scenario --no-ssh-key --sku automatic --zones 1 2 3 --enable-managed-identity\\s*$",
+      "az aks create -g 123456789 -n test --location eastus --tier Standard --tags SkipAKSCluster=1 creation_time=.* deletion_due_time=.* owner=aks role=client run_id=123456789 scenario=perf-eval-my_scenario telescope_provisioner=aks-cli --no-ssh-key --sku automatic --zones 1 2 3 --enable-managed-identity\\s*$",
       replace(module.aks-cli["client"].aks_cli_command, "/\\s+/", " ") # normalize whitespace for comparison
     )) > 0
     error_message = "Actual: ${replace(module.aks-cli["client"].aks_cli_command, "/\\s+/", " ")}"
+  }
+}
+
+run "test_aks_cli_global_cilium_policy" {
+
+  command = apply
+
+  variables {
+    json_input = {
+      run_id                = "123456789"
+      region                = "eastus"
+      aks_network_dataplane = "cilium"
+      aks_network_policy    = "cilium"
+    }
+
+    aks_cli_config_list = [
+      {
+        role                          = "client"
+        aks_name                      = "test-cilium"
+        sku_tier                      = "Standard"
+        use_aks_preview_cli_extension = true
+        optional_parameters = [
+          {
+            name  = "network-dataplane"
+            value = "cilium"
+          }
+        ]
+        dry_run = true
+      }
+    ]
+  }
+
+  assert {
+    condition     = length(regexall("--network-dataplane cilium", module.aks-cli["client"].aks_cli_command)) == 1
+    error_message = "Global AKS dataplane input must not duplicate an explicit aks-cli parameter."
+  }
+
+  assert {
+    condition     = length(regexall("--network-policy cilium", module.aks-cli["client"].aks_cli_command)) == 1
+    error_message = "Global AKS network policy must be injected into the aks-cli command."
   }
 }
 

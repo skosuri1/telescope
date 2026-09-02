@@ -57,6 +57,9 @@ N100_TFVARS_PATH = (
     / "terraform-inputs"
     / "azure-100-mock-shared.tfvars"
 )
+AZURE_TERRAFORM_MAIN = (
+    REPOSITORY_ROOT / "modules" / "terraform" / "azure" / "main.tf"
+)
 
 
 def _write_validation_fixture(tmp_path, *, include_second_node_group):
@@ -237,6 +240,8 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "CLUSTERMESH_DEBUG_MODE'], 'fresh-preserve'" in fresh
     assert 'SKIP_RESOURCE_DELETION: "true"' in fresh
     assert 'CLUSTERMESH_DEBUG_PRESERVE: "true"' in fresh
+    assert "NETWORK_DATAPLANE: cilium" in fresh
+    assert "NETWORK_POLICY: cilium" in fresh
     assert "emit_resume_manifest: true" in fresh
     assert 'debug_preserve: "true"' in fresh
     assert "eq(variables['Build.Reason'], 'Manual')" in fresh
@@ -361,6 +366,18 @@ def test_fresh_preserve_n100_lease_is_seven_days():
     tfvars = N100_TFVARS_PATH.read_text(encoding="utf-8")
 
     assert 'deletion_delay = "168h"' in tfvars
+
+
+def test_global_cilium_policy_is_injected_into_aks_cli_configs():
+    terraform = AZURE_TERRAFORM_MAIN.read_text(encoding="utf-8")
+
+    assert "local.aks_network_dataplane != null" in terraform
+    assert '"network-dataplane"' in terraform
+    assert "local.aks_network_policy != null" in terraform
+    assert '"network-policy"' in terraform
+    assert terraform.count(
+        "[for parameter in aks.optional_parameters : parameter.name]"
+    ) >= 2
 
 
 def test_fleet_reset_and_resume_do_not_mutate_aks_lifecycle():

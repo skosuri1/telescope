@@ -2668,6 +2668,8 @@ stages:
       SKIP_RESOURCE_DELETION: "true"
       CLUSTERMESH_DEBUG_PRESERVE: "true"
       CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
+      NETWORK_DATAPLANE: cilium
+      NETWORK_POLICY: cilium
       MOCK_ACR_HOST: mockmeshshared11225.azurecr.io
       MOCK_ACR_SUBSCRIPTION_ID: "37deca37-c375-4a14-b90a-043849bd2bf1"
       MOCK_AGENT_TAG: v26
