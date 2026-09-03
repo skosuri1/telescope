@@ -835,7 +835,8 @@ steps:
         --attempts "${CLUSTERMESH_DEBUG_LIVE_PROBE_ATTEMPTS:-5}" \
         --retry-seconds "${CLUSTERMESH_DEBUG_LIVE_PROBE_RETRY_SECONDS:-30}" \
         --command-timeout-seconds "${CLUSTERMESH_DEBUG_LIVE_PROBE_COMMAND_TIMEOUT_SECONDS:-30}" \
-        --max-concurrent "${CLUSTERMESH_DEBUG_LIVE_PROBE_CONCURRENCY:-10}"
+        --max-concurrent "${CLUSTERMESH_DEBUG_LIVE_PROBE_CONCURRENCY:-10}" \
+        --max-repair-roles "${CLUSTERMESH_DEBUG_MAX_REPAIR_MEMBERS:-20}"
       probe_rc=$?
       set -e
       echo "##vso[task.uploadfile]$initial_summary"
@@ -866,7 +867,8 @@ steps:
         --attempts "${CLUSTERMESH_DEBUG_LIVE_VERIFY_ATTEMPTS:-40}" \
         --retry-seconds "${CLUSTERMESH_DEBUG_LIVE_VERIFY_RETRY_SECONDS:-30}" \
         --command-timeout-seconds "${CLUSTERMESH_DEBUG_LIVE_PROBE_COMMAND_TIMEOUT_SECONDS:-30}" \
-        --max-concurrent "${CLUSTERMESH_DEBUG_LIVE_PROBE_CONCURRENCY:-10}"
+        --max-concurrent "${CLUSTERMESH_DEBUG_LIVE_PROBE_CONCURRENCY:-10}" \
+        --max-repair-roles "${CLUSTERMESH_DEBUG_MAX_REPAIR_MEMBERS:-20}"
       verify_rc=$?
       set -e
       echo "##vso[task.uploadfile]$verify_summary"

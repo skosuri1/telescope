@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -333,18 +334,20 @@ def analyze_status(
     )
 
 
-def repair_roles_for_drift(
+def repair_selection_for_drift(
     drifts: Iterable[ClusterDrift],
     identity_by_name: Dict[str, ClusterIdentity],
-) -> List[str]:
-    """Map live peer drift to the smallest safe Fleet member repair set."""
+    max_repair_roles: int = 20,
+) -> dict:
+    """Build a minimum bounded Fleet repair set for every unhealthy edge."""
 
-    roles: Set[str] = set()
+    forced_local_roles: Set[str] = set()
+    directed_edges: Set[Tuple[str, str]] = set()
     for drift in drifts:
         if drift.command_error or drift.unexpected_remote_names:
-            roles.add(drift.role)
+            forced_local_roles.add(drift.role)
         if drift.duplicate_remote_names:
-            roles.add(drift.role)
+            forced_local_roles.add(drift.role)
         for remote_name in (
             drift.missing_remote_names + drift.not_ready_remote_names
         ):
@@ -352,10 +355,165 @@ def repair_roles_for_drift(
             if remote_identity is None:
                 # The local member has a stale or malformed projection that
                 # cannot be mapped safely to a target member.
-                roles.add(drift.role)
+                forced_local_roles.add(drift.role)
+            elif remote_identity.role == drift.role:
+                forced_local_roles.add(drift.role)
             else:
-                roles.add(remote_identity.role)
-    return sorted(roles, key=role_sort_key)
+                directed_edges.add((drift.role, remote_identity.role))
+
+    if max_repair_roles <= 0:
+        raise ProbeError("max_repair_roles must be positive")
+    remote_incidence: Counter[str] = Counter(
+        remote_role for _, remote_role in directed_edges
+    )
+    cover_edges = {
+        tuple(sorted(edge, key=role_sort_key)) for edge in directed_edges
+    }
+    uncovered_edges = {
+        edge
+        for edge in cover_edges
+        if edge[0] not in forced_local_roles
+        and edge[1] not in forced_local_roles
+    }
+    budget = max_repair_roles - len(forced_local_roles)
+    cover = None
+    minimum_additional_roles = None
+    if budget >= 0:
+        lower_bound = _matching_lower_bound(uncovered_edges)
+        for limit in range(lower_bound, budget + 1):
+            cover = _find_vertex_cover(
+                uncovered_edges,
+                limit,
+                remote_incidence,
+            )
+            if cover is not None:
+                minimum_additional_roles = len(cover)
+                break
+
+    cover_within_limit = cover is not None
+    if cover is None:
+        # All endpoints always cover every edge and make the unsafe breadth
+        # explicit in the summary. The caller must not mutate when bounded=false.
+        cover = {role for edge in uncovered_edges for role in edge}
+    selected_roles = forced_local_roles | cover
+
+    return {
+        "directed_edge_count": len(directed_edges),
+        "cover_edge_count": len(cover_edges),
+        "forced_local_roles": sorted(forced_local_roles, key=role_sort_key),
+        "max_repair_roles": max_repair_roles,
+        "minimum_additional_roles": minimum_additional_roles,
+        "cover_within_limit": cover_within_limit,
+        "repair_roles": sorted(selected_roles, key=role_sort_key),
+    }
+
+
+def _matching_lower_bound(edges: Set[Tuple[str, str]]) -> int:
+    """Return a deterministic maximal-matching lower bound."""
+
+    matched: Set[str] = set()
+    count = 0
+    for left, right in sorted(
+        edges,
+        key=lambda edge: (role_sort_key(edge[0]), role_sort_key(edge[1])),
+    ):
+        if left in matched or right in matched:
+            continue
+        matched.update((left, right))
+        count += 1
+    return count
+
+
+def _find_vertex_cover(
+    edges: Set[Tuple[str, str]],
+    limit: int,
+    remote_incidence: Counter[str],
+) -> Optional[Set[str]]:
+    """Find one deterministic vertex cover using at most ``limit`` roles."""
+
+    def search(
+        remaining_edges: Set[Tuple[str, str]],
+        remaining_limit: int,
+    ) -> Optional[Set[str]]:
+        selected: Set[str] = set()
+        while remaining_edges:
+            if remaining_limit <= 0:
+                return None
+            degree: Counter[str] = Counter()
+            for left, right in remaining_edges:
+                degree[left] += 1
+                degree[right] += 1
+            forced = [
+                role for role, count in degree.items() if count > remaining_limit
+            ]
+            if not forced:
+                break
+            chosen = sorted(
+                forced,
+                key=lambda role: (
+                    -degree[role],
+                    -remote_incidence[role],
+                    role_sort_key(role),
+                ),
+            )[0]
+            selected.add(chosen)
+            remaining_limit -= 1
+            remaining_edges = {
+                edge for edge in remaining_edges if chosen not in edge
+            }
+
+        if not remaining_edges:
+            return selected
+        if len(remaining_edges) > remaining_limit * remaining_limit:
+            return None
+        if _matching_lower_bound(remaining_edges) > remaining_limit:
+            return None
+
+        degree = Counter()
+        for left, right in remaining_edges:
+            degree[left] += 1
+            degree[right] += 1
+        branch_edge = sorted(
+            remaining_edges,
+            key=lambda edge: (
+                -max(degree[edge[0]], degree[edge[1]]),
+                -min(degree[edge[0]], degree[edge[1]]),
+                role_sort_key(edge[0]),
+                role_sort_key(edge[1]),
+            ),
+        )[0]
+        branch_roles = sorted(
+            branch_edge,
+            key=lambda role: (
+                -degree[role],
+                -remote_incidence[role],
+                role_sort_key(role),
+            ),
+        )
+        for role in branch_roles:
+            result = search(
+                {edge for edge in remaining_edges if role not in edge},
+                remaining_limit - 1,
+            )
+            if result is not None:
+                return selected | {role} | result
+        return None
+
+    return search(set(edges), limit)
+
+
+def repair_roles_for_drift(
+    drifts: Iterable[ClusterDrift],
+    identity_by_name: Dict[str, ClusterIdentity],
+    max_repair_roles: int = 20,
+) -> List[str]:
+    """Map live peer drift to a compact safe Fleet member repair set."""
+
+    return repair_selection_for_drift(
+        drifts,
+        identity_by_name,
+        max_repair_roles,
+    )["repair_roles"]
 
 
 def write_json_atomic(path: str, payload: dict) -> None:
@@ -476,6 +634,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--retry-seconds", type=int, default=15)
     parser.add_argument("--command-timeout-seconds", type=int, default=30)
     parser.add_argument("--max-concurrent", type=int, default=10)
+    parser.add_argument("--max-repair-roles", type=int, default=20)
     args = parser.parse_args(argv)
     if args.attempts <= 0:
         parser.error("--attempts must be positive")
@@ -485,6 +644,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--command-timeout-seconds must be positive")
     if args.max_concurrent <= 0:
         parser.error("--max-concurrent must be positive")
+    if args.max_repair_roles <= 0:
+        parser.error("--max-repair-roles must be positive")
     return args
 
 
@@ -505,7 +666,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         identity_by_name = {
             identity.cluster_name: identity for identity in identities
         }
-        repair_roles = repair_roles_for_drift(drifts, identity_by_name)
+        repair_selection = repair_selection_for_drift(
+            drifts,
+            identity_by_name,
+            args.max_repair_roles,
+        )
+        repair_roles = repair_selection["repair_roles"]
         healthy = not drifts
         summary = {
             "schema_version": 1,
@@ -516,6 +682,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "rounds": rounds,
             "identities": [asdict(identity) for identity in identities],
             "drift": [asdict(drift) for drift in drifts],
+            "repair_selection": repair_selection,
             "repair_roles": repair_roles,
         }
         write_json_atomic(args.summary_file, summary)
@@ -530,6 +697,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(
                 "Live ClusterMesh drift was detected but no safe repair role "
                 "could be derived.",
+                file=sys.stderr,
+            )
+            return 1
+        if not repair_selection["cover_within_limit"]:
+            print(
+                "Live ClusterMesh drift has no repair cover within "
+                f"{args.max_repair_roles} member(s); refusing Fleet mutation.",
                 file=sys.stderr,
             )
             return 1

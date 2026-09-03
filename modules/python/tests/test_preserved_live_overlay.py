@@ -117,6 +117,177 @@ def test_command_failure_repairs_local_member():
     assert overlay.repair_roles_for_drift([drift], identities) == ["mesh-2"]
 
 
+def test_many_remote_failures_on_one_observer_repair_local_member():
+    identities = {
+        item.cluster_name: item
+        for item in (
+            identity("mesh-1", "mesh-11", 1),
+            identity("mesh-2", "mesh-22", 2),
+            identity("mesh-3", "mesh-33", 3),
+            identity("mesh-4", "mesh-44", 4),
+        )
+    }
+    drift = overlay.ClusterDrift(
+        role="mesh-1",
+        cluster_name="mesh-11",
+        not_ready_remote_names=["mesh-22", "mesh-33", "mesh-44"],
+    )
+
+    selection = overlay.repair_selection_for_drift([drift], identities)
+
+    assert selection["directed_edge_count"] == 3
+    assert selection["repair_roles"] == ["mesh-1"]
+    assert selection["minimum_additional_roles"] == 1
+    assert selection["cover_within_limit"] is True
+
+
+def test_many_observers_of_one_remote_repair_shared_remote_member():
+    identities = {
+        item.cluster_name: item
+        for item in (
+            identity("mesh-1", "mesh-11", 1),
+            identity("mesh-2", "mesh-22", 2),
+            identity("mesh-3", "mesh-33", 3),
+        )
+    }
+    drifts = [
+        overlay.ClusterDrift(
+            role="mesh-1",
+            cluster_name="mesh-11",
+            missing_remote_names=["mesh-33"],
+        ),
+        overlay.ClusterDrift(
+            role="mesh-2",
+            cluster_name="mesh-22",
+            not_ready_remote_names=["mesh-33"],
+        ),
+    ]
+
+    selection = overlay.repair_selection_for_drift(drifts, identities)
+
+    assert selection["directed_edge_count"] == 2
+    assert selection["repair_roles"] == ["mesh-3"]
+    assert selection["minimum_additional_roles"] == 1
+
+
+def test_bounded_search_finds_smaller_cover_than_highest_degree_greedy():
+    identities = {
+        item.cluster_name: item
+        for item in (
+            identity("mesh-1", "mesh-11", 1),
+            identity("mesh-2", "mesh-22", 2),
+            identity("mesh-3", "mesh-33", 3),
+            identity("mesh-4", "mesh-44", 4),
+            identity("mesh-5", "mesh-55", 5),
+        )
+    }
+    drifts = [
+        overlay.ClusterDrift(
+            role="mesh-1",
+            cluster_name="mesh-11",
+            not_ready_remote_names=["mesh-33", "mesh-55"],
+        ),
+        overlay.ClusterDrift(
+            role="mesh-2",
+            cluster_name="mesh-22",
+            not_ready_remote_names=["mesh-33", "mesh-44"],
+        ),
+    ]
+
+    selection = overlay.repair_selection_for_drift(
+        drifts,
+        identities,
+        max_repair_roles=2,
+    )
+
+    assert selection["cover_within_limit"] is True
+    assert selection["minimum_additional_roles"] == 2
+    assert selection["repair_roles"] == ["mesh-1", "mesh-2"]
+
+
+def test_bounded_search_finds_fourteen_role_cover_for_repeated_counterexample():
+    identities = {}
+    drifts = []
+    for group in range(7):
+        base = group * 5
+        group_identities = [
+            identity(
+                f"mesh-{base + offset}",
+                f"cluster-{base + offset}",
+                base + offset,
+            )
+            for offset in range(1, 6)
+        ]
+        identities.update(
+            {item.cluster_name: item for item in group_identities}
+        )
+        drifts.extend(
+            [
+                overlay.ClusterDrift(
+                    role=group_identities[0].role,
+                    cluster_name=group_identities[0].cluster_name,
+                    not_ready_remote_names=[
+                        group_identities[2].cluster_name,
+                        group_identities[4].cluster_name,
+                    ],
+                ),
+                overlay.ClusterDrift(
+                    role=group_identities[1].role,
+                    cluster_name=group_identities[1].cluster_name,
+                    not_ready_remote_names=[
+                        group_identities[2].cluster_name,
+                        group_identities[3].cluster_name,
+                    ],
+                ),
+            ]
+        )
+
+    selection = overlay.repair_selection_for_drift(
+        drifts,
+        identities,
+        max_repair_roles=20,
+    )
+
+    assert selection["cover_within_limit"] is True
+    assert selection["minimum_additional_roles"] == 14
+    assert len(selection["repair_roles"]) == 14
+
+
+def test_bounded_search_reports_when_minimum_cover_exceeds_limit():
+    identities = {}
+    drifts = []
+    for edge in range(21):
+        observer = identity(
+            f"mesh-{edge * 2 + 1}",
+            f"observer-{edge}",
+            edge * 2 + 1,
+        )
+        remote = identity(
+            f"mesh-{edge * 2 + 2}",
+            f"remote-{edge}",
+            edge * 2 + 2,
+        )
+        identities[observer.cluster_name] = observer
+        identities[remote.cluster_name] = remote
+        drifts.append(
+            overlay.ClusterDrift(
+                role=observer.role,
+                cluster_name=observer.cluster_name,
+                not_ready_remote_names=[remote.cluster_name],
+            )
+        )
+
+    selection = overlay.repair_selection_for_drift(
+        drifts,
+        identities,
+        max_repair_roles=20,
+    )
+
+    assert selection["cover_within_limit"] is False
+    assert selection["minimum_additional_roles"] is None
+    assert len(selection["repair_roles"]) == 42
+
+
 def test_remote_readiness_requires_retrieved_configuration():
     assert overlay.remote_is_ready(
         {
