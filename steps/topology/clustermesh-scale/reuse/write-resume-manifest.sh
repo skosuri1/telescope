@@ -4,8 +4,8 @@ set -euo pipefail
 
 target_run_id="${RUN_ID:?RUN_ID is required}"
 region="${CLUSTERMESH_DEBUG_EXPECTED_REGION:-eastus2}"
-expected_count="${CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT:-0}"
-expected_fleet_count="${CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT:-0}"
+expected_count="${CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT:-100}"
+expected_fleet_count="${CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT:--1}"
 expected_subscription_id="${CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}"
 tfvars_path="${CLUSTERMESH_DEBUG_TFVARS_PATH:-}"
 output_path="${CLUSTERMESH_DEBUG_MANIFEST_PATH:?CLUSTERMESH_DEBUG_MANIFEST_PATH is required}"
@@ -14,13 +14,17 @@ inventory_retry_seconds="${CLUSTERMESH_DEBUG_MANIFEST_RETRY_SECONDS:-10}"
 inventory_timeout_seconds="${CLUSTERMESH_DEBUG_MANIFEST_INVENTORY_TIMEOUT_SECONDS:-600}"
 
 mkdir -p "$(dirname "$output_path")"
-for value_name in expected_count expected_fleet_count inventory_attempts inventory_retry_seconds inventory_timeout_seconds; do
+for value_name in expected_count inventory_attempts inventory_retry_seconds inventory_timeout_seconds; do
   value="${!value_name}"
   if ! [[ "$value" =~ ^[0-9]+$ ]]; then
     echo "$value_name must be a non-negative integer." >&2
     exit 1
   fi
 done
+if ! [[ "$expected_fleet_count" =~ ^-1$|^[0-9]+$ ]]; then
+  echo "expected_fleet_count must be -1 or a non-negative integer." >&2
+  exit 1
+fi
 if [ "$inventory_attempts" -eq 0 ] || [ "$inventory_timeout_seconds" -eq 0 ]; then
   echo "inventory_attempts and inventory_timeout_seconds must be positive." >&2
   exit 1
@@ -84,12 +88,6 @@ if [ "$expected_count" -eq 0 ]; then
     "CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT must be positive"
   exit 1
 fi
-if [ -z "$expected_subscription_id" ]; then
-  write_error_manifest "manifest_configuration_invalid" \
-    "CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID is required"
-  exit 1
-fi
-
 account_file=$(mktemp)
 if ! run_json_inventory "$account_file" "Azure account query" \
     az account show --output json --only-show-errors; then
@@ -212,6 +210,7 @@ if ! jq -e \
   inventory_error="AKS inventory is not exactly mesh-1..mesh-${expected_count} in ${region}"
 fi
 if [ -z "$inventory_error" ] &&
+   [ "$expected_fleet_count" -ge 0 ] &&
    ! jq -e --argjson expected "$expected_fleet_count" '
       length == $expected and
       all(.[];

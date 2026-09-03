@@ -233,3 +233,63 @@ def test_probe_cluster_validates_every_cilium_agent(tmp_path, monkeypatch):
         {"pod_name": "cilium-a", "node_name": "node-a"},
         {"pod_name": "cilium-b", "node_name": "node-b"},
     ]
+
+
+def test_capture_loads_exact_expected_cilium_names(tmp_path):
+    clusters = []
+    for number in (1, 2):
+        role = f"mesh-{number}"
+        state = tmp_path / role
+        support = state / "support"
+        support.mkdir(parents=True)
+        metadata = {
+            "run_id": "run-id",
+            "node_count": 2,
+            "cluster_name": f"mesh-{number}{number}",
+            "cluster_id": str(number),
+            "node_manifest": "nodes.yaml",
+            "agent_manifest": "agents.yaml",
+            "agent_controller_manifest": "agent-controller.yaml",
+        }
+        (state / "metadata.json").write_text(
+            json.dumps(metadata),
+            encoding="utf-8",
+        )
+        for name in ("nodes.yaml", "agents.yaml", "agent-controller.yaml"):
+            (state / name).write_text("test\n", encoding="utf-8")
+        for name in (
+            "kwok-controller.yaml",
+            "stage-fast.yaml",
+            "kwok-apf.yaml",
+            "rbac.yaml",
+        ):
+            (support / name).write_text("test\n", encoding="utf-8")
+        clusters.append(
+            capture.Cluster(
+                name=f"clustermesh-{number}",
+                resource_group="run-id",
+                role=role,
+                kubeconfig=f"/tmp/{role}.config",
+            )
+        )
+
+    names = capture.load_expected_cilium_names(
+        clusters,
+        str(tmp_path),
+        "run-id",
+        2,
+    )
+
+    assert names == {"mesh-1": "mesh-11", "mesh-2": "mesh-22"}
+
+    metadata_path = tmp_path / "mesh-2" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["cluster_name"] = "mesh-11"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(capture.CaptureError, match="identity is not exact"):
+        capture.load_expected_cilium_names(
+            clusters,
+            str(tmp_path),
+            "run-id",
+            2,
+        )

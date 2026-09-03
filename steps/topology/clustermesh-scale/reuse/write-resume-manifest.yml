@@ -13,10 +13,10 @@ parameters:
   default: ''
 - name: expected_cluster_count
   type: number
-  default: 0
+  default: 100
 - name: expected_fleet_count
   type: number
-  default: 0
+  default: -1
 
 steps:
 - ${{ if parameters.enabled }}:

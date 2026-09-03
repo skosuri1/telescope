@@ -1107,3 +1107,12 @@ def test_pipeline_and_debug_templates_parse_as_yaml():
     yaml.safe_load(
         (REUSE_DIR / "write-resume-manifest.yml").read_text(encoding="utf-8")
     )
+
+
+def test_resume_manifest_template_preserves_legacy_defaults():
+    template = (
+        REUSE_DIR / "write-resume-manifest.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "- name: expected_cluster_count\n  type: number\n  default: 100" in template
+    assert "- name: expected_fleet_count\n  type: number\n  default: -1" in template

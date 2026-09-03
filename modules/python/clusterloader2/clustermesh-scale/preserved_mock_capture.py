@@ -468,6 +468,50 @@ def validate_aks_inventory(payload: object, clusters: List[Cluster]) -> Dict[str
     return resource_ids
 
 
+def load_expected_cilium_names(
+    clusters: List[Cluster],
+    state_root: str,
+    run_id: str,
+    expected_mock_count: int,
+) -> Dict[str, str]:
+    """Load the exact unique Cilium name advertised by every cluster."""
+
+    names_by_role = {}
+    cluster_names = set()
+    cluster_ids = set()
+    for cluster in clusters:
+        metadata = load_state_metadata(
+            os.path.join(state_root, cluster.role),
+            run_id,
+            expected_mock_count,
+        )
+        cluster_name = metadata.get("cluster_name")
+        raw_cluster_id = metadata.get("cluster_id")
+        try:
+            cluster_id = int(raw_cluster_id)
+        except (TypeError, ValueError) as exc:
+            raise CaptureError(
+                f"{cluster.role}: invalid persisted Cilium cluster ID "
+                f"{raw_cluster_id!r}"
+            ) from exc
+        if (
+            not isinstance(cluster_name, str)
+            or not cluster_name
+            or cluster_id <= 0
+            or cluster_name in cluster_names
+            or cluster_id in cluster_ids
+        ):
+            raise CaptureError(
+                f"{cluster.role}: persisted Cilium identity is not exact"
+            )
+        names_by_role[cluster.role] = cluster_name
+        cluster_names.add(cluster_name)
+        cluster_ids.add(cluster_id)
+    if len(names_by_role) != len(clusters):
+        raise CaptureError("persisted Cilium identity inventory is incomplete")
+    return names_by_role
+
+
 def write_json_atomic(path: str, payload: dict) -> None:
     """Write a JSON file atomically."""
 
@@ -534,6 +578,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "AKS resource inventory",
         )
         resource_ids = validate_aks_inventory(aks, clusters)
+        expected_cilium_names = load_expected_cilium_names(
+            clusters,
+            args.state_root,
+            args.run_id,
+            args.expected_mock_count,
+        )
 
         def capture_one(cluster: Cluster) -> dict:
             result = probe_cluster(
@@ -544,6 +594,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 expected_mock_count=args.expected_mock_count,
                 command_timeout_seconds=args.command_timeout_seconds,
                 runner=run_command,
+                expected_remote_names={
+                    name
+                    for role, name in expected_cilium_names.items()
+                    if role != cluster.role
+                },
             )
             result["resource_id"] = resource_ids[cluster.role]
             print(
