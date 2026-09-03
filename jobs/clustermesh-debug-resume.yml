@@ -445,3 +445,6 @@ jobs:
       enabled: true
       region: ${{ parameters.region }}
       tfvars_path: ${{ parameters.tfvars_path }}
+      expected_subscription_id: ${{ parameters.expected_subscription_id }}
+      expected_cluster_count: ${{ parameters.expected_cluster_count }}
+      expected_fleet_count: 1

@@ -75,6 +75,15 @@ parameters:
 - name: resume_manifest_tfvars_path
   type: string
   default: ''
+- name: resume_manifest_expected_subscription_id
+  type: string
+  default: ''
+- name: resume_manifest_expected_cluster_count
+  type: number
+  default: 0
+- name: resume_manifest_expected_fleet_count
+  type: number
+  default: 0
 - name: debug_preserve
   type: string
   default: "false"
@@ -157,6 +166,9 @@ jobs:
       enabled: ${{ parameters.emit_resume_manifest }}
       region: ${{ parameters.resume_manifest_region }}
       tfvars_path: ${{ parameters.resume_manifest_tfvars_path }}
+      expected_subscription_id: ${{ parameters.resume_manifest_expected_subscription_id }}
+      expected_cluster_count: ${{ parameters.resume_manifest_expected_cluster_count }}
+      expected_fleet_count: ${{ parameters.resume_manifest_expected_fleet_count }}
   - template: /steps/cleanup-resources.yml
     parameters:
       cloud: ${{ parameters.cloud }}

@@ -2822,6 +2822,9 @@ stages:
           emit_resume_manifest: true
           resume_manifest_region: ${{ parameters.scaleDebugRegion }}
           resume_manifest_tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
+          resume_manifest_expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
+          resume_manifest_expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
+          resume_manifest_expected_fleet_count: 1
           debug_preserve: "true"
 
   - stage: azure_eastus2euap_n100_debug_reset_fleet_37deca
@@ -2870,6 +2873,9 @@ stages:
               enabled: true
               region: ${{ parameters.scaleDebugRegion }}
               tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
+              expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
+              expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
+              expected_fleet_count: 0
 
   - stage: azure_eastus2euap_n100_debug_resume_37deca
     dependsOn: []

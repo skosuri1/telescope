@@ -40,6 +40,14 @@ def ready_remote(name):
     }
 
 
+def agent_status(remotes, pod_name="cilium-a", node_name="node-a"):
+    return overlay.CiliumAgentStatus(
+        pod_name=pod_name,
+        node_name=node_name,
+        remotes=remotes,
+    )
+
+
 def test_missing_concat_named_remote_repairs_target_member():
     identities = {
         item.cluster_name: item
@@ -51,7 +59,7 @@ def test_missing_concat_named_remote_repairs_target_member():
     }
     drift = overlay.analyze_status(
         identities["mesh-2121"],
-        [ready_remote("mesh-100100")],
+        [agent_status([ready_remote("mesh-100100")])],
         identities,
     )
 
@@ -70,12 +78,16 @@ def test_remote_with_missing_configuration_repairs_target_member():
     drift = overlay.analyze_status(
         identities["mesh-2121"],
         [
-            {
-                "name": "mesh-9191",
-                "ready": False,
-                "connected": True,
-                "config": {"required": True, "retrieved": False},
-            }
+            agent_status(
+                [
+                    {
+                        "name": "mesh-9191",
+                        "ready": False,
+                        "connected": True,
+                        "config": {"required": True, "retrieved": False},
+                    }
+                ]
+            )
         ],
         identities,
     )
@@ -94,7 +106,15 @@ def test_unknown_or_duplicate_projection_repairs_local_member():
     }
     drift = overlay.analyze_status(
         identities["mesh-11"],
-        [ready_remote("mesh-22"), ready_remote("stale-peer"), ready_remote("stale-peer")],
+        [
+            agent_status(
+                [
+                    ready_remote("mesh-22"),
+                    ready_remote("stale-peer"),
+                    ready_remote("stale-peer"),
+                ]
+            )
+        ],
         identities,
     )
 
@@ -115,6 +135,98 @@ def test_command_failure_repairs_local_member():
     )
 
     assert overlay.repair_roles_for_drift([drift], identities) == ["mesh-2"]
+
+
+def test_analyze_status_unions_drift_from_every_cilium_agent():
+    identities = {
+        item.cluster_name: item
+        for item in (
+            identity("mesh-1", "mesh-11", 1),
+            identity("mesh-2", "mesh-22", 2),
+            identity("mesh-3", "mesh-33", 3),
+        )
+    }
+    drift = overlay.analyze_status(
+        identities["mesh-11"],
+        [
+            agent_status(
+                [ready_remote("mesh-22"), ready_remote("mesh-33")],
+                pod_name="cilium-a",
+                node_name="node-a",
+            ),
+            agent_status(
+                [
+                    ready_remote("mesh-22"),
+                    {
+                        "name": "mesh-33",
+                        "ready": False,
+                        "connected": True,
+                        "config": {"required": True, "retrieved": True},
+                    },
+                ],
+                pod_name="cilium-b",
+                node_name="node-b",
+            ),
+        ],
+        identities,
+    )
+
+    assert drift.not_ready_remote_names == ["mesh-33"]
+    assert [row["pod_name"] for row in drift.agent_drift] == ["cilium-b"]
+
+
+def test_read_status_probes_every_named_ready_cilium_pod():
+    cluster = overlay.Cluster(
+        name="clustermesh-1",
+        resource_group="rg",
+        role="mesh-1",
+        kubeconfig="/tmp/mesh-1.config",
+    )
+    calls = []
+
+    def runner(args, _timeout):
+        calls.append(list(args))
+        if "get" in args and "pods" in args:
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": "cilium-a"},
+                            "spec": {"nodeName": "node-a"},
+                            "status": {
+                                "phase": "Running",
+                                "containerStatuses": [
+                                    {"name": "cilium-agent", "ready": True}
+                                ],
+                            },
+                        },
+                        {
+                            "metadata": {"name": "cilium-b"},
+                            "spec": {"nodeName": "node-b"},
+                            "status": {
+                                "phase": "Running",
+                                "containerStatuses": [
+                                    {"name": "cilium-agent", "ready": True}
+                                ],
+                            },
+                        },
+                    ]
+                }
+            )
+        if "exec" in args:
+            return json.dumps(
+                {"cluster-mesh": {"clusters": [ready_remote("mesh-22")]}}
+            )
+        raise AssertionError(args)
+
+    statuses = overlay.read_status(cluster, runner, 30)
+
+    assert [status.pod_name for status in statuses] == ["cilium-a", "cilium-b"]
+    exec_calls = [call for call in calls if "exec" in call]
+    assert [call[call.index("exec") + 1] for call in exec_calls] == [
+        "cilium-a",
+        "cilium-b",
+    ]
 
 
 def test_many_remote_failures_on_one_observer_repair_local_member():

@@ -127,3 +127,109 @@ def test_state_metadata_requires_matching_run_and_manifests(tmp_path):
     assert capture.load_state_metadata(str(state), "run-id", 2) == metadata
     with pytest.raises(capture.CaptureError, match="run_id mismatch"):
         capture.load_state_metadata(str(state), "other-run", 2)
+
+
+def test_probe_cluster_validates_every_cilium_agent(tmp_path, monkeypatch):
+    state = tmp_path / "mesh-1"
+    support = state / "support"
+    support.mkdir(parents=True)
+    metadata = {
+        "run_id": "run-id",
+        "node_count": 2,
+        "cluster_name": "mesh-11",
+        "cluster_id": "1",
+        "node_manifest": "nodes.yaml",
+        "agent_manifest": "agents.yaml",
+        "agent_controller_manifest": "agent-controller.yaml",
+    }
+    (state / "metadata.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+    for name in ("nodes.yaml", "agents.yaml", "agent-controller.yaml"):
+        (state / name).write_text("test\n", encoding="utf-8")
+    for name in (
+        "kwok-controller.yaml",
+        "stage-fast.yaml",
+        "kwok-apf.yaml",
+        "rbac.yaml",
+    ):
+        (support / name).write_text("test\n", encoding="utf-8")
+
+    node_payload = {
+        "items": [
+            {"metadata": {"name": f"kwok-node-{index}", "uid": f"n-{index}"}}
+            for index in range(2)
+        ]
+    }
+    pod_payload = {
+        "items": [
+            {
+                "metadata": {
+                    "name": f"kwok-node-{index}",
+                    "uid": f"p-{index}",
+                },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{"ready": True}],
+                },
+            }
+            for index in range(2)
+        ]
+    }
+    statefulset = {"status": {"readyReplicas": 2}}
+
+    def runner(args, _timeout):
+        if "get" in args and "nodes" in args:
+            return json.dumps(node_payload)
+        if "get" in args and "pods" in args:
+            return json.dumps(pod_payload)
+        if "statefulset" in args:
+            return json.dumps(statefulset)
+        raise AssertionError(args)
+
+    remotes = [
+        {
+            "name": "mesh-22",
+            "ready": True,
+            "connected": True,
+            "config": {"required": True, "retrieved": True},
+        }
+    ]
+    monkeypatch.setattr(
+        capture.live_overlay,
+        "read_status",
+        lambda *_args, **_kwargs: [
+            capture.live_overlay.CiliumAgentStatus(
+                pod_name="cilium-a",
+                node_name="node-a",
+                remotes=remotes,
+            ),
+            capture.live_overlay.CiliumAgentStatus(
+                pod_name="cilium-b",
+                node_name="node-b",
+                remotes=remotes,
+            ),
+        ],
+    )
+
+    result = capture.probe_cluster(
+        capture.Cluster(
+            name="clustermesh-1",
+            resource_group="run-id",
+            role="mesh-1",
+            kubeconfig="/tmp/mesh-1.config",
+        ),
+        state_root=str(tmp_path),
+        run_id="run-id",
+        expected_cluster_count=2,
+        expected_mock_count=2,
+        command_timeout_seconds=30,
+        runner=runner,
+        expected_remote_names={"mesh-22"},
+    )
+
+    assert result["cilium_agents"] == [
+        {"pod_name": "cilium-a", "node_name": "node-a"},
+        {"pod_name": "cilium-b", "node_name": "node-b"},
+    ]

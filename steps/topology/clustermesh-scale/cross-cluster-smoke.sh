@@ -26,15 +26,48 @@ kc_second="$HOME/.kube/$second_role.config"
 namespace="cm-smoke"
 server_manifest="/tmp/cm-smoke-server.yaml"
 client_manifest="/tmp/cm-smoke-client.yaml"
+cleanup_timeout_seconds="${CLUSTERMESH_CROSS_CLUSTER_CLEANUP_TIMEOUT_SECONDS:-180}"
+if ! [[ "$cleanup_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CLUSTERMESH_CROSS_CLUSTER_CLEANUP_TIMEOUT_SECONDS must be positive." >&2
+  exit 1
+fi
 
-cleanup() {
-  KUBECONFIG="$kc_first" kubectl delete ns "$namespace" \
-    --ignore-not-found --wait=true --timeout=60s || true
-  KUBECONFIG="$kc_second" kubectl delete ns "$namespace" \
-    --ignore-not-found --wait=true --timeout=60s || true
-  rm -f "$server_manifest" "$client_manifest"
+wait_namespace_absent() {
+  local kubeconfig="$1"
+  local role="$2"
+  local deadline output rc
+  deadline=$(( $(date +%s) + cleanup_timeout_seconds ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    rc=0
+    output=$(KUBECONFIG="$kubeconfig" kubectl get namespace "$namespace" \
+      -o name --request-timeout=30s 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] &&
+       grep -qiE '(NotFound|not found)' <<<"$output"; then
+      return 0
+    fi
+    if [ "$rc" -eq 0 ] && [ -z "$output" ]; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "##vso[task.logissue type=error;] $role: namespace $namespace cleanup did not converge within ${cleanup_timeout_seconds}s" >&2
+  return 1
 }
-trap cleanup EXIT
+
+cleanup_namespaces() {
+  local failed=0
+  KUBECONFIG="$kc_first" kubectl delete ns "$namespace" \
+    --ignore-not-found --wait=false --request-timeout=30s ||
+    echo "Initial namespace deletion request failed on $first_role; verifying absence."
+  KUBECONFIG="$kc_second" kubectl delete ns "$namespace" \
+    --ignore-not-found --wait=false --request-timeout=30s ||
+    echo "Initial namespace deletion request failed on $second_role; verifying absence."
+  wait_namespace_absent "$kc_first" "$first_role" || failed=1
+  wait_namespace_absent "$kc_second" "$second_role" || failed=1
+  rm -f "$server_manifest" "$client_manifest"
+  return "$failed"
+}
+trap 'cleanup_namespaces || true' EXIT
 
 cat <<'EOF' > "$server_manifest"
 apiVersion: v1
@@ -140,5 +173,11 @@ done
 
 if [ "$ok" -ne 1 ]; then
   echo "##vso[task.logissue type=error;] Cross-cluster data-path smoke failed: $second_role could not reach service in $first_role"
+  exit 1
+fi
+
+trap - EXIT
+if ! cleanup_namespaces; then
+  echo "##vso[task.logissue type=error;] Cross-cluster data-path smoke succeeded but cleanup failed."
   exit 1
 fi

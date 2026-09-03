@@ -8,6 +8,15 @@ parameters:
 - name: tfvars_path
   type: string
   default: ''
+- name: expected_subscription_id
+  type: string
+  default: ''
+- name: expected_cluster_count
+  type: number
+  default: 0
+- name: expected_fleet_count
+  type: number
+  default: 0
 
 steps:
 - ${{ if parameters.enabled }}:
@@ -20,7 +29,9 @@ steps:
       BUILD_BUILDID: $(Build.BuildId)
       BUILD_SOURCEVERSION: $(Build.SourceVersion)
       CLUSTERMESH_DEBUG_EXPECTED_REGION: ${{ parameters.region }}
-      CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: "100"
+      CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID: ${{ parameters.expected_subscription_id }}
+      CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT: "${{ parameters.expected_fleet_count }}"
       CLUSTERMESH_DEBUG_TFVARS_PATH: $(Pipeline.Workspace)/s/${{ parameters.tfvars_path }}
       CLUSTERMESH_DEBUG_MANIFEST_PATH: $(Build.ArtifactStagingDirectory)/n100-resume/manifest.json
 

@@ -133,7 +133,11 @@ def test_node_readiness_has_final_recovery_grace_before_failure():
     assert "CLUSTERMESH_NODE_READY_TIMEOUT_SECONDS:-900" in validate
     assert "CLUSTERMESH_NODE_READY_GRACE_SECONDS:-300" in validate
     assert "node_readiness_snapshot()" in validate
-    assert 'kubectl --request-timeout=25s get nodes -o json' in validate
+    snapshot_command = (
+        'kubectl --request-timeout=25s get nodes '
+        '"${node_selector_args[@]}" -o json'
+    )
+    assert snapshot_command in validate
     assert "node_ready_initial_deadline" in validate
     assert "node_ready_final_deadline" in validate
     grace = validate.index("initial node readiness budget exhausted")
@@ -154,10 +158,10 @@ def test_node_readiness_has_final_recovery_grace_before_failure():
     assert "set +x" in snapshot_capture
     assert "set -x" in snapshot_capture
     assert snapshot_capture.index("set +x") < snapshot_capture.index(
-        "kubectl --request-timeout=25s get nodes -o json"
+        snapshot_command
     )
     assert snapshot_capture.index(
-        "kubectl --request-timeout=25s get nodes -o json"
+        snapshot_command
     ) < snapshot_capture.index('[[ "$xtrace_state" != *x* ]] || set -x')
 
 
@@ -166,10 +170,13 @@ def test_cilium_status_exec_has_wall_clock_and_command_timeouts():
 
     assert "CLUSTERMESH_PEER_CONVERGENCE_TIMEOUT_SECONDS:-1800" in validate
     assert "CLUSTERMESH_STATUS_COMMAND_TIMEOUT_SECONDS:-45" in validate
-    assert 'while [ "$(date +%s)" -lt "$mesh_status_deadline" ]' in validate
     assert "timeout --signal=TERM --kill-after=10s" in validate
-    assert 'kubectl --request-timeout="${mesh_status_command_timeout}s"' in validate
-    assert "cilium-dbg status timed out" in validate
+    assert 'python3 "$CILIUM_AGENT_HEALTH_PROBE"' in validate
+    assert "--identity-inventory \"$cilium_identity_inventory\"" in validate
+    assert '--attempts "${CLUSTERMESH_ALL_AGENT_STATUS_ATTEMPTS:-40}"' in validate
+    assert '--retry-seconds "$mesh_status_poll_seconds"' in validate
+    assert '--command-timeout-seconds "$mesh_status_command_timeout_seconds"' in validate
+    assert "all-agent Cilium status timed out" in validate
     assert "for i in $(seq 1 120)" not in validate
 
 

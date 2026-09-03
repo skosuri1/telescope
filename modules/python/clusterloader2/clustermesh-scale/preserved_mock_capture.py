@@ -16,6 +16,13 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Sequence
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+import preserved_live_overlay as live_overlay  # pylint: disable=wrong-import-position
+
+
 class CaptureError(Exception):
     """Expected fail-closed capture error."""
 
@@ -399,35 +406,35 @@ def probe_cluster(
             f"{cluster.role}: StatefulSet readyReplicas={ready_replicas}, "
             f"expected {expected_mock_count}"
         )
-    cilium = parse_json(
-        runner(
-            base
-            + [
-                "-n",
-                "kube-system",
-                "exec",
-                "daemonset/cilium",
-                "--",
-                "cilium-dbg",
-                "status",
-                "-o",
-                "json",
-            ],
+    try:
+        cilium_agents = live_overlay.read_status(
+            live_overlay.Cluster(
+                name=cluster.name,
+                resource_group=cluster.resource_group,
+                role=cluster.role,
+                kubeconfig=cluster.kubeconfig,
+            ),
+            runner,
             command_timeout_seconds,
-        ),
-        f"{cluster.role} Cilium status",
-    )
-    validate_cilium_status(
-        cilium,
-        expected_cluster_count - 1,
-        expected_remote_names,
-    )
+        )
+    except live_overlay.ProbeError as exc:
+        raise CaptureError(str(exc)) from exc
+    for agent in cilium_agents:
+        validate_cilium_status(
+            {"cluster-mesh": {"clusters": agent.remotes}},
+            expected_cluster_count - 1,
+            expected_remote_names,
+        )
     return {
         "name": cluster.name,
         "resource_group": cluster.resource_group,
         "role": cluster.role,
         "cluster_name": metadata.get("cluster_name"),
         "cluster_id": metadata.get("cluster_id"),
+        "cilium_agents": [
+            {"pod_name": agent.pod_name, "node_name": agent.node_name}
+            for agent in cilium_agents
+        ],
         "node_uids": nodes,
         "agent_uids": agents,
         "desired_state_sha256": file_digests(state_dir),

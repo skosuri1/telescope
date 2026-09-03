@@ -2329,6 +2329,7 @@ steps:
       CL2_OPERATION_TIMEOUT: ${{ parameters.engine_input.operation_timeout }}
       NODE_CHURNER_SCRIPT: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/config/node-churner.sh
       HEALTH_GATE_SCRIPT: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/config/scenario-health-gate.sh
+      CILIUM_AGENT_HEALTH_PROBE: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/cilium_agent_health.py
       SCENARIO_ARTIFACT_PRESERVER: $(Pipeline.Workspace)/s/scenarios/perf-eval/clustermesh-scale/telemetry/preserve-scenario-artifacts.sh
       SNAPSHOT_RELABEL_SCRIPT: $(Pipeline.Workspace)/s/scenarios/perf-eval/clustermesh-scale/telemetry/relabel-prometheus-snapshots.sh
       CILIUM_POLICY_GUARD_SCRIPT: $(Pipeline.Workspace)/s/scenarios/perf-eval/clustermesh-scale/telemetry/ensure-cilium-policy.sh

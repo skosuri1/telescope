@@ -1,5 +1,7 @@
 """Static and guard checks for the reusable n=100 debug lifecycle."""
 
+# pylint: disable=too-many-lines
+
 import json
 import os
 import subprocess
@@ -229,6 +231,7 @@ def _write_validation_fixture(tmp_path, *, include_second_node_group):
             "CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID": "test-subscription",
             "CLUSTERMESH_DEBUG_EXPECTED_REGION": "eastus2euap",
             "CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT": "2",
+            "CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT": "1",
             "CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256": "test-sha",
             "CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS": "24",
             "CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET": "false",
@@ -236,6 +239,78 @@ def _write_validation_fixture(tmp_path, *, include_second_node_group):
         }
     )
     return env, az_log, tmp_path / "manifest.json"
+
+
+def _write_resume_manifest_fixture(
+    tmp_path,
+    *,
+    fail_aks_inventory=False,
+    extra_aks=False,
+    no_fleet=False,
+):
+    fake_bin = tmp_path / "manifest-bin"
+    fake_bin.mkdir()
+    output_path = tmp_path / "resume-manifest.json"
+    fake_az = fake_bin / "az"
+    fake_az.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[:2] == ['account', 'show']:\n"
+        "    print(json.dumps({'id': 'test-subscription'}))\n"
+        "elif args[:2] == ['group', 'exists']:\n"
+        "    print('true')\n"
+        "elif args[:2] == ['group', 'show']:\n"
+        "    print(json.dumps({'tags': {'deletion_due_time': '2099-01-01T00:00:00Z'}}))\n"
+        "elif args[:2] == ['aks', 'list']:\n"
+        "    if 'FAIL_AKS' in __import__('os').environ:\n"
+        "        print('transient AKS inventory failure', file=sys.stderr)\n"
+        "        raise SystemExit(1)\n"
+        "    clusters = [\n"
+        "        {'id': '/subscriptions/test/resourceGroups/run/providers/Microsoft.ContainerService/managedClusters/clustermesh-1', 'name': 'clustermesh-1', 'runId': 'run', 'role': 'mesh-1', 'location': 'eastus2euap', 'provisioningState': 'Succeeded', 'powerState': 'Running', 'nodeResourceGroup': 'MC_run_1'},\n"
+        "        {'id': '/subscriptions/test/resourceGroups/run/providers/Microsoft.ContainerService/managedClusters/clustermesh-2', 'name': 'clustermesh-2', 'runId': 'run', 'role': 'mesh-2', 'location': 'eastus2euap', 'provisioningState': 'Succeeded', 'powerState': 'Running', 'nodeResourceGroup': 'MC_run_2'},\n"
+        "    ]\n"
+        "    if 'EXTRA_AKS' in __import__('os').environ:\n"
+        "        clusters.append({'id': '/subscriptions/test/resourceGroups/run/providers/Microsoft.ContainerService/managedClusters/untracked', 'name': 'untracked', 'runId': None, 'role': None, 'location': 'eastus2euap', 'provisioningState': 'Succeeded', 'powerState': 'Running', 'nodeResourceGroup': 'MC_run_extra'})\n"
+        "    print(json.dumps(clusters))\n"
+        "elif args[:2] == ['resource', 'list']:\n"
+        "    if 'NO_FLEET' in __import__('os').environ:\n"
+        "        print('[]')\n"
+        "    else:\n"
+        "        print(json.dumps([{'name': 'clustermesh-flt', 'provisioningState': 'Succeeded'}]))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected az command: {args}')\n",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "RUN_ID": "run",
+            "BUILD_BUILDID": "999",
+            "BUILD_SOURCEVERSION": "test-source",
+            "CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID": "test-subscription",
+            "CLUSTERMESH_DEBUG_EXPECTED_REGION": "eastus2euap",
+            "CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT": "2",
+            "CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT": "1",
+            "CLUSTERMESH_DEBUG_MANIFEST_INVENTORY_ATTEMPTS": "2",
+            "CLUSTERMESH_DEBUG_MANIFEST_RETRY_SECONDS": "0",
+            "CLUSTERMESH_DEBUG_MANIFEST_INVENTORY_TIMEOUT_SECONDS": "10",
+            "CLUSTERMESH_DEBUG_MANIFEST_PATH": str(output_path),
+            "CLUSTERMESH_DEBUG_TFVARS_PATH": str(tmp_path / "test.tfvars"),
+        }
+    )
+    (tmp_path / "test.tfvars").write_text("test\n", encoding="utf-8")
+    if fail_aks_inventory:
+        env["FAIL_AKS"] = "1"
+    if extra_aks:
+        env["EXTRA_AKS"] = "1"
+    if no_fleet:
+        env["NO_FLEET"] = "1"
+        env["CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT"] = "0"
+    return env, output_path
 
 
 def _stage_block(name: str, next_name: str) -> str:
@@ -295,6 +370,9 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "NETWORK_DATAPLANE: cilium" in fresh
     assert "NETWORK_POLICY: cilium" in fresh
     assert "emit_resume_manifest: true" in fresh
+    assert "resume_manifest_expected_subscription_id" in fresh
+    assert "resume_manifest_expected_cluster_count" in fresh
+    assert "resume_manifest_expected_fleet_count" in fresh
     assert 'debug_preserve: "true"' in fresh
     assert "eq(variables['Build.Reason'], 'Manual')" in fresh
     assert "eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'], '')" in fresh
@@ -558,6 +636,95 @@ def test_preserved_rg_validation_is_fail_closed():
         assert expected in validation
 
     assert "az group update" not in manifest
+    assert "cluster_inventory_failed" in manifest
+    assert "inventory_invalid" in manifest
+    assert "AKS inventory is not exactly mesh-1..mesh-${expected_count}" in manifest
+    assert "CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT" in manifest
+
+
+def test_resume_manifest_requires_exact_live_inventory(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(tmp_path)
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "ready"
+    assert manifest["subscription_id"] == "test-subscription"
+    assert manifest["cluster_count"] == 2
+    assert [row["role"] for row in manifest["clusters"]] == [
+        "mesh-1",
+        "mesh-2",
+    ]
+    assert len(manifest["fleet"]) == 1
+
+
+def test_resume_manifest_does_not_silently_publish_empty_inventory(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        fail_aks_inventory=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "cluster_inventory_failed"
+    assert "AKS inventory failed after 2 attempt" in manifest["fatal_error"]
+    assert "clusters" not in manifest
+
+
+def test_resume_manifest_rejects_extra_untagged_aks_cluster(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        extra_aks=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "inventory_invalid"
+    assert manifest["cluster_count"] == 3
+    assert "not exactly mesh-1..mesh-2" in manifest["fatal_error"]
+
+
+def test_resume_manifest_allows_explicit_post_reset_fleet_absence(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        no_fleet=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "ready"
+    assert manifest["fleet"] == []
 
 
 def test_preserved_validation_rejects_missing_node_resource_group(tmp_path):
@@ -641,8 +808,13 @@ def test_preserved_resume_recovery_runs_before_authoritative_validation():
     )
     assert "ensure_kubeconfig" in validation
     assert "cross-cluster-smoke.sh" in validation
+    assert 'then .' in validation
+    assert 'mv "$cilium_identity_inventory_tmp" "$cilium_identity_inventory"' in validation
     assert "service.cilium.io/global" in cross_cluster_smoke
     assert "Cross-cluster curl succeeded" in cross_cluster_smoke
+    assert "wait_namespace_absent" in cross_cluster_smoke
+    assert "trap - EXIT" in cross_cluster_smoke
+    assert "smoke succeeded but cleanup failed" in cross_cluster_smoke
 
 
 def test_n100_kwok_verifier_is_bounded_and_does_not_run_workloads():

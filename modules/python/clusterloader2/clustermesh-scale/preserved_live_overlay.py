@@ -51,6 +51,15 @@ class ClusterIdentity:
     cluster_id: int
 
 
+@dataclass(frozen=True)
+class CiliumAgentStatus:
+    """One Cilium agent's local view of every remote cluster."""
+
+    pod_name: str
+    node_name: str
+    remotes: List[dict]
+
+
 @dataclass
 class ClusterDrift:
     """Live drift observed from one local cluster."""
@@ -61,6 +70,7 @@ class ClusterDrift:
     not_ready_remote_names: List[str] = field(default_factory=list)
     unexpected_remote_names: List[str] = field(default_factory=list)
     duplicate_remote_names: List[str] = field(default_factory=list)
+    agent_drift: List[dict] = field(default_factory=list)
     command_error: Optional[str] = None
 
     @property
@@ -248,10 +258,10 @@ def read_status(
     cluster: Cluster,
     runner: Runner,
     command_timeout_seconds: int,
-) -> List[dict]:
-    """Read the live Cilium remote-cluster status list."""
+) -> List[CiliumAgentStatus]:
+    """Read every local Cilium agent's remote-cluster status list."""
 
-    output = runner(
+    pod_output = runner(
         [
             "kubectl",
             "--kubeconfig",
@@ -259,29 +269,107 @@ def read_status(
             f"--request-timeout={command_timeout_seconds}s",
             "-n",
             "kube-system",
-            "exec",
-            "daemonset/cilium",
-            "--",
-            "cilium-dbg",
-            "status",
+            "get",
+            "pods",
+            "-l",
+            "k8s-app=cilium",
             "-o",
             "json",
         ],
         command_timeout_seconds,
     )
     try:
-        payload = json.loads(output)
+        pod_payload = json.loads(pod_output)
     except json.JSONDecodeError as exc:
-        raise ProbeError(f"{cluster.role}: invalid cilium status JSON: {exc}") from exc
-    mesh = payload.get("cluster-mesh")
-    if not isinstance(mesh, dict):
-        raise ProbeError(f"{cluster.role}: cilium status has no cluster-mesh object")
-    remotes = mesh.get("clusters")
-    if not isinstance(remotes, list):
-        raise ProbeError(f"{cluster.role}: cluster-mesh.clusters is not an array")
-    if any(not isinstance(remote, dict) for remote in remotes):
-        raise ProbeError(f"{cluster.role}: malformed remote cluster status entry")
-    return remotes
+        raise ProbeError(f"{cluster.role}: invalid Cilium Pod JSON: {exc}") from exc
+    pod_items = pod_payload.get("items") if isinstance(pod_payload, dict) else None
+    if not isinstance(pod_items, list) or not pod_items:
+        raise ProbeError(f"{cluster.role}: no Cilium agent Pods found")
+
+    agents = []
+    for item in pod_items:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        spec = item.get("spec") if isinstance(item, dict) else None
+        status = item.get("status") if isinstance(item, dict) else None
+        pod_name = metadata.get("name") if isinstance(metadata, dict) else None
+        node_name = spec.get("nodeName") if isinstance(spec, dict) else None
+        containers = (
+            status.get("containerStatuses") if isinstance(status, dict) else None
+        )
+        cilium_status = next(
+            (
+                container
+                for container in containers or []
+                if isinstance(container, dict)
+                and container.get("name") == "cilium-agent"
+            ),
+            None,
+        )
+        pod_ready = (
+            isinstance(status, dict)
+            and status.get("phase") == "Running"
+            and isinstance(cilium_status, dict)
+            and cilium_status.get("ready") is True
+        )
+        if (
+            not isinstance(pod_name, str)
+            or not pod_name
+            or not isinstance(node_name, str)
+            or not node_name
+            or not pod_ready
+        ):
+            raise ProbeError(
+                f"{cluster.role}: Cilium agent Pod is not Running/Ready: "
+                f"{pod_name or 'unknown'}"
+            )
+        output = runner(
+            [
+                "kubectl",
+                "--kubeconfig",
+                cluster.kubeconfig,
+                f"--request-timeout={command_timeout_seconds}s",
+                "-n",
+                "kube-system",
+                "exec",
+                pod_name,
+                "-c",
+                "cilium-agent",
+                "--",
+                "cilium-dbg",
+                "status",
+                "-o",
+                "json",
+            ],
+            command_timeout_seconds,
+        )
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise ProbeError(
+                f"{cluster.role}/{pod_name}: invalid cilium status JSON: {exc}"
+            ) from exc
+        mesh = payload.get("cluster-mesh")
+        if not isinstance(mesh, dict):
+            raise ProbeError(
+                f"{cluster.role}/{pod_name}: cilium status has no cluster-mesh object"
+            )
+        remotes = mesh.get("clusters")
+        if not isinstance(remotes, list):
+            raise ProbeError(
+                f"{cluster.role}/{pod_name}: cluster-mesh.clusters is not an array"
+            )
+        if any(not isinstance(remote, dict) for remote in remotes):
+            raise ProbeError(
+                f"{cluster.role}/{pod_name}: malformed remote cluster status entry"
+            )
+        agents.append(
+            CiliumAgentStatus(
+                pod_name=pod_name,
+                node_name=node_name,
+                remotes=remotes,
+            )
+        )
+    return sorted(agents, key=lambda agent: (agent.node_name, agent.pod_name))
 
 
 def remote_is_ready(remote: dict) -> bool:
@@ -300,37 +388,67 @@ def remote_is_ready(remote: dict) -> bool:
 
 def analyze_status(
     identity: ClusterIdentity,
-    remotes: List[dict],
+    agent_statuses: List[CiliumAgentStatus],
     identity_by_name: Dict[str, ClusterIdentity],
 ) -> ClusterDrift:
-    """Compare one local Cilium view with the complete expected peer set."""
+    """Compare every local Cilium agent with the expected peer set."""
 
     expected_names = set(identity_by_name) - {identity.cluster_name}
-    actual_names: List[str] = []
+    missing_names: Set[str] = set()
     not_ready_names: Set[str] = set()
-    for remote in remotes:
-        name = remote.get("name")
-        if not isinstance(name, str) or not name:
-            return ClusterDrift(
-                role=identity.role,
-                cluster_name=identity.cluster_name,
-                command_error="remote cluster entry is missing name",
+    unexpected_names: Set[str] = set()
+    duplicate_names: Set[str] = set()
+    agent_drift = []
+    for agent in agent_statuses:
+        actual_names: List[str] = []
+        agent_not_ready: Set[str] = set()
+        for remote in agent.remotes:
+            name = remote.get("name")
+            if not isinstance(name, str) or not name:
+                return ClusterDrift(
+                    role=identity.role,
+                    cluster_name=identity.cluster_name,
+                    command_error=(
+                        f"{agent.pod_name}: remote cluster entry is missing name"
+                    ),
+                )
+            actual_names.append(name)
+            if not remote_is_ready(remote):
+                agent_not_ready.add(name)
+        actual_name_set = set(actual_names)
+        agent_missing = expected_names - actual_name_set
+        agent_unexpected = actual_name_set - expected_names
+        agent_duplicates = {
+            name for name in actual_names if actual_names.count(name) > 1
+        }
+        missing_names.update(agent_missing)
+        not_ready_names.update(agent_not_ready)
+        unexpected_names.update(agent_unexpected)
+        duplicate_names.update(agent_duplicates)
+        if (
+            agent_missing
+            or agent_not_ready
+            or agent_unexpected
+            or agent_duplicates
+        ):
+            agent_drift.append(
+                {
+                    "pod_name": agent.pod_name,
+                    "node_name": agent.node_name,
+                    "missing_remote_names": sorted(agent_missing),
+                    "not_ready_remote_names": sorted(agent_not_ready),
+                    "unexpected_remote_names": sorted(agent_unexpected),
+                    "duplicate_remote_names": sorted(agent_duplicates),
+                }
             )
-        actual_names.append(name)
-        if not remote_is_ready(remote):
-            not_ready_names.add(name)
-
-    duplicate_names = sorted(
-        {name for name in actual_names if actual_names.count(name) > 1}
-    )
-    actual_name_set = set(actual_names)
     return ClusterDrift(
         role=identity.role,
         cluster_name=identity.cluster_name,
-        missing_remote_names=sorted(expected_names - actual_name_set),
+        missing_remote_names=sorted(missing_names),
         not_ready_remote_names=sorted(not_ready_names),
-        unexpected_remote_names=sorted(actual_name_set - expected_names),
-        duplicate_remote_names=duplicate_names,
+        unexpected_remote_names=sorted(unexpected_names),
+        duplicate_remote_names=sorted(duplicate_names),
+        agent_drift=agent_drift,
     )
 
 
@@ -584,7 +702,9 @@ def probe(
     identity_by_role = {identity.role: identity for identity in identities}
     last_drifts: List[ClusterDrift] = []
     for round_number in range(1, attempts + 1):
-        def get_status(cluster: Cluster) -> Tuple[str, Optional[List[dict]], Optional[str]]:
+        def get_status(
+            cluster: Cluster,
+        ) -> Tuple[str, Optional[List[CiliumAgentStatus]], Optional[str]]:
             try:
                 return (
                     cluster.role,

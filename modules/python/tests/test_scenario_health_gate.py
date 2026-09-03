@@ -16,6 +16,9 @@ SCRIPT_PATH = (
     / "config"
     / "scenario-health-gate.sh"
 )
+CILIUM_AGENT_HEALTH_PROBE = (
+    SCRIPT_PATH.parents[1] / "cilium_agent_health.py"
+)
 
 
 def _write_fake_tools(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -129,6 +132,9 @@ def _write_fake_tools(tmp_path: Path) -> tuple[Path, Path, Path]:
             elif [[ " $args " == *" -n kube-system get daemonset cilium -o json "* ]]; then
               printf '%s\\n' \
                 '{"status":{"desiredNumberScheduled":1,"numberReady":1}}'
+            elif [[ " $args " == *" -n kube-system get pods -l k8s-app=cilium -o json "* ]]; then
+              printf '%s\\n' \
+                '{"items":[{"metadata":{"name":"cilium-a"},"spec":{"nodeName":"node-a"},"status":{"phase":"Running","containerStatuses":[{"name":"cilium-agent","ready":true}]}}]}'
             elif [[ " $args " == *" -n mock-clustermesh get statefulset kwok-node -o json "* ]]; then
               printf '%s\\n' \
                 '{"spec":{"replicas":2},"status":{"currentReplicas":2,"readyReplicas":2}}'
@@ -150,8 +156,8 @@ def _write_fake_tools(tmp_path: Path) -> tuple[Path, Path, Path]:
                 printf '%s\\n' \
                   '{"items":[{"metadata":{"name":"kwok-node-1","ownerReferences":[{"kind":"StatefulSet","name":"kwok-node","controller":true}]},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}},{"metadata":{"name":"kwok-node-2","ownerReferences":[{"kind":"StatefulSet","name":"kwok-node","controller":true}]},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}}]}'
               fi
-            elif [[ " $args " == *" -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status "* ]]; then
-              printf '%s\\n' 'ClusterMesh: 0/0 remote clusters ready.'
+            elif [[ " $args " == *" -n kube-system exec cilium-a -c cilium-agent -- cilium-dbg status -o json "* ]]; then
+              printf '%s\\n' '{"cluster-mesh":{"clusters":[]}}'
             elif [[ " $args " == *" get ciliumidentities.cilium.io -o name "* ]]; then
               echo 'No resources found' >&2
               count=5
@@ -203,6 +209,13 @@ def _run_gate(
         encoding="utf-8",
     )
     summary_file = tmp_path / "health-summary.json"
+    cilium_identity_inventory = tmp_path / "cilium-identities.json"
+    cilium_identity_inventory.write_text(
+        json.dumps(
+            [{"role": "mesh-1", "cluster_name": "mesh-11", "cluster_id": 1}]
+        ),
+        encoding="utf-8",
+    )
     environment = os.environ.copy()
     environment.update(
         {
@@ -210,6 +223,8 @@ def _run_gate(
             "FAKE_POLL": str(poll_file),
             "FAKE_MODE": mode,
             "PATH": f"{fake_bin}:{environment['PATH']}",
+            "CILIUM_AGENT_HEALTH_PROBE": str(CILIUM_AGENT_HEALTH_PROBE),
+            "CILIUM_IDENTITY_INVENTORY": str(cilium_identity_inventory),
         }
     )
     if mock_nodes_json is not None:
@@ -281,6 +296,8 @@ def test_health_gate_succeeds_after_transient_cleanup(tmp_path):
     assert summary["clusters"][0]["mock"]["controller"]["ready"] == 2
     assert summary["clusters"][0]["mock"]["ready_agents"] == 2
     assert summary["clusters"][0]["mock"]["controller_owned_agents"] == 2
+    assert summary["clusters"][0]["clustermesh"]["cilium_agent_count"] == 1
+    assert summary["clusters"][0]["clustermesh"]["healthy_agent_count"] == 1
     coverage = summary["clusters"][0]["mock"]["serves_node_coverage"]
     assert coverage["served_count"] == 2
     assert coverage["unique_count"] == 2
@@ -333,6 +350,19 @@ def test_health_gate_times_out_with_actionable_summary(tmp_path):
     )
     assert "ClusterMesh scenario health gate timed out" in result.stderr
     assert "before starting another observation cycle" in result.stderr
+
+
+def test_health_gate_removes_prior_cilium_agent_summary_before_probe():
+    script = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    summary_assignment = (
+        'cilium_agent_summary="$state_dir/cilium-agents-${role}.json"'
+    )
+    cleanup = 'rm -f "$cilium_agent_summary" "$cilium_agent_log"'
+    probe = 'python3 "$cilium_agent_health_probe"'
+
+    assert script.index(summary_assignment) < script.index(cleanup)
+    assert script.index(cleanup) < script.index(probe)
 
 
 def _healthy_nodes_json() -> str:
@@ -537,10 +567,23 @@ def test_health_gate_hard_bounds_a_hung_kubectl(tmp_path):
         encoding="utf-8",
     )
     summary_file = tmp_path / "health-summary.json"
+    cilium_identity_inventory = tmp_path / "cilium-identities.json"
+    cilium_identity_inventory.write_text(
+        json.dumps(
+            [{"role": "mesh-1", "cluster_name": "mesh-11", "cluster_id": 1}]
+        ),
+        encoding="utf-8",
+    )
     kubectl_log = tmp_path / "kubectl.log"
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
     environment["HUNG_KUBECTL_LOG"] = str(kubectl_log)
+    environment["CILIUM_AGENT_HEALTH_PROBE"] = str(
+        CILIUM_AGENT_HEALTH_PROBE
+    )
+    environment["CILIUM_IDENTITY_INVENTORY"] = str(
+        cilium_identity_inventory
+    )
 
     started = time.monotonic()
     result = subprocess.run(

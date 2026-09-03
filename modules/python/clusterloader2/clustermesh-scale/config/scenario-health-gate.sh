@@ -30,6 +30,8 @@ poll_interval_seconds="${HEALTH_GATE_POLL_INTERVAL_SECONDS:-10}"
 concurrency="${HEALTH_GATE_CONCURRENCY:-8}"
 kubectl_request_timeout_seconds="${HEALTH_GATE_KUBECTL_REQUEST_TIMEOUT_SECONDS:-15}"
 summary_file="${HEALTH_GATE_SUMMARY_FILE:-}"
+cilium_agent_health_probe="${CILIUM_AGENT_HEALTH_PROBE:-}"
+cilium_identity_inventory="${CILIUM_IDENTITY_INVENTORY:-$HOME/.kube/cilium-cluster-identities.json}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -114,6 +116,15 @@ if [ "$timeout_seconds" -eq 0 ] ||
 fi
 if ! command -v timeout >/dev/null 2>&1; then
   echo "coreutils timeout is required for bounded kubectl observations." >&2
+  exit 2
+fi
+if [ -z "$cilium_agent_health_probe" ] ||
+   [ ! -f "$cilium_agent_health_probe" ]; then
+  echo "CILIUM_AGENT_HEALTH_PROBE must name the all-agent health script." >&2
+  exit 2
+fi
+if [ ! -s "$cilium_identity_inventory" ]; then
+  echo "Cilium identity inventory is required: $cilium_identity_inventory" >&2
   exit 2
 fi
 
@@ -205,6 +216,9 @@ observe_cluster() {
   local mock_coverage_missing_nodes='[]' mock_coverage_orphan_agents='[]'
   local mock_coverage_exact_match=true
   local remote_ready=-1 remote_total=-1
+  local cilium_agent_count=0 cilium_healthy_agent_count=0
+  local cilium_agent_details='[]'
+  local cilium_agent_summary cilium_agent_log now remaining cilium_probe_rc
   local identity_count=0 global_service_count=0
   local endpoint_namespaces=""
 
@@ -504,27 +518,41 @@ observe_cluster() {
     fi
   fi
 
-  if kube "$kubeconfig" "$context" -n kube-system exec ds/cilium \
-      -c cilium-agent -- cilium-dbg status; then
-    remote_status=$(sed -nE \
-      's/.*ClusterMesh:[[:space:]]+([0-9]+)\/([0-9]+) remote clusters ready.*/\1 \2/p' \
-      <<<"$K_OUT" | head -1)
-    if read -r remote_ready remote_total <<<"$remote_status" &&
-       [[ "$remote_ready" =~ ^[0-9]+$ ]] &&
-       [[ "$remote_total" =~ ^[0-9]+$ ]]; then
-      if [ "$remote_ready" -ne "$expected_remote_count" ] ||
-         [ "$remote_total" -ne "$expected_remote_count" ]; then
-        failures=$(append_failure "$failures" \
-          "ClusterMesh remote ready/total expected=${expected_remote_count}, observed=${remote_ready}/${remote_total}")
-      fi
-    else
-      remote_ready=-1
-      remote_total=-1
-      failures=$(append_failure "$failures" \
-        "cilium-dbg status did not report ClusterMesh remote readiness")
-    fi
+  cilium_agent_summary="$state_dir/cilium-agents-${role}.json"
+  cilium_agent_log="$state_dir/cilium-agents-${role}.log"
+  rm -f "$cilium_agent_summary" "$cilium_agent_log"
+  now=$(date +%s)
+  remaining=$((active_cycle_deadline - now))
+  cilium_probe_rc=0
+  if [ "$remaining" -le 0 ]; then
+    cilium_probe_rc=1
   else
-    failures=$(append_failure "$failures" "cilium-dbg status failed: $K_ERROR")
+    timeout --signal=KILL "${remaining}s" \
+      python3 "$cilium_agent_health_probe" \
+        --role "$role" \
+        --kubeconfig "$kubeconfig" \
+        --expected-remote-count "$expected_remote_count" \
+        --identity-inventory "$cilium_identity_inventory" \
+        --attempts 1 \
+        --retry-seconds 0 \
+        --command-timeout-seconds "$kubectl_request_timeout_seconds" \
+        --summary-file "$cilium_agent_summary" \
+        >"$cilium_agent_log" 2>&1 ||
+      cilium_probe_rc=$?
+  fi
+  if [ -s "$cilium_agent_log" ]; then
+    sed "s/^/${role} all-agent probe: /" "$cilium_agent_log" >&2
+  fi
+  if [ -s "$cilium_agent_summary" ]; then
+    cilium_agent_count=$(jq -r '.cilium_agent_count // 0' "$cilium_agent_summary")
+    cilium_healthy_agent_count=$(jq -r '.healthy_agent_count // 0' "$cilium_agent_summary")
+    cilium_agent_details=$(jq -c '.agents // []' "$cilium_agent_summary")
+    remote_ready=$(jq -r '[.agents[]?.ready_remote_count] | min // -1' "$cilium_agent_summary")
+    remote_total=$(jq -r '[.agents[]?.remote_count] | max // -1' "$cilium_agent_summary")
+  fi
+  if [ "$cilium_probe_rc" -ne 0 ]; then
+    failures=$(append_failure "$failures" \
+      "Cilium all-agent ClusterMesh health failed: healthy=${cilium_healthy_agent_count}/${cilium_agent_count}, minimum_ready=${remote_ready}/${expected_remote_count}")
   fi
 
   if kube "$kubeconfig" "$context" get ciliumidentities.cilium.io -o name; then
@@ -558,7 +586,7 @@ observe_cluster() {
 
   local healthy fingerprint
   healthy=$(jq -n --argjson failures "$failures" '$failures | length == 0')
-  fingerprint="cep=${cep_total};identity=${identity_count};global_service=${global_service_count}"
+  fingerprint="cep=${cep_total};identity=${identity_count};global_service=${global_service_count};cilium_agents=${cilium_healthy_agent_count}/${cilium_agent_count};remote_min=${remote_ready}"
 
   jq -cn \
     --arg role "$role" \
@@ -600,6 +628,9 @@ observe_cluster() {
     --argjson remote_expected "$expected_remote_count" \
     --argjson remote_ready "$remote_ready" \
     --argjson remote_total "$remote_total" \
+    --argjson cilium_agent_count "$cilium_agent_count" \
+    --argjson cilium_healthy_agent_count "$cilium_healthy_agent_count" \
+    --argjson cilium_agent_details "$cilium_agent_details" \
     --argjson identity_count "$identity_count" \
     --argjson global_service_count "$global_service_count" \
     '{
@@ -653,7 +684,10 @@ observe_cluster() {
       clustermesh: {
         expected_remote: $remote_expected,
         ready_remote: $remote_ready,
-        total_remote: $remote_total
+        total_remote: $remote_total,
+        cilium_agent_count: $cilium_agent_count,
+        healthy_agent_count: $cilium_healthy_agent_count,
+        agents: $cilium_agent_details
       },
       fingerprint: {
         value: $fingerprint,

@@ -973,10 +973,6 @@ steps:
       source "$HOME/.kube/lib/fetch-kubeconfig.sh"
 
       _fleet_enabled="${CLUSTERMESH_FLEET_ENABLED:-true}"
-      if [ "${_fleet_enabled,,}" = "false" ]; then
-        echo "CLUSTERMESH_FLEET_ENABLED=${CLUSTERMESH_FLEET_ENABLED:-} — Fleet/ClusterMesh disabled (single-cluster baseline); skipping Cilium+ClusterMesh mesh validation."
-        exit 0
-      fi
 
       clusters=$(cat "$HOME/.kube/clustermesh-clusters.json")
       expected_remote=$(( $(echo "$clusters" | jq 'length') - 1 ))
@@ -1007,6 +1003,74 @@ steps:
       # entries Fleet pushed, mangling and all, so we can correlate Fleet
       # RP behavior with the on-cluster state.
       cluster_count=$(echo "$clusters" | jq 'length')
+      cilium_identity_inventory="$HOME/.kube/cilium-cluster-identities.json"
+      cilium_identity_jsonl=$(mktemp)
+      if [ "${_fleet_enabled,,}" = "false" ]; then
+        _role=$(echo "$clusters" | jq -r '.[0].role')
+        _cid="${MOCK_CLUSTER_ID:-}"
+        _cn="${MOCK_CLUSTER_NAME:-}"
+        if [ "$cluster_count" -ne 1 ] ||
+           ! [[ "$_cid" =~ ^[1-9][0-9]*$ ]] ||
+           [ -z "$_cn" ]; then
+          echo "##vso[task.logissue type=error;] Fleet-disabled identity requires one cluster plus positive MOCK_CLUSTER_ID and MOCK_CLUSTER_NAME."
+          rm -f "$cilium_identity_jsonl"
+          exit 1
+        fi
+        jq -nc \
+          --arg role "$_role" \
+          --arg cluster_name "$_cn" \
+          --argjson cluster_id "$_cid" \
+          '{role:$role,cluster_name:$cluster_name,cluster_id:$cluster_id}' \
+          >> "$cilium_identity_jsonl"
+      else
+        for _row in $(echo "$clusters" | jq -c '.[]'); do
+          _name=$(echo "$_row" | jq -r '.name')
+          _rg=$(echo "$_row" | jq -r '.rg')
+          _role=$(echo "$_row" | jq -r '.role')
+          _kc="$HOME/.kube/${_role}.config"
+          ensure_kubeconfig "$_rg" "$_name" "$_kc"
+          _cm=$(KUBECONFIG="$_kc" kubectl --request-timeout=45s \
+            -n kube-system get cm cilium-config -o json)
+          _cid=$(jq -r '.data["cluster-id"] // ""' <<<"$_cm")
+          _cn=$(jq -r '.data["cluster-name"] // ""' <<<"$_cm")
+          if ! [[ "$_cid" =~ ^[1-9][0-9]*$ ]] || [ -z "$_cn" ]; then
+            echo "##vso[task.logissue type=error;] $_role: invalid Cilium identity name='$_cn' id='$_cid'"
+            rm -f "$cilium_identity_jsonl"
+            exit 1
+          fi
+          jq -nc \
+            --arg role "$_role" \
+            --arg cluster_name "$_cn" \
+            --argjson cluster_id "$_cid" \
+            '{role:$role,cluster_name:$cluster_name,cluster_id:$cluster_id}' \
+            >> "$cilium_identity_jsonl"
+        done
+      fi
+      cilium_identity_inventory_tmp="${cilium_identity_inventory}.tmp"
+      if ! jq -se --argjson expected "$cluster_count" '
+        if (
+          length == $expected and
+          ([.[].role] | unique | length) == $expected and
+          ([.[].cluster_name] | unique | length) == $expected and
+          ([.[].cluster_id] | unique | length) == $expected
+        )
+        then .
+        else error("Cilium identity inventory is not exact")
+        end
+        ' "$cilium_identity_jsonl" > "$cilium_identity_inventory_tmp"; then
+        rm -f "$cilium_identity_jsonl"
+        rm -f "$cilium_identity_inventory_tmp"
+        echo "##vso[task.logissue type=error;] Cilium identity inventory is not exact."
+        exit 1
+      fi
+      mv "$cilium_identity_inventory_tmp" "$cilium_identity_inventory"
+      rm -f "$cilium_identity_jsonl"
+
+      if [ "${_fleet_enabled,,}" = "false" ]; then
+        echo "CLUSTERMESH_FLEET_ENABLED=${CLUSTERMESH_FLEET_ENABLED:-} — identity inventory captured; Fleet/ClusterMesh peer validation is disabled for this single-cluster baseline."
+        exit 0
+      fi
+
       if [ "$cluster_count" -ge 3 ]; then
         FLEET_RG=$(echo "$clusters" | jq -r '.[0].rg')
         FLEET_NAME="clustermesh-flt"
@@ -1474,46 +1538,34 @@ steps:
           exit 1
         fi
         connected=0
-        mesh_status_attempt=0
-        mesh_status_deadline=$(( $(date +%s) + mesh_convergence_timeout_seconds ))
-        while [ "$(date +%s)" -lt "$mesh_status_deadline" ]; do
-          mesh_status_attempt=$((mesh_status_attempt + 1))
-          mesh_status_remaining=$((mesh_status_deadline - $(date +%s)))
-          mesh_status_command_timeout="$mesh_status_command_timeout_seconds"
-          if [ "$mesh_status_command_timeout" -gt "$mesh_status_remaining" ]; then
-            mesh_status_command_timeout="$mesh_status_remaining"
-          fi
-          mesh_status_rc=0
-          out=$(timeout --signal=TERM --kill-after=10s \
-            "${mesh_status_command_timeout}s" \
-            kubectl --request-timeout="${mesh_status_command_timeout}s" \
-            -n kube-system exec ds/cilium -- cilium-dbg status 2>&1) ||
-            mesh_status_rc=$?
-          echo "$out"
-          if [ "$mesh_status_rc" -eq 124 ] || [ "$mesh_status_rc" -eq 137 ]; then
-            echo "  cilium-dbg status timed out after ${mesh_status_command_timeout}s; retrying within the convergence deadline"
-          fi
-          # Parse "<ready>/<total> remote clusters ready" line.
-          ready=$(echo "$out" | sed -nE 's/.*ClusterMesh:[[:space:]]+([0-9]+)\/[0-9]+ remote clusters ready.*/\1/p' | head -1)
-          ready=${ready:-0}
-          if [ "$ready" -ge "$expected_remote" ]; then
-            connected=1
-            break
-          fi
-
-          mesh_status_remaining=$((mesh_status_deadline - $(date +%s)))
-          echo "  waiting for $expected_remote remote clusters to be ready (got $ready), attempt $mesh_status_attempt, remaining=${mesh_status_remaining}s..."
-          if [ "$mesh_status_remaining" -le 0 ]; then
-            break
-          fi
-          mesh_status_sleep="$mesh_status_poll_seconds"
-          if [ "$mesh_status_sleep" -gt "$mesh_status_remaining" ]; then
-            mesh_status_sleep="$mesh_status_remaining"
-          fi
-          if [ "$mesh_status_sleep" -gt 0 ]; then
-            sleep "$mesh_status_sleep"
-          fi
-        done
+        mesh_agent_summary=$(mktemp)
+        mesh_status_rc=0
+        timeout --signal=TERM --kill-after=10s \
+          "${mesh_convergence_timeout_seconds}s" \
+          python3 "$CILIUM_AGENT_HEALTH_PROBE" \
+            --role "$role" \
+            --kubeconfig "$kubeconfig" \
+            --expected-remote-count "$expected_remote" \
+            --identity-inventory "$cilium_identity_inventory" \
+            --attempts "${CLUSTERMESH_ALL_AGENT_STATUS_ATTEMPTS:-40}" \
+            --retry-seconds "$mesh_status_poll_seconds" \
+            --command-timeout-seconds "$mesh_status_command_timeout_seconds" \
+            --summary-file "$mesh_agent_summary" ||
+          mesh_status_rc=$?
+        if [ -s "$mesh_agent_summary" ]; then
+          jq -r '
+            "  Cilium agents healthy: \(.healthy_agent_count)/\(.cilium_agent_count)",
+            (.agents[]?
+              | "  \(.pod_name) on \(.node_name): "
+                + "\(.ready_remote_count)/\(.remote_count) ready")
+          ' "$mesh_agent_summary"
+        fi
+        if [ "$mesh_status_rc" -eq 0 ]; then
+          connected=1
+        elif [ "$mesh_status_rc" -eq 124 ] || [ "$mesh_status_rc" -eq 137 ]; then
+          echo "  all-agent Cilium status timed out after ${mesh_convergence_timeout_seconds}s"
+        fi
+        rm -f "$mesh_agent_summary"
 
         if [ "$connected" -ne 1 ]; then
           echo "##vso[task.logissue type=error;] $role: clustermesh not Connected to $expected_remote remote clusters"
@@ -1567,6 +1619,8 @@ steps:
         echo "##vso[task.complete result=SucceededWithIssues;]"
       fi
     displayName: "Validate Cilium + ClusterMesh on every cluster"
+    env:
+      CILIUM_AGENT_HEALTH_PROBE: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/cilium_agent_health.py
 
   - script: |
       bash "$(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/cross-cluster-smoke.sh"
