@@ -402,29 +402,53 @@ def validate_cluster_data_plane(
             f"{cluster.role}: clustermesh-apiserver is not Available"
         )
 
-    status = runner(
-        [
-            "kubectl",
-            "--kubeconfig",
-            kubeconfig,
-            f"--request-timeout={query_timeout_seconds}s",
-            "-n",
-            "kube-system",
-            "exec",
-            "daemonset/cilium",
-            "--",
-            "cilium-dbg",
-            "status",
-        ],
-        query_timeout_seconds,
+    status = parse_json(
+        runner(
+            [
+                "kubectl",
+                "--kubeconfig",
+                kubeconfig,
+                f"--request-timeout={query_timeout_seconds}s",
+                "-n",
+                "kube-system",
+                "exec",
+                "daemonset/cilium",
+                "--",
+                "cilium-dbg",
+                "status",
+                "-o",
+                "json",
+            ],
+            query_timeout_seconds,
+        ),
+        f"{cluster.role} Cilium status",
     )
-    expected = (
-        f"ClusterMesh: {expected_remote_count}/{expected_remote_count} "
-        "remote clusters ready"
-    )
-    if expected not in status:
+    mesh = status.get("cluster-mesh") if isinstance(status, dict) else None
+    remotes = mesh.get("clusters") if isinstance(mesh, dict) else None
+    if not isinstance(remotes, list) or len(remotes) != expected_remote_count:
         raise ReconcileError(
-            f"{cluster.role}: live Cilium status does not contain {expected!r}"
+            f"{cluster.role}: expected {expected_remote_count} Cilium remotes, "
+            f"got {len(remotes) if isinstance(remotes, list) else 'invalid'}"
+        )
+    unhealthy = []
+    for remote in remotes:
+        if not isinstance(remote, dict):
+            raise ReconcileError(
+                f"{cluster.role}: malformed Cilium remote status entry"
+            )
+        config = remote.get("config")
+        if (
+            remote.get("ready") is not True
+            or remote.get("connected") is not True
+            or not isinstance(config, dict)
+            or config.get("required") is not True
+            or config.get("retrieved") is not True
+        ):
+            unhealthy.append(str(remote.get("name") or "unknown"))
+    if unhealthy:
+        raise ReconcileError(
+            f"{cluster.role}: unhealthy Cilium remotes: "
+            + " ".join(sorted(unhealthy))
         )
 
 

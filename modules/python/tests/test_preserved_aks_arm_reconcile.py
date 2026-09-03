@@ -225,6 +225,57 @@ def test_latest_operation_requires_known_fleet_addon_error():
         arm.validate_latest_operation(cluster, known)
 
 
+def test_data_plane_validation_uses_structured_cilium_status():
+    cluster = arm.Cluster(
+        name="clustermesh-2",
+        role="mesh-2",
+        resource_group="rg",
+        resource_id="/subscriptions/s/resourceGroups/rg/clustermesh-2",
+        node_resource_group="MC_rg_cluster_region",
+        state="Failed",
+        power_state="Running",
+    )
+    remotes = [
+        {
+            "name": "mesh-11",
+            "ready": True,
+            "connected": True,
+            "config": {"required": True, "retrieved": True},
+        }
+    ]
+
+    def runner(args, _timeout):
+        if args[1:3] == ["aks", "get-credentials"]:
+            return ""
+        if args[0] == "kubectl" and "--raw=/readyz" in args:
+            return "ok\n"
+        if args[0] == "kubectl" and "deployment" in args:
+            return (
+                '{"status":{"conditions":['
+                '{"type":"Available","status":"True"}]}}'
+            )
+        if args[0] == "kubectl" and "cilium-dbg" in args:
+            return arm.json.dumps({"cluster-mesh": {"clusters": remotes}})
+        raise AssertionError(f"unexpected command: {args}")
+
+    arm.validate_cluster_data_plane(
+        cluster,
+        "/tmp/mesh-2.config",
+        1,
+        runner,
+        query_timeout_seconds=5,
+    )
+    remotes[0]["config"]["retrieved"] = False
+    with pytest.raises(arm.ReconcileError, match="unhealthy Cilium remotes"):
+        arm.validate_cluster_data_plane(
+            cluster,
+            "/tmp/mesh-2.config",
+            1,
+            runner,
+            query_timeout_seconds=5,
+        )
+
+
 def test_reconcile_cluster_waits_for_succeeded(monkeypatch):
     cluster = arm.Cluster(
         name="clustermesh-2",
