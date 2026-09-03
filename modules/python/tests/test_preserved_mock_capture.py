@@ -90,10 +90,14 @@ def test_structured_cilium_status_requires_every_remote_ready():
     ]
     payload = {"cluster-mesh": {"clusters": remotes}}
 
-    capture.validate_cilium_status(payload, 1)
+    capture.validate_cilium_status(payload, 1, {"mesh-11"})
     remotes[0]["config"]["retrieved"] = False
     with pytest.raises(capture.CaptureError, match="unhealthy Cilium remotes"):
-        capture.validate_cilium_status(payload, 1)
+        capture.validate_cilium_status(payload, 1, {"mesh-11"})
+
+    remotes[0]["config"]["retrieved"] = True
+    with pytest.raises(capture.CaptureError, match="names are not exact"):
+        capture.validate_cilium_status(payload, 1, {"mesh-12"})
 
 
 def test_state_metadata_requires_matching_run_and_manifests(tmp_path):

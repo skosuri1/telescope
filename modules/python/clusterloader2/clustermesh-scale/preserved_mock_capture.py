@@ -274,7 +274,11 @@ def parse_agent_identities(payload: object, expected_count: int) -> Dict[str, st
     return identities
 
 
-def validate_cilium_status(payload: object, expected_remote_count: int) -> None:
+def validate_cilium_status(
+    payload: object,
+    expected_remote_count: int,
+    expected_remote_names: Optional[Sequence[str]] = None,
+) -> None:
     """Require exact structured live ClusterMesh readiness."""
 
     mesh = payload.get("cluster-mesh") if isinstance(payload, dict) else None
@@ -285,9 +289,14 @@ def validate_cilium_status(payload: object, expected_remote_count: int) -> None:
             f"{len(remotes) if isinstance(remotes, list) else 'invalid'}"
         )
     unhealthy = []
+    names = []
     for remote in remotes:
         if not isinstance(remote, dict):
             raise CaptureError("malformed Cilium remote status entry")
+        name = remote.get("name")
+        if not isinstance(name, str) or not name:
+            raise CaptureError("Cilium remote status entry has no name")
+        names.append(name)
         config = remote.get("config")
         if (
             remote.get("ready") is not True
@@ -296,7 +305,17 @@ def validate_cilium_status(payload: object, expected_remote_count: int) -> None:
             or config.get("required") is not True
             or config.get("retrieved") is not True
         ):
-            unhealthy.append(str(remote.get("name") or "unknown"))
+            unhealthy.append(name)
+    if len(set(names)) != len(names):
+        raise CaptureError("Cilium remote status contains duplicate names")
+    if expected_remote_names is not None:
+        expected_names = set(expected_remote_names)
+        if len(expected_names) != expected_remote_count or set(names) != expected_names:
+            missing = sorted(expected_names - set(names))[:10]
+            extra = sorted(set(names) - expected_names)[:10]
+            raise CaptureError(
+                f"Cilium remote names are not exact: missing={missing} extra={extra}"
+            )
     if unhealthy:
         raise CaptureError(
             "unhealthy Cilium remotes: " + " ".join(sorted(unhealthy))
@@ -312,6 +331,7 @@ def probe_cluster(
     expected_mock_count: int,
     command_timeout_seconds: int,
     runner: Runner,
+    expected_remote_names: Optional[Sequence[str]] = None,
 ) -> dict:
     """Capture one cluster after validating exact live and persisted state."""
 
@@ -397,7 +417,11 @@ def probe_cluster(
         ),
         f"{cluster.role} Cilium status",
     )
-    validate_cilium_status(cilium, expected_cluster_count - 1)
+    validate_cilium_status(
+        cilium,
+        expected_cluster_count - 1,
+        expected_remote_names,
+    )
     return {
         "name": cluster.name,
         "resource_group": cluster.resource_group,

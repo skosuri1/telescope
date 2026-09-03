@@ -14,6 +14,13 @@ VALIDATE_RESOURCES_PATH = (
     / "clustermesh-scale"
     / "validate-resources.yml"
 )
+CROSS_CLUSTER_SMOKE_PATH = (
+    REPOSITORY_ROOT
+    / "steps"
+    / "topology"
+    / "clustermesh-scale"
+    / "cross-cluster-smoke.sh"
+)
 TFVARS_PATH = (
     REPOSITORY_ROOT
     / "scenarios"
@@ -366,6 +373,8 @@ def test_competitive_job_can_skip_workload_execution():
 
 def test_threshold_node_readiness_warning_mode_preserves_peer_gate():
     validation = VALIDATE_RESOURCES_PATH.read_text(encoding="utf-8")
+    cross_cluster_smoke = CROSS_CLUSTER_SMOKE_PATH.read_text(encoding="utf-8")
+    combined = f"{validation}\n{cross_cluster_smoke}"
 
     for expected in (
         'CLUSTERMESH_NODE_READINESS_REQUIRED:-true',
@@ -375,10 +384,11 @@ def test_threshold_node_readiness_warning_mode_preserves_peer_gate():
         'CLUSTERMESH_CROSS_CLUSTER_SMOKE_ENABLED:-true',
         "Cross-cluster data-path smoke disabled",
     ):
-        assert expected in validation
+        assert expected in combined
 
     peer_failure_gate = validation.index('if [ "$failures" -gt 0 ]')
     warning_completion = validation.index(
         'if [ "$node_readiness_warnings" -gt 0 ]'
     )
     assert peer_failure_gate < warning_completion
+    assert "cross-cluster-smoke.sh" in validation

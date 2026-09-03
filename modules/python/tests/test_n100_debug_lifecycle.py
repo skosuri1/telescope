@@ -32,6 +32,21 @@ BASE_VALIDATE_PATH = (
     / "clustermesh-scale"
     / "validate-resources.yml"
 )
+CROSS_CLUSTER_SMOKE_PATH = (
+    REPOSITORY_ROOT
+    / "steps"
+    / "topology"
+    / "clustermesh-scale"
+    / "cross-cluster-smoke.sh"
+)
+MOCK_VERIFY_SCRIPT = (
+    REPOSITORY_ROOT
+    / "modules"
+    / "python"
+    / "clusterloader2"
+    / "clustermesh-scale"
+    / "preserved_mock_verify.py"
+)
 LIVE_OVERLAY_SCRIPT = (
     REPOSITORY_ROOT
     / "modules"
@@ -245,6 +260,9 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "- name: scaleDebugRequiredFamilyVcpus" in pipeline
     assert "- name: scaleDebugRunWorkload" in pipeline
     assert "- name: scaleDebugKwokPreservationMode" in pipeline
+    assert "- name: scaleDebugKwokBaselineBuildId" in pipeline
+    assert "default: 78812" in pipeline
+    assert "- verify" in pipeline
 
     assert "CLUSTERMESH_DEBUG_MODE'], 'fresh-preserve'" in fresh
     assert 'SKIP_RESOURCE_DELETION: "true"' in fresh
@@ -299,6 +317,7 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "parameters.scaleDebugTopology" in resume
     assert "parameters.scaleDebugRunWorkload" in resume
     assert "parameters.scaleDebugKwokPreservationMode" in resume
+    assert "parameters.scaleDebugKwokBaselineBuildId" in resume
     assert 'cl2_prom_snapshot_storage_account: "cmshscaleprom"' in resume
     assert 'AKS_AMW_CLUSTERS_PER_WORKSPACE: "1"' in resume
     assert 'AKS_AMW_FORCE_SHARD_NAMING: "true"' in resume
@@ -379,9 +398,35 @@ def test_resume_job_skips_terraform_and_preserves_resources():
         in resume
     )
     assert "mock_preservation_mode" in resume
+    assert "mock_preservation_baseline_build_id" in resume
     assert "preserved_mock_capture.py" in resume
     assert "Capture preserved n100 KWOK baseline" in resume
     assert "Publish preserved n100 KWOK baseline" in resume
+    assert "DownloadPipelineArtifact@2" in resume
+    assert "Download preserved n100 KWOK baseline" in resume
+    assert "buildVersionToDownload: specific" in resume
+    assert resume.count("/steps/validate-resources.yml") == 1
+    assert resume.index("Download preserved n100 KWOK baseline") < resume.index(
+        "Reconcile stale preserved AKS ARM states"
+    )
+    assert (
+        "artifactName: n100-kwok-preservation-"
+        "${{ parameters.mock_preservation_baseline_build_id }}"
+        in resume
+    )
+    assert "preserved_mock_verify.py" in resume
+    assert "Verify preserved n100 KWOK identities and exact recovery" in resume
+    assert "Revalidate cross-cluster data path after KWOK recovery" in resume
+    assert "Publish preserved n100 KWOK verification" in resume
+    assert "cross_cluster_data_path_failed" in resume
+    assert 'payload["fatal_error"]' in resume
+    assert 'CLUSTERMESH_CROSS_CLUSTER_SMOKE_ENABLED: "true"' in resume
+    assert "Finalize incomplete preserved n100 KWOK verification evidence" in resume
+    assert "pipeline_failed_before_verification_completion" in resume
+    assert resume.count("--fault-role") == 5
+    assert "--fault-role mesh-1" in resume
+    assert "--fault-role mesh-100" in resume
+    assert "cross-cluster-smoke.sh" in resume
     assert 'CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"' in resume
     assert (
         "${{ if and(parameters.run_workload, parameters.publish_results, "
@@ -539,6 +584,7 @@ def test_preserved_validation_extends_child_leases_before_parent(tmp_path):
 
 def test_preserved_resume_recovery_runs_before_authoritative_validation():
     validation = BASE_VALIDATE_PATH.read_text(encoding="utf-8")
+    cross_cluster_smoke = CROSS_CLUSTER_SMOKE_PATH.read_text(encoding="utf-8")
 
     enumerate_pos = validation.index('displayName: "Enumerate clustermesh clusters"')
     worker_pos = validation.index(
@@ -563,6 +609,31 @@ def test_preserved_resume_recovery_runs_before_authoritative_validation():
         in validation
     )
     assert "ensure_kubeconfig" in validation
+    assert "cross-cluster-smoke.sh" in validation
+    assert "service.cilium.io/global" in cross_cluster_smoke
+    assert "Cross-cluster curl succeeded" in cross_cluster_smoke
+
+
+def test_n100_kwok_verifier_is_bounded_and_does_not_run_workloads():
+    pipeline = PIPELINE_PATH.read_text(encoding="utf-8")
+    resume = RESUME_JOB_PATH.read_text(encoding="utf-8")
+    verifier = MOCK_VERIFY_SCRIPT.read_text(encoding="utf-8")
+
+    assert "values:\n  - none\n  - capture\n  - verify" in resume
+    assert "scaleDebugKwokBaselineBuildId" in pipeline
+    assert "mock_preservation_baseline_build_id" in resume
+    assert "fault injection is bounded to at most five clusters" in verifier
+    assert "fault count must be between one and five" in verifier
+    assert "expected_pool_count" in verifier
+    assert "Fleet member is not Succeeded/Connected" in verifier
+    assert (
+        "${{ if and(parameters.run_workload, "
+        "eq(parameters.mock_preservation_mode, 'none')) }}:"
+        in resume
+    )
+    assert "condition: always()" in resume[
+        resume.index('displayName: "Publish preserved n100 KWOK verification"') :
+    ]
 
 
 def test_preserved_resume_repair_is_bounded_and_non_destructive():
