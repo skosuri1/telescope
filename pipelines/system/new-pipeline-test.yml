@@ -52,6 +52,12 @@ parameters:
   - name: scaleDebugRunWorkload
     type: boolean
     default: true
+  - name: scaleDebugKwokPreservationMode
+    type: string
+    default: none
+    values:
+      - none
+      - capture
 
 pool: AKS-Telescope-Airlock
 
@@ -2877,6 +2883,7 @@ stages:
       MOCK_CONSUME_CLUSTERMESH: true
       MOCK_DEPLOY_CONCURRENCY: 8
       MOCK_DEPLOY_MAX_FAILURES: 0
+      MOCK_CAPTURE_CONCURRENCY: "8"
       CL2_PROMETHEUS_MEMORY_LIMIT_GI: "16"
       CL2_ACNS_TELEMETRY_ENABLED: "true"
       CL2_ACCEPT_CILIUM_POLICY_GAP: "true"
@@ -2999,6 +3006,7 @@ stages:
           expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
           run_workload: ${{ parameters.scaleDebugRunWorkload }}
           publish_results: ${{ parameters.scaleDebugRunWorkload }}
+          mock_preservation_mode: ${{ parameters.scaleDebugKwokPreservationMode }}
           manifest_subdir: scale-resume
           target_run_id: ${{ parameters.debugTargetRunId }}
           ${{ if eq(parameters.debugMode, 'resume-existing') }}:

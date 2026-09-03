@@ -48,6 +48,12 @@ parameters:
   values:
   - resume
   - resume-existing
+- name: mock_preservation_mode
+  type: string
+  default: none
+  values:
+  - none
+  - capture
 
 jobs:
 - job: azure
@@ -138,7 +144,37 @@ jobs:
       topology: ${{ parameters.topology }}
       engine: ${{ parameters.engine }}
 
-  - ${{ if parameters.run_workload }}:
+  - ${{ if eq(parameters.mock_preservation_mode, 'capture') }}:
+    - template: /steps/topology/clustermesh-scale-mock/deploy-mock-layer.yml
+      parameters:
+        cloud: azure
+        engine: ${{ parameters.engine }}
+        regions:
+        - ${{ parameters.region }}
+    - script: |
+        set -euo pipefail
+        artifact_dir="$(Build.ArtifactStagingDirectory)/n100-kwok-preservation"
+        mkdir -p "$artifact_dir"
+        python3 "$PRESERVED_MOCK_CAPTURE" \
+          --clusters "$HOME/.kube/clustermesh-clusters.json" \
+          --state-root "$HOME/.kube/mock-layer-state/$RUN_ID" \
+          --artifact-dir "$artifact_dir" \
+          --run-id "$RUN_ID" \
+          --expected-cluster-count "${{ parameters.expected_cluster_count }}" \
+          --expected-mock-count "${MOCK_NODE_COUNT:-100}" \
+          --max-concurrent "${MOCK_CAPTURE_CONCURRENCY:-8}"
+      displayName: "Capture preserved n100 KWOK baseline"
+      env:
+        PRESERVED_MOCK_CAPTURE: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_mock_capture.py
+        RUN_ID: ${{ parameters.target_run_id }}
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish preserved n100 KWOK baseline"
+      condition: always()
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/n100-kwok-preservation
+        artifact: n100-kwok-preservation-$(Build.BuildId)
+
+  - ${{ if and(parameters.run_workload, eq(parameters.mock_preservation_mode, 'none')) }}:
     - template: /steps/execute-tests.yml
       parameters:
         cloud: azure
@@ -148,7 +184,7 @@ jobs:
         - ${{ parameters.region }}
         engine_input: ${{ parameters.engine_input }}
 
-  - ${{ if and(parameters.run_workload, parameters.publish_results) }}:
+  - ${{ if and(parameters.run_workload, parameters.publish_results, eq(parameters.mock_preservation_mode, 'none')) }}:
     - template: /steps/publish-results.yml
       parameters:
         cloud: azure

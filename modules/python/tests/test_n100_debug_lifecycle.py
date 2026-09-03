@@ -244,6 +244,7 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "- name: scaleDebugTopology" in pipeline
     assert "- name: scaleDebugRequiredFamilyVcpus" in pipeline
     assert "- name: scaleDebugRunWorkload" in pipeline
+    assert "- name: scaleDebugKwokPreservationMode" in pipeline
 
     assert "CLUSTERMESH_DEBUG_MODE'], 'fresh-preserve'" in fresh
     assert 'SKIP_RESOURCE_DELETION: "true"' in fresh
@@ -297,6 +298,7 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "parameters.scaleDebugClusterCount" in resume
     assert "parameters.scaleDebugTopology" in resume
     assert "parameters.scaleDebugRunWorkload" in resume
+    assert "parameters.scaleDebugKwokPreservationMode" in resume
     assert 'cl2_prom_snapshot_storage_account: "cmshscaleprom"' in resume
     assert 'AKS_AMW_CLUSTERS_PER_WORKSPACE: "1"' in resume
     assert 'AKS_AMW_FORCE_SHARD_NAMING: "true"' in resume
@@ -371,10 +373,19 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     assert "- name: expected_cluster_count" in resume
     assert "- name: run_workload" in resume
     assert "- name: publish_results" in resume
-    assert "${{ if parameters.run_workload }}:" in resume
+    assert (
+        "${{ if and(parameters.run_workload, "
+        "eq(parameters.mock_preservation_mode, 'none')) }}:"
+        in resume
+    )
+    assert "mock_preservation_mode" in resume
+    assert "preserved_mock_capture.py" in resume
+    assert "Capture preserved n100 KWOK baseline" in resume
+    assert "Publish preserved n100 KWOK baseline" in resume
     assert 'CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"' in resume
     assert (
-        "${{ if and(parameters.run_workload, parameters.publish_results) }}:"
+        "${{ if and(parameters.run_workload, parameters.publish_results, "
+        "eq(parameters.mock_preservation_mode, 'none')) }}:"
         in resume
     )
 
