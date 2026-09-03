@@ -566,6 +566,8 @@ def test_preserved_resume_repair_is_bounded_and_non_destructive():
     assert "max-repair-clusters" in worker
     assert "OverlaymgrReconcileError" in arm
     assert '"aks",\n        "update"' in arm
+    assert "inventory-timeout-seconds" in arm
+    assert "TRANSIENT_READ_RE" in arm
     assert "delete-instances" in worker
     assert "stale_instance_ids" in worker
     assert "repair_roles_for_drift" in live

@@ -53,6 +53,38 @@ def cluster_row(number, state="Succeeded"):
     }
 
 
+def test_inventory_reads_retry_only_transient_failures(monkeypatch):
+    calls = []
+
+    def transient_runner(_args, _timeout):
+        calls.append("call")
+        if len(calls) == 1:
+            raise arm.ReconcileError("command timed out after 5s")
+        return "[]"
+
+    monkeypatch.setattr(arm.time, "sleep", lambda _seconds: None)
+    assert arm.run_read_with_retries(
+        ["az", "aks", "list"],
+        transient_runner,
+        timeout_seconds=5,
+        attempts=2,
+        retry_seconds=1,
+    ) == "[]"
+    assert len(calls) == 2
+
+    def fatal_runner(_args, _timeout):
+        raise arm.ReconcileError("AuthorizationFailed")
+
+    with pytest.raises(arm.ReconcileError, match="AuthorizationFailed"):
+        arm.run_read_with_retries(
+            ["az", "aks", "list"],
+            fatal_runner,
+            timeout_seconds=5,
+            attempts=3,
+            retry_seconds=1,
+        )
+
+
 def test_resource_group_requires_exact_preserved_desired_state():
     payload = {
         "location": "eastus2euap",

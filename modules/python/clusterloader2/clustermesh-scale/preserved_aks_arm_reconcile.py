@@ -52,6 +52,11 @@ TRANSIENT_UPDATE_RE = re.compile(
     r"EtagMismatch|TooManyRequests|\b429\b|temporar|timeout|timed out",
     re.IGNORECASE,
 )
+TRANSIENT_READ_RE = re.compile(
+    r"command timed out|TooManyRequests|\b429\b|ServiceUnavailable|"
+    r"InternalServerError|temporar",
+    re.IGNORECASE,
+)
 ROLE_RE = re.compile(r"^mesh-(?P<number>[1-9][0-9]*)$")
 
 
@@ -94,6 +99,38 @@ def parse_json(output: str, description: str) -> object:
         return json.loads(output)
     except json.JSONDecodeError as exc:
         raise ReconcileError(f"invalid {description} JSON: {exc}") from exc
+
+
+def run_read_with_retries(
+    args: Sequence[str],
+    runner: Runner,
+    *,
+    timeout_seconds: int,
+    attempts: int,
+    retry_seconds: int,
+) -> str:
+    """Retry only transient failures for a read-only command."""
+
+    last_error: Optional[ReconcileError] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return runner(args, timeout_seconds)
+        except ReconcileError as exc:
+            last_error = exc
+            if (
+                attempt >= attempts
+                or TRANSIENT_READ_RE.search(str(exc)) is None
+            ):
+                raise
+            print(
+                f"Transient inventory read failure on attempt "
+                f"{attempt}/{attempts}: {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(retry_seconds)
+    if last_error is None:
+        raise ReconcileError("inventory retry called without attempts")
+    raise last_error
 
 
 def validate_resource_group(
@@ -498,6 +535,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-repair-clusters", type=int, default=10)
     parser.add_argument("--max-concurrent", type=int, default=2)
     parser.add_argument("--query-timeout-seconds", type=int, default=180)
+    parser.add_argument("--inventory-timeout-seconds", type=int, default=600)
+    parser.add_argument("--inventory-attempts", type=int, default=3)
+    parser.add_argument("--inventory-retry-seconds", type=int, default=15)
     parser.add_argument("--mutation-timeout-seconds", type=int, default=1800)
     parser.add_argument("--recovery-timeout-seconds", type=int, default=1800)
     parser.add_argument("--poll-seconds", type=int, default=30)
@@ -508,6 +548,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "max_repair_clusters",
         "max_concurrent",
         "query_timeout_seconds",
+        "inventory_timeout_seconds",
+        "inventory_attempts",
+        "inventory_retry_seconds",
         "mutation_timeout_seconds",
         "recovery_timeout_seconds",
         "poll_seconds",
@@ -564,7 +607,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
         initial_payload = parse_json(
-            run_command(
+            run_read_with_retries(
                 [
                     "az",
                     "aks",
@@ -575,7 +618,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "json",
                     "--only-show-errors",
                 ],
-                args.query_timeout_seconds,
+                run_command,
+                timeout_seconds=args.inventory_timeout_seconds,
+                attempts=args.inventory_attempts,
+                retry_seconds=args.inventory_retry_seconds,
             ),
             "AKS inventory",
         )
@@ -588,7 +634,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         summary["initial_failed_roles"] = [cluster.role for cluster in failed]
 
         fleet_members = parse_json(
-            run_command(
+            run_read_with_retries(
                 [
                     "az",
                     "fleet",
@@ -604,7 +650,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "json",
                     "--only-show-errors",
                 ],
-                args.query_timeout_seconds,
+                run_command,
+                timeout_seconds=args.inventory_timeout_seconds,
+                attempts=args.inventory_attempts,
+                retry_seconds=args.inventory_retry_seconds,
             ),
             "Fleet member",
         )
@@ -688,7 +737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
         final_payload = parse_json(
-            run_command(
+            run_read_with_retries(
                 [
                     "az",
                     "aks",
@@ -699,7 +748,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "json",
                     "--only-show-errors",
                 ],
-                args.query_timeout_seconds,
+                run_command,
+                timeout_seconds=args.inventory_timeout_seconds,
+                attempts=args.inventory_attempts,
+                retry_seconds=args.inventory_retry_seconds,
             ),
             "final AKS inventory",
         )
@@ -715,7 +767,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 + " ".join(cluster.role for cluster in final_failed)
             )
         final_fleet = parse_json(
-            run_command(
+            run_read_with_retries(
                 [
                     "az",
                     "fleet",
@@ -731,7 +783,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "json",
                     "--only-show-errors",
                 ],
-                args.query_timeout_seconds,
+                run_command,
+                timeout_seconds=args.inventory_timeout_seconds,
+                attempts=args.inventory_attempts,
+                retry_seconds=args.inventory_retry_seconds,
             ),
             "final Fleet member",
         )
