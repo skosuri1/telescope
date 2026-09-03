@@ -167,6 +167,21 @@ def test_load_baseline_rejects_desired_state_digest_drift(tmp_path):
         verify.load_baseline(str(baseline_dir), "run-id", 2, 2)
 
 
+def test_load_baseline_rejects_extra_desired_state_file(tmp_path):
+    baseline_dir, _ = _write_baseline(tmp_path)
+    extra = baseline_dir / "desired-state" / "mesh-1" / "extra.yaml"
+    extra.write_text("extra\n", encoding="utf-8")
+    baseline_path = baseline_dir / "baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["clusters"][0]["desired_state_sha256"] = verify.capture.file_digests(
+        str(extra.parent)
+    )
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+    with pytest.raises(verify.VerificationError, match="files are not exact"):
+        verify.load_baseline(str(baseline_dir), "run-id", 2, 2)
+
+
 def test_pre_boundary_requires_every_uid_to_survive(tmp_path):
     baseline_dir, rows = _write_baseline(tmp_path)
     _, by_role = verify.load_baseline(str(baseline_dir), "run-id", 2, 2)
