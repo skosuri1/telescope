@@ -167,13 +167,14 @@ def validate_resource_group(
             )
 
 
-def _pool_is_stable(pool: object) -> bool:
+def _pool_is_quiescent(pool: object, *, allow_failed: bool) -> bool:
     if not isinstance(pool, dict):
         return False
     power = pool.get("powerState")
     power_state = power.get("code") if isinstance(power, dict) else power
+    allowed_states = ("Succeeded", "Failed") if allow_failed else ("Succeeded",)
     return (
-        pool.get("provisioningState") == "Succeeded"
+        pool.get("provisioningState") in allowed_states
         and power_state in (None, "", "Running")
     )
 
@@ -243,9 +244,12 @@ def validate_cluster_inventory(
             raise ReconcileError(f"{role}: node resource group is missing")
         pools = row.get("agentPoolProfiles")
         if not isinstance(pools, list) or not pools or not all(
-            _pool_is_stable(pool) for pool in pools
+            _pool_is_quiescent(pool, allow_failed=state == "Failed")
+            for pool in pools
         ):
-            raise ReconcileError(f"{role}: one or more node pools are not stable")
+            raise ReconcileError(
+                f"{role}: one or more node pools are not safely quiescent"
+            )
         seen_names.add(name)
         role_numbers.append(number)
         clusters.append(

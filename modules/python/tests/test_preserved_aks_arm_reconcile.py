@@ -24,7 +24,7 @@ sys.modules[MODULE_SPEC.name] = arm
 MODULE_SPEC.loader.exec_module(arm)
 
 
-def cluster_row(number, state="Succeeded"):
+def cluster_row(number, state="Succeeded", pool_state="Succeeded"):
     return {
         "id": (
             "/subscriptions/s/resourceGroups/12345-deadbeef/providers/"
@@ -47,7 +47,7 @@ def cluster_row(number, state="Succeeded"):
             {
                 "name": "default",
                 "powerState": {"code": "Running"},
-                "provisioningState": "Succeeded",
+                "provisioningState": pool_state,
             }
         ],
     }
@@ -125,6 +125,32 @@ def test_inventory_accepts_only_bounded_failed_clusters():
 
     assert [cluster.role for cluster in clusters] == ["mesh-1", "mesh-2"]
     assert [cluster.role for cluster in failed] == ["mesh-2"]
+
+
+def test_failed_cluster_allows_quiescent_failed_pool_state():
+    _, failed = arm.validate_cluster_inventory(
+        [cluster_row(1), cluster_row(2, "Failed", "Failed")],
+        expected_count=2,
+        region="eastus2euap",
+        max_repair_clusters=1,
+    )
+    assert [cluster.role for cluster in failed] == ["mesh-2"]
+
+    with pytest.raises(arm.ReconcileError, match="not safely quiescent"):
+        arm.validate_cluster_inventory(
+            [cluster_row(1), cluster_row(2, "Failed", "Updating")],
+            expected_count=2,
+            region="eastus2euap",
+            max_repair_clusters=1,
+        )
+
+    with pytest.raises(arm.ReconcileError, match="not safely quiescent"):
+        arm.validate_cluster_inventory(
+            [cluster_row(1, "Succeeded", "Failed"), cluster_row(2)],
+            expected_count=2,
+            region="eastus2euap",
+            max_repair_clusters=1,
+        )
 
 
 def test_inventory_rejects_active_operations_and_excess_failures():
