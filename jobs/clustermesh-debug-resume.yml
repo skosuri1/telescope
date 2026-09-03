@@ -61,6 +61,9 @@ parameters:
 - name: mock_preservation_baseline_build_id
   type: number
   default: 0
+- name: mock_preservation_verification_build_id
+  type: number
+  default: 0
 
 jobs:
 - job: azure
@@ -82,13 +85,59 @@ jobs:
       credential_type: ${{ parameters.credential_type }}
       ssh_key_enabled: false
 
+  - ${{ if or(eq(parameters.mock_preservation_mode, 'verify'), and(parameters.run_workload, eq(parameters.mock_preservation_mode, 'none'), eq(parameters.topology, 'clustermesh-scale-mock'))) }}:
+    - script: |
+        set -euo pipefail
+        baseline_dir="$(Pipeline.Workspace)/n100-kwok-baseline"
+        rm -rf "$baseline_dir"
+        rm -rf "$(Pipeline.Workspace)/n100-kwok-verification-input"
+        if [ "$BASELINE_BUILD_ID" -le 0 ]; then
+          echo "##vso[task.logissue type=error;] scaleDebugKwokBaselineBuildId must be a positive build ID."
+          exit 1
+        fi
+        if [ "${RUN_WORKLOAD,,}" = "true" ] &&
+          [ "$PRESERVATION_MODE" = "none" ] &&
+          [ "$VERIFICATION_BUILD_ID" -le 0 ]; then
+          echo "##vso[task.logissue type=error;] scaleDebugKwokVerificationBuildId must be a positive build ID for workload mode."
+          exit 1
+        fi
+      displayName: "Prepare preserved n100 KWOK artifact handoff"
+      env:
+        BASELINE_BUILD_ID: "${{ parameters.mock_preservation_baseline_build_id }}"
+        VERIFICATION_BUILD_ID: "${{ parameters.mock_preservation_verification_build_id }}"
+        RUN_WORKLOAD: "${{ parameters.run_workload }}"
+        PRESERVATION_MODE: ${{ parameters.mock_preservation_mode }}
+
+    - task: DownloadPipelineArtifact@2
+      displayName: "Download preserved n100 KWOK baseline"
+      inputs:
+        buildType: specific
+        project: $(System.TeamProjectId)
+        definition: $(System.DefinitionId)
+        specificBuildWithTriggering: false
+        buildVersionToDownload: specific
+        pipelineId: ${{ parameters.mock_preservation_baseline_build_id }}
+        artifactName: n100-kwok-preservation-${{ parameters.mock_preservation_baseline_build_id }}
+        targetPath: $(Pipeline.Workspace)/n100-kwok-baseline
+
+  - ${{ if and(parameters.run_workload, eq(parameters.mock_preservation_mode, 'none'), eq(parameters.topology, 'clustermesh-scale-mock')) }}:
+    - task: DownloadPipelineArtifact@2
+      displayName: "Download preserved n100 KWOK verification proof"
+      inputs:
+        buildType: specific
+        project: $(System.TeamProjectId)
+        definition: $(System.DefinitionId)
+        specificBuildWithTriggering: false
+        buildVersionToDownload: specific
+        pipelineId: ${{ parameters.mock_preservation_verification_build_id }}
+        artifactName: n100-kwok-verification-${{ parameters.mock_preservation_verification_build_id }}
+        targetPath: $(Pipeline.Workspace)/n100-kwok-verification-input
+
   - ${{ if eq(parameters.mock_preservation_mode, 'verify') }}:
     - script: |
         set -euo pipefail
         artifact_dir="$(Build.ArtifactStagingDirectory)/n100-kwok-verification"
-        baseline_dir="$(Pipeline.Workspace)/n100-kwok-baseline"
         mkdir -p "$artifact_dir"
-        rm -rf "$baseline_dir"
         python3 - "$artifact_dir/summary.json" "$RUN_ID" "$BASELINE_BUILD_ID" <<'PY'
         import json
         import sys
@@ -117,26 +166,10 @@ jobs:
             )
             handle.write("\n")
         PY
-        if [ "$BASELINE_BUILD_ID" -le 0 ]; then
-          echo "##vso[task.logissue type=error;] scaleDebugKwokBaselineBuildId must be a positive build ID in verify mode."
-          exit 1
-        fi
-      displayName: "Prepare preserved n100 KWOK verification"
+      displayName: "Prepare preserved n100 KWOK verification evidence"
       env:
         RUN_ID: ${{ parameters.target_run_id }}
         BASELINE_BUILD_ID: "${{ parameters.mock_preservation_baseline_build_id }}"
-
-    - task: DownloadPipelineArtifact@2
-      displayName: "Download preserved n100 KWOK baseline"
-      inputs:
-        buildType: specific
-        project: $(System.TeamProjectId)
-        definition: $(System.DefinitionId)
-        specificBuildWithTriggering: false
-        buildVersionToDownload: specific
-        pipelineId: ${{ parameters.mock_preservation_baseline_build_id }}
-        artifactName: n100-kwok-preservation-${{ parameters.mock_preservation_baseline_build_id }}
-        targetPath: $(Pipeline.Workspace)/n100-kwok-baseline
 
   - script: |
       set -euo pipefail
@@ -387,6 +420,14 @@ jobs:
         regions:
         - ${{ parameters.region }}
         engine_input: ${{ parameters.engine_input }}
+        mock_handoff_enabled: ${{ eq(parameters.topology, 'clustermesh-scale-mock') }}
+        mock_handoff_run_id: ${{ parameters.target_run_id }}
+        mock_handoff_baseline_build_id: ${{ parameters.mock_preservation_baseline_build_id }}
+        mock_handoff_verification_build_id: ${{ parameters.mock_preservation_verification_build_id }}
+        mock_handoff_expected_subscription_id: ${{ parameters.expected_subscription_id }}
+        mock_handoff_expected_cluster_count: ${{ parameters.expected_cluster_count }}
+        mock_handoff_expected_mock_count: 100
+        mock_handoff_expected_pool_count: ${{ parameters.expected_pool_count }}
 
   - ${{ if and(parameters.run_workload, parameters.publish_results, eq(parameters.mock_preservation_mode, 'none')) }}:
     - template: /steps/publish-results.yml

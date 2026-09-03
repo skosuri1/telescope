@@ -62,6 +62,9 @@ parameters:
   - name: scaleDebugKwokBaselineBuildId
     type: number
     default: 78812
+  - name: scaleDebugKwokVerificationBuildId
+    type: number
+    default: 78851
 
 pool: AKS-Telescope-Airlock
 
@@ -2890,6 +2893,8 @@ stages:
       MOCK_CAPTURE_CONCURRENCY: "8"
       MOCK_VERIFY_CONCURRENCY: "8"
       MOCK_RECONCILE_CONCURRENCY: "8"
+      MOCK_HANDOFF_CONCURRENCY: "8"
+      MOCK_HANDOFF_RECONCILE_CONCURRENCY: "12"
       CL2_PROMETHEUS_MEMORY_LIMIT_GI: "16"
       CL2_ACNS_TELEMETRY_ENABLED: "true"
       CL2_ACCEPT_CILIUM_POLICY_GAP: "true"
@@ -3014,6 +3019,7 @@ stages:
           publish_results: ${{ parameters.scaleDebugRunWorkload }}
           mock_preservation_mode: ${{ parameters.scaleDebugKwokPreservationMode }}
           mock_preservation_baseline_build_id: ${{ parameters.scaleDebugKwokBaselineBuildId }}
+          mock_preservation_verification_build_id: ${{ parameters.scaleDebugKwokVerificationBuildId }}
           manifest_subdir: scale-resume
           target_run_id: ${{ parameters.debugTargetRunId }}
           ${{ if eq(parameters.debugMode, 'resume-existing') }}:

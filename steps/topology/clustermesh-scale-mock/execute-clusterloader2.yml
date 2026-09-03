@@ -8,6 +8,30 @@ parameters:
   - name: regions
     type: object
     default: {}
+  - name: mock_handoff_enabled
+    type: boolean
+    default: false
+  - name: mock_handoff_run_id
+    type: string
+    default: ""
+  - name: mock_handoff_baseline_build_id
+    type: number
+    default: 0
+  - name: mock_handoff_verification_build_id
+    type: number
+    default: 0
+  - name: mock_handoff_expected_subscription_id
+    type: string
+    default: ""
+  - name: mock_handoff_expected_cluster_count
+    type: number
+    default: 100
+  - name: mock_handoff_expected_mock_count
+    type: number
+    default: 100
+  - name: mock_handoff_expected_pool_count
+    type: number
+    default: 201
 
 # Configure managed telemetry first because it mutates each AKS cluster through
 # `az aks update`. Required platform metrics must already be streaming before
@@ -23,11 +47,23 @@ steps:
     parameters:
       cloud: ${{ parameters.cloud }}
 
-  - template: /steps/topology/clustermesh-scale-mock/deploy-mock-layer.yml@self
-    parameters:
-      cloud: ${{ parameters.cloud }}
-      engine: clusterloader2
-      regions: ${{ parameters.regions }}
+  - ${{ if parameters.mock_handoff_enabled }}:
+      - template: /steps/topology/clustermesh-scale-mock/verified-workload-handoff.yml@self
+        parameters:
+          run_id: ${{ parameters.mock_handoff_run_id }}
+          baseline_build_id: ${{ parameters.mock_handoff_baseline_build_id }}
+          verification_build_id: ${{ parameters.mock_handoff_verification_build_id }}
+          expected_subscription_id: ${{ parameters.mock_handoff_expected_subscription_id }}
+          expected_cluster_count: ${{ parameters.mock_handoff_expected_cluster_count }}
+          expected_mock_count: ${{ parameters.mock_handoff_expected_mock_count }}
+          expected_pool_count: ${{ parameters.mock_handoff_expected_pool_count }}
+
+  - ${{ if not(parameters.mock_handoff_enabled) }}:
+      - template: /steps/topology/clustermesh-scale-mock/deploy-mock-layer.yml@self
+        parameters:
+          cloud: ${{ parameters.cloud }}
+          engine: clusterloader2
+          regions: ${{ parameters.regions }}
 
   - template: /steps/engine/clusterloader2/clustermesh-scale/execute.yml@self
     parameters:

@@ -47,6 +47,29 @@ MOCK_VERIFY_SCRIPT = (
     / "clustermesh-scale"
     / "preserved_mock_verify.py"
 )
+MOCK_HANDOFF_SCRIPT = (
+    REPOSITORY_ROOT
+    / "modules"
+    / "python"
+    / "clusterloader2"
+    / "clustermesh-scale"
+    / "preserved_mock_handoff.py"
+)
+MOCK_HANDOFF_TEMPLATE_PATH = (
+    REPOSITORY_ROOT
+    / "steps"
+    / "topology"
+    / "clustermesh-scale-mock"
+    / "verified-workload-handoff.yml"
+)
+MOCK_EXECUTE_TEMPLATE_PATH = (
+    REPOSITORY_ROOT
+    / "steps"
+    / "topology"
+    / "clustermesh-scale-mock"
+    / "execute-clusterloader2.yml"
+)
+EXECUTE_TESTS_PATH = REPOSITORY_ROOT / "steps" / "execute-tests.yml"
 LIVE_OVERLAY_SCRIPT = (
     REPOSITORY_ROOT
     / "modules"
@@ -262,6 +285,8 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "- name: scaleDebugKwokPreservationMode" in pipeline
     assert "- name: scaleDebugKwokBaselineBuildId" in pipeline
     assert "default: 78812" in pipeline
+    assert "- name: scaleDebugKwokVerificationBuildId" in pipeline
+    assert "default: 78851" in pipeline
     assert "- verify" in pipeline
 
     assert "CLUSTERMESH_DEBUG_MODE'], 'fresh-preserve'" in fresh
@@ -318,6 +343,7 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "parameters.scaleDebugRunWorkload" in resume
     assert "parameters.scaleDebugKwokPreservationMode" in resume
     assert "parameters.scaleDebugKwokBaselineBuildId" in resume
+    assert "parameters.scaleDebugKwokVerificationBuildId" in resume
     assert 'cl2_prom_snapshot_storage_account: "cmshscaleprom"' in resume
     assert 'AKS_AMW_CLUSTERS_PER_WORKSPACE: "1"' in resume
     assert 'AKS_AMW_FORCE_SHARD_NAMING: "true"' in resume
@@ -399,11 +425,13 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     )
     assert "mock_preservation_mode" in resume
     assert "mock_preservation_baseline_build_id" in resume
+    assert "mock_preservation_verification_build_id" in resume
     assert "preserved_mock_capture.py" in resume
     assert "Capture preserved n100 KWOK baseline" in resume
     assert "Publish preserved n100 KWOK baseline" in resume
     assert "DownloadPipelineArtifact@2" in resume
     assert "Download preserved n100 KWOK baseline" in resume
+    assert "Download preserved n100 KWOK verification proof" in resume
     assert "buildVersionToDownload: specific" in resume
     assert resume.count("/steps/validate-resources.yml") == 1
     assert resume.index("Download preserved n100 KWOK baseline") < resume.index(
@@ -423,6 +451,9 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     assert 'CLUSTERMESH_CROSS_CLUSTER_SMOKE_ENABLED: "true"' in resume
     assert "Finalize incomplete preserved n100 KWOK verification evidence" in resume
     assert "pipeline_failed_before_verification_completion" in resume
+    assert "mock_handoff_enabled:" in resume
+    assert "mock_handoff_run_id:" in resume
+    assert "mock_handoff_verification_build_id:" in resume
     assert resume.count("--fault-role") == 5
     assert "--fault-role mesh-1" in resume
     assert "--fault-role mesh-100" in resume
@@ -634,6 +665,52 @@ def test_n100_kwok_verifier_is_bounded_and_does_not_run_workloads():
     assert "condition: always()" in resume[
         resume.index('displayName: "Publish preserved n100 KWOK verification"') :
     ]
+
+
+def test_n100_workload_handoff_requires_verified_artifacts_before_execute():
+    resume = RESUME_JOB_PATH.read_text(encoding="utf-8")
+    handoff = MOCK_HANDOFF_SCRIPT.read_text(encoding="utf-8")
+    handoff_template = MOCK_HANDOFF_TEMPLATE_PATH.read_text(encoding="utf-8")
+    mock_execute = MOCK_EXECUTE_TEMPLATE_PATH.read_text(encoding="utf-8")
+    execute_tests = EXECUTE_TESTS_PATH.read_text(encoding="utf-8")
+
+    assert (
+        "or(eq(parameters.mock_preservation_mode, 'verify'), "
+        "and(parameters.run_workload, "
+        "eq(parameters.mock_preservation_mode, 'none'), "
+        "eq(parameters.topology, 'clustermesh-scale-mock')))"
+        in resume
+    )
+    assert "n100-kwok-preservation-" in resume
+    assert "n100-kwok-verification-" in resume
+    assert "validate_verification_artifact" in handoff
+    assert "restore_state" in handoff
+    assert "run_reconciler" in handoff
+    assert "validate_platform_state" in handoff
+    assert "capture_live" in handoff
+    assert "attempts=10" in handoff
+    assert "settle_seconds=30" in handoff
+    assert "workloads_started" in handoff
+    assert "mock_redeployed" in handoff
+    assert "desired_state_files_restored" in handoff
+    assert "Restore verified n100 KWOK state before workloads" in handoff_template
+    assert "Validate post-telemetry n100 workload data path" in handoff_template
+    assert "Finalize incomplete n100 workload handoff evidence" in handoff_template
+    assert "Publish n100 workload handoff" in handoff_template
+    assert "pipeline_failed_before_workload_handoff_completion" in handoff_template
+    assert 'CLUSTERMESH_CROSS_CLUSTER_SMOKE_ENABLED: "true"' in handoff_template
+    assert "- name: mock_handoff_enabled" in mock_execute
+    assert "${{ if parameters.mock_handoff_enabled }}:" in mock_execute
+    assert "${{ if not(parameters.mock_handoff_enabled) }}:" in mock_execute
+    handoff_pos = mock_execute.index("verified-workload-handoff.yml")
+    deploy_pos = mock_execute.index("deploy-mock-layer.yml")
+    engine_pos = mock_execute.index(
+        "/steps/engine/clusterloader2/clustermesh-scale/execute.yml"
+    )
+    assert handoff_pos < engine_pos
+    assert deploy_pos < engine_pos
+    assert "mock_handoff_enabled" in execute_tests
+    assert "eq(parameters.topology, 'clustermesh-scale-mock')" in execute_tests
 
 
 def test_preserved_resume_repair_is_bounded_and_non_destructive():

@@ -564,6 +564,8 @@ def test_mock_layer_is_deployed_after_managed_telemetry_configuration():
     execute = MOCK_EXECUTE_TEMPLATE_PATH.read_text(encoding="utf-8")
 
     assert "deploy-mock-layer.yml" not in validate
+    assert "- name: mock_handoff_enabled" in execute
+    assert "${{ if not(parameters.mock_handoff_enabled) }}:" in execute
     configure_pos = execute.index("configure-control-plane-metrics.yml")
     qualify_pos = execute.index("qualify-platform-metrics.yml")
     deploy_pos = execute.index("deploy-mock-layer.yml")

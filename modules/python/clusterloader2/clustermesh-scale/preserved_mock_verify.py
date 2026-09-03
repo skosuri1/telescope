@@ -29,6 +29,16 @@ class VerificationError(Exception):
 
 
 Runner = Callable[[Sequence[str], int], str]
+EXPECTED_STATE_FILES = {
+    "agent-controller.yaml",
+    "agents.yaml",
+    "metadata.json",
+    "nodes.yaml",
+    "support/kwok-apf.yaml",
+    "support/kwok-controller.yaml",
+    "support/rbac.yaml",
+    "support/stage-fast.yaml",
+}
 
 
 def utc_now() -> str:
@@ -141,6 +151,13 @@ def validate_state_tree(
             raise VerificationError(
                 f"{role}: unable to hash desired-state files: {exc}"
             ) from exc
+        if set(digests) != EXPECTED_STATE_FILES:
+            missing = sorted(EXPECTED_STATE_FILES - set(digests))
+            extra = sorted(set(digests) - EXPECTED_STATE_FILES)
+            raise VerificationError(
+                f"{role}: desired-state files are not exact: "
+                f"missing={missing} extra={extra}"
+            )
         if digests != baseline_row["desired_state_sha256"]:
             raise VerificationError(f"{role}: desired-state SHA-256 map changed")
 
@@ -666,6 +683,9 @@ def run_reconciler(
     artifact_dir: str,
     max_concurrent: int,
     timeout_seconds: int,
+    attempts: int = 6,
+    settle_seconds: int = 15,
+    request_timeout_seconds: int = 45,
 ) -> dict:
     """Run the exact bounded reconciler and validate its summary."""
 
@@ -689,11 +709,11 @@ def run_reconciler(
         "--max-concurrent",
         str(max_concurrent),
         "--attempts",
-        "6",
+        str(attempts),
         "--settle-seconds",
-        "15",
+        str(settle_seconds),
         "--request-timeout-seconds",
-        "45",
+        str(request_timeout_seconds),
     ]
     try:
         completed = subprocess.run(

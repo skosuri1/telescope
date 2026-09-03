@@ -1,0 +1,156 @@
+parameters:
+  - name: run_id
+    type: string
+  - name: baseline_build_id
+    type: number
+  - name: verification_build_id
+    type: number
+  - name: expected_subscription_id
+    type: string
+  - name: expected_cluster_count
+    type: number
+    default: 100
+  - name: expected_mock_count
+    type: number
+    default: 100
+  - name: expected_pool_count
+    type: number
+    default: 201
+
+steps:
+  - script: |
+      set -euo pipefail
+      artifact_dir="$(Build.ArtifactStagingDirectory)/n100-workload-handoff"
+      python3 "$PRESERVED_MOCK_HANDOFF" \
+        --baseline-dir "$(Pipeline.Workspace)/n100-kwok-baseline" \
+        --baseline-build-id "${{ parameters.baseline_build_id }}" \
+        --verification-dir "$(Pipeline.Workspace)/n100-kwok-verification-input" \
+        --verification-build-id "${{ parameters.verification_build_id }}" \
+        --clusters "$HOME/.kube/clustermesh-clusters.json" \
+        --state-root "$HOME/.kube/mock-layer-state/$RUN_ID" \
+        --artifact-dir "$artifact_dir" \
+        --reconciler "$MOCK_LAYER_RECONCILER" \
+        --run-id "$RUN_ID" \
+        --expected-subscription-id "${{ parameters.expected_subscription_id }}" \
+        --expected-cluster-count "${{ parameters.expected_cluster_count }}" \
+        --expected-mock-count "${{ parameters.expected_mock_count }}" \
+        --expected-pool-count "${{ parameters.expected_pool_count }}" \
+        --max-concurrent "${MOCK_HANDOFF_CONCURRENCY:-8}" \
+        --reconcile-concurrent "${MOCK_HANDOFF_RECONCILE_CONCURRENCY:-12}"
+    displayName: "Restore verified n100 KWOK state before workloads"
+    env:
+      PRESERVED_MOCK_HANDOFF: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_mock_handoff.py
+      MOCK_LAYER_RECONCILER: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/mock_layer_reconcile.py
+      RUN_ID: ${{ parameters.run_id }}
+
+  - script: |
+      set -euo pipefail
+      summary="$(Build.ArtifactStagingDirectory)/n100-workload-handoff/summary.json"
+      set +e
+      bash "$(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/cross-cluster-smoke.sh"
+      smoke_rc=$?
+      set -e
+      python3 - "$summary" "$smoke_rc" <<'PY'
+      import json
+      import os
+      import sys
+      from datetime import datetime, timezone
+
+      path = sys.argv[1]
+      smoke_rc = int(sys.argv[2])
+      with open(path, encoding="utf-8") as handle:
+          payload = json.load(handle)
+      if payload.get("handoff_validation_healthy") is not True:
+          raise SystemExit("workload handoff validation did not complete")
+      payload.update(
+          {
+              "finished_at": datetime.now(timezone.utc).strftime(
+                  "%Y-%m-%dT%H:%M:%SZ"
+              ),
+              "healthy": smoke_rc == 0,
+              "cross_cluster_data_path_valid": smoke_rc == 0,
+              "stage": (
+                  "complete"
+                  if smoke_rc == 0
+                  else "cross_cluster_data_path_failed"
+              ),
+          }
+      )
+      if smoke_rc != 0:
+          payload["fatal_error"] = (
+              f"cross-cluster data-path smoke exited with code {smoke_rc}"
+          )
+      temporary = f"{path}.tmp"
+      with open(temporary, "w", encoding="utf-8") as handle:
+          json.dump(payload, handle, indent=2, sort_keys=True)
+          handle.write("\n")
+      os.replace(temporary, path)
+      PY
+      if [ "$smoke_rc" -ne 0 ]; then
+        exit "$smoke_rc"
+      fi
+    displayName: "Validate post-telemetry n100 workload data path"
+    env:
+      CLUSTERMESH_CROSS_CLUSTER_SMOKE_ENABLED: "true"
+
+  - script: |
+      set -euo pipefail
+      artifact_dir="$(Build.ArtifactStagingDirectory)/n100-workload-handoff"
+      summary="$artifact_dir/summary.json"
+      mkdir -p "$artifact_dir"
+      python3 - "$summary" "$RUN_ID" "$BASELINE_BUILD_ID" "$VERIFICATION_BUILD_ID" <<'PY'
+      import json
+      import os
+      import sys
+      from datetime import datetime, timezone
+
+      path, run_id, baseline_build_id, verification_build_id = sys.argv[1:]
+      now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+      if os.path.isfile(path):
+          with open(path, encoding="utf-8") as handle:
+              payload = json.load(handle)
+      else:
+          payload = {
+              "schema_version": 1,
+              "started_at": None,
+              "healthy": False,
+              "handoff_validation_healthy": False,
+              "cross_cluster_data_path_valid": False,
+              "run_id": run_id,
+              "baseline_build_id": int(baseline_build_id),
+              "verification_build_id": int(verification_build_id),
+              "workloads_started": False,
+              "mock_redeployed": False,
+          }
+      if payload.get("finished_at") is None:
+          payload.update(
+              {
+                  "finished_at": now,
+                  "healthy": False,
+                  "stage": "pipeline_failed_before_workload_handoff_completion",
+                  "fatal_error": payload.get("fatal_error")
+                  or (
+                      "pipeline failed before workload handoff completed; "
+                      "inspect preceding task logs"
+                  ),
+              }
+          )
+      temporary = f"{path}.tmp"
+      with open(temporary, "w", encoding="utf-8") as handle:
+          json.dump(payload, handle, indent=2, sort_keys=True)
+          handle.write("\n")
+      os.replace(temporary, path)
+      PY
+    displayName: "Finalize incomplete n100 workload handoff evidence"
+    condition: always()
+    env:
+      RUN_ID: ${{ parameters.run_id }}
+      BASELINE_BUILD_ID: "${{ parameters.baseline_build_id }}"
+      VERIFICATION_BUILD_ID: "${{ parameters.verification_build_id }}"
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish n100 workload handoff"
+    condition: always()
+    inputs:
+      targetPath: $(Build.ArtifactStagingDirectory)/n100-workload-handoff
+      artifact: n100-workload-handoff-$(Build.BuildId)

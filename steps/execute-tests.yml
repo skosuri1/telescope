@@ -11,6 +11,30 @@ parameters:
 - name: regions
   type: object
   default: {}
+- name: mock_handoff_enabled
+  type: boolean
+  default: false
+- name: mock_handoff_run_id
+  type: string
+  default: ""
+- name: mock_handoff_baseline_build_id
+  type: number
+  default: 0
+- name: mock_handoff_verification_build_id
+  type: number
+  default: 0
+- name: mock_handoff_expected_subscription_id
+  type: string
+  default: ""
+- name: mock_handoff_expected_cluster_count
+  type: number
+  default: 100
+- name: mock_handoff_expected_mock_count
+  type: number
+  default: 100
+- name: mock_handoff_expected_pool_count
+  type: number
+  default: 201
 
 steps:
 - template: /steps/topology/${{ parameters.topology }}/execute-${{ parameters.engine }}.yml@self
@@ -18,3 +42,12 @@ steps:
     cloud: ${{ parameters.cloud }}
     engine_input: ${{ parameters.engine_input }}
     regions: ${{ parameters.regions }}
+    ${{ if eq(parameters.topology, 'clustermesh-scale-mock') }}:
+      mock_handoff_enabled: ${{ parameters.mock_handoff_enabled }}
+      mock_handoff_run_id: ${{ parameters.mock_handoff_run_id }}
+      mock_handoff_baseline_build_id: ${{ parameters.mock_handoff_baseline_build_id }}
+      mock_handoff_verification_build_id: ${{ parameters.mock_handoff_verification_build_id }}
+      mock_handoff_expected_subscription_id: ${{ parameters.mock_handoff_expected_subscription_id }}
+      mock_handoff_expected_cluster_count: ${{ parameters.mock_handoff_expected_cluster_count }}
+      mock_handoff_expected_mock_count: ${{ parameters.mock_handoff_expected_mock_count }}
+      mock_handoff_expected_pool_count: ${{ parameters.mock_handoff_expected_pool_count }}
