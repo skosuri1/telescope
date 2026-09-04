@@ -6,6 +6,7 @@ import stat
 import subprocess
 import tarfile
 import textwrap
+import time
 from pathlib import Path
 
 import yaml
@@ -391,7 +392,7 @@ def test_configure_batches_two_cluster_workspaces_and_maps_manifest(tmp_path):
               fi
               exit 0
             elif [ "${1:-} ${2:-}" = "aks show" ]; then
-              echo true
+              echo '{"provisioningState":"Succeeded","azureMonitorProfile":{"metrics":{"enabled":true,"controlPlane":{"enabled":true}}}}'
             elif [ "${1:-} ${2:-}" = "resource show" ]; then
               echo Succeeded
             elif [ "${1:-}" = "rest" ]; then
@@ -522,7 +523,7 @@ def test_configure_batches_two_cluster_workspaces_and_maps_manifest(tmp_path):
     ) == 1
     assert az_log.read_text(encoding="utf-8").count(
         "resource show --ids"
-    ) == 2
+    ) == 4
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == 2
     assert len(manifest["workspaces"]) == 2
@@ -1983,6 +1984,24 @@ def _write_rotation_fake_az(fake_bin: Path) -> None:
             JSON
               fi
             elif [ "${1:-} ${2:-}" = "resource show" ]; then
+              resource_ids=$(arg_value --ids "$@")
+              if [[ "$resource_ids" == *"/Microsoft.KubernetesConfiguration/extensions/"* ]]; then
+                if [ -n "${FAKE_EXTENSION_SLEEP_SECONDS:-}" ]; then
+                  sleep "$FAKE_EXTENSION_SLEEP_SECONDS"
+                fi
+                if [ "${FAKE_EXTENSION_FAIL_AFTER_SUCCEEDED:-false}" = "true" ]; then
+                  count=$(( $(cat "$EXTENSION_STATE_FILE" 2>/dev/null || echo 0) + 1 ))
+                  echo "$count" > "$EXTENSION_STATE_FILE"
+                  if [ "$count" -eq 1 ]; then
+                    echo Succeeded
+                  else
+                    echo Failed
+                  fi
+                else
+                  echo Succeeded
+                fi
+                exit 0
+              fi
               # Fresh, unattached Azure Monitor workspaces may never emit an
               # ActiveTimeSeriesLimit/EventsPerMinuteIngestedLimit metric
               # sample, so the real script verifies the requested ingestion
@@ -1990,7 +2009,6 @@ def _write_rotation_fake_az(fake_bin: Path) -> None:
               # resource directly instead. Simulate that here, including
               # optional query failures and delayed convergence, driven by
               # LIMITS_FILE.
-              resource_ids=$(arg_value --ids "$@")
               name=$(echo "$resource_ids" | sed -E 's#.*/accounts/([^/]+)/metricsContainers/default$#\\1#')
               if [ -n "${LIMITS_FILE:-}" ] && [ -s "$LIMITS_FILE" ]; then
                 query_fails=$(jq -r --arg name "$name" '.[$name].fail // false' "$LIMITS_FILE")
@@ -2023,7 +2041,17 @@ def _write_rotation_fake_az(fake_bin: Path) -> None:
               method=$(arg_value --method "$@")
               url=$(arg_value --url "$@")
               if [[ "$url" == *"/dataCollectionRuleAssociations?"* ]]; then
-                if [ "${FAKE_EXISTING_DCR:-false}" = "true" ]; then
+                if [ "${FAKE_ASSOCIATION_PERMANENT_ERROR:-false}" = "true" ]; then
+                  echo 'BadRequest correlationId=03f502aa-not-transient' >&2
+                  exit 1
+                elif [ "${FAKE_ASSOCIATION_503_ONCE:-false}" = "true" ] &&
+                   [ ! -f "$ASSOCIATION_STATE_FILE" ]; then
+                  touch "$ASSOCIATION_STATE_FILE"
+                  echo '<html><title>Service Unavailable</title></html>' >&2
+                  exit 1
+                fi
+                if [ "${FAKE_EXISTING_DCR:-false}" = "true" ] ||
+                   [ -f "$AKS_UPDATE_STATE_FILE" ]; then
                   cluster=$(echo "$url" | sed -E 's#.*managedClusters/([^/]+)/providers/.*#\\1#')
                   dcr_name="MSProm-eastus2euap-$cluster"
                   jq -n --arg dcr "/subscriptions/sub-1/resourceGroups/run-rg/providers/Microsoft.Insights/dataCollectionRules/$dcr_name" \
@@ -2097,6 +2125,18 @@ def _write_rotation_fake_az(fake_bin: Path) -> None:
               mkdir -p "$(dirname "$file")"
               touch "$file"
             elif [ "${1:-} ${2:-}" = "aks update" ]; then
+              if [ "${FAKE_AKS_UPDATE_FORCED_TIMEOUT_UNACCEPTED:-false}" = "true" ]; then
+                exit 137
+              elif [ "${FAKE_AKS_UPDATE_FORCED_TIMEOUT:-false}" = "true" ] &&
+                 [ ! -f "$AKS_UPDATE_STATE_FILE" ]; then
+                touch "$AKS_UPDATE_STATE_FILE"
+                exit 137
+              elif [ "${FAKE_AKS_UPDATE_LOST_RESPONSE:-false}" = "true" ] &&
+                 [ ! -f "$AKS_UPDATE_STATE_FILE" ]; then
+                touch "$AKS_UPDATE_STATE_FILE"
+                echo 'Service Unavailable after request acceptance' >&2
+                exit 1
+              fi
               if [ -n "${CAPACITY_AFTER_AKS_UPDATE:-}" ]; then
                 tmp=$(mktemp)
                 jq --argjson value "$CAPACITY_AFTER_AKS_UPDATE" \
@@ -2106,7 +2146,31 @@ def _write_rotation_fake_az(fake_bin: Path) -> None:
               fi
               exit 0
             elif [ "${1:-} ${2:-}" = "aks show" ]; then
-              echo true
+              if [ -n "${FAKE_AKS_PROFILE_SLEEP_SECONDS:-}" ]; then
+                sleep "$FAKE_AKS_PROFILE_SLEEP_SECONDS"
+              fi
+              if [ "${FAKE_AKS_PROFILE_PERMANENT_ERROR:-false}" = "true" ]; then
+                echo 'AuthorizationFailed: caller cannot read managed cluster' >&2
+                exit 1
+              elif [ "${FAKE_AKS_PROFILE_UPDATING_THEN_FAILED:-false}" = "true" ]; then
+                count=$(( $(cat "$AKS_PROFILE_STATE_FILE" 2>/dev/null || echo 0) + 1 ))
+                echo "$count" > "$AKS_PROFILE_STATE_FILE"
+                if [ "$count" -le 2 ]; then
+                  echo '{"provisioningState":"Updating","azureMonitorProfile":{"metrics":{"enabled":true,"controlPlane":{"enabled":true}}}}'
+                else
+                  echo '{"provisioningState":"Failed","azureMonitorProfile":{"metrics":{"enabled":true,"controlPlane":{"enabled":true}}}}'
+                fi
+              elif [ "${FAKE_AKS_UPDATE_LOST_RESPONSE:-false}" = "true" ]; then
+                count=$(( $(cat "$AKS_PROFILE_STATE_FILE" 2>/dev/null || echo 0) + 1 ))
+                echo "$count" > "$AKS_PROFILE_STATE_FILE"
+                if [ "$count" -eq 1 ]; then
+                  echo '{"provisioningState":"Updating","azureMonitorProfile":{"metrics":{"enabled":false,"controlPlane":{"enabled":false}}}}'
+                else
+                  echo '{"provisioningState":"Succeeded","azureMonitorProfile":{"metrics":{"enabled":true,"controlPlane":{"enabled":true}}}}'
+                fi
+              else
+                echo '{"provisioningState":"Succeeded","azureMonitorProfile":{"metrics":{"enabled":true,"controlPlane":{"enabled":true}}}}'
+              fi
             elif [[ " $* " == *" diagnostic-settings categories list "* ]]; then
               cat <<'JSON'
             {"value":[
@@ -2138,6 +2202,23 @@ def _write_rotation_fake_kubectl(fake_bin: Path) -> None:
               printf '%s\\n' 'apiVersion: v1' 'kind: Namespace' 'metadata:' '  name: monitoring'
             elif [ "${1:-} ${2:-} ${3:-}" = "apply -f -" ]; then
               cat >/dev/null
+            elif [[ " $* " == *" -n kube-system get configmap cilium-config -o jsonpath="* ]]; then
+              if [ -n "${FAKE_CILIUM_POLICY_READ_SLEEP_SECONDS:-}" ]; then
+                sleep "$FAKE_CILIUM_POLICY_READ_SLEEP_SECONDS"
+              fi
+              printf '%s' "${FAKE_CILIUM_POLICY:-default}"
+            elif [[ " $* " == *" -n kube-system get configmap cilium-config -o json "* ]]; then
+              if [ -n "${FAKE_CILIUM_GET_SLEEP_SECONDS:-}" ]; then
+                sleep "$FAKE_CILIUM_GET_SLEEP_SECONDS"
+              fi
+              jq -n \
+                --arg policy "${FAKE_CILIUM_POLICY:-default}" \
+                '{metadata:{resourceVersion:"10"},data:{"enable-policy":$policy}}'
+            elif [[ " $* " == *" -n kube-system get daemonset cilium -o json "* ]]; then
+              if [ -n "${FAKE_CILIUM_GET_SLEEP_SECONDS:-}" ]; then
+                sleep "$FAKE_CILIUM_GET_SLEEP_SECONDS"
+              fi
+              printf '%s\\n' '{"metadata":{"generation":3},"spec":{"template":{"metadata":{"annotations":{"cilium.io/cilium-configmap-checksum":"abc"}}}},"status":{"desiredNumberScheduled":2,"numberReady":2,"updatedNumberScheduled":2,"observedGeneration":3}}'
             else
               exit 0
             fi
@@ -2162,6 +2243,24 @@ def _write_rotation_fake_kubectl(fake_bin: Path) -> None:
         encoding="utf-8",
     )
     fake_curl.chmod(fake_curl.stat().st_mode | stat.S_IXUSR)
+    fake_mv = fake_bin / "mv"
+    fake_mv.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -euo pipefail
+            destination="${!#}"
+            if [ "${FAKE_CONVERGENCE_MV_FAILURE:-false}" = "true" ] &&
+               [[ "$destination" == *"/managed-monitoring-convergence-"* ]]; then
+              echo "simulated convergence evidence move failure" >&2
+              exit 1
+            fi
+            exec /usr/bin/mv "$@"
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_mv.chmod(fake_mv.stat().st_mode | stat.S_IXUSR)
 
 
 def _run_rotation_configure(
@@ -2219,6 +2318,9 @@ def _run_rotation_configure(
             "AKS_AMW_METRICS_QUERY_RETRY_SECONDS": "0",
             "AKS_AMW_LIMIT_VERIFY_ATTEMPTS": "1",
             "AKS_AMW_LIMIT_VERIFY_RETRY_SECONDS": "0",
+            "AKS_MANAGED_ROUTE_RETRY_SECONDS": "0",
+            "AKS_MANAGED_UPDATE_TIMEOUT_SECONDS": "5",
+            "AKS_MANAGED_UPDATE_POLL_SECONDS": "0",
             "RUN_ID": "build-123",
             "REGION": "eastus2euap",
             "CLUSTERS_FILE": str(clusters_file),
@@ -2238,6 +2340,12 @@ def _run_rotation_configure(
             "ARM_TEMPLATE_COPY": str(arm_template_copy),
             "LIMITS_ARM_TEMPLATE_COPY": str(limits_arm_template_copy),
             "DCR_STATE_DIR": str(dcr_state_dir),
+            "ASSOCIATION_STATE_FILE": str(
+                tmp_path / "association-query-failed-once"
+            ),
+            "AKS_UPDATE_STATE_FILE": str(tmp_path / "aks-update-accepted"),
+            "AKS_PROFILE_STATE_FILE": str(tmp_path / "aks-profile-count"),
+            "EXTENSION_STATE_FILE": str(tmp_path / "extension-state-count"),
             "HOME": str(tmp_path),
             "PATH": f"{fake_bin}:{environment['PATH']}",
         }
@@ -2256,6 +2364,388 @@ def _run_rotation_configure(
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     return result, manifest, workspace_dir, az_log
+
+
+def test_managed_monitoring_accepts_documented_cilium_policy_gap(tmp_path):
+    result, manifest, _, _ = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED": "true",
+            "AKS_MANAGED_MONITORING_CONVERGENCE_TIMEOUT_SECONDS": "5",
+            "AKS_MANAGED_MONITORING_CILIUM_QUIET_SECONDS": "0",
+            "AKS_MANAGED_MONITORING_POLL_SECONDS": "0",
+            "CL2_ACCEPT_CILIUM_POLICY_GAP": "true",
+            "FAKE_CILIUM_POLICY": "never",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest is not None
+    assert "accepting documented Cilium policy/L7 gap" in result.stdout
+    assert "accepted_gap=true" in result.stdout
+    assert manifest["control_plane"]["managed_monitoring_convergence"] == [
+        {
+            "role": "mesh-1",
+            "enabled": True,
+            "extension_state": "Succeeded",
+            "policy_before": "never",
+            "policy_after": "never",
+            "accepted_policy_gap": True,
+            "cilium": {
+                "desired": 2,
+                "ready": 2,
+                "updated": 2,
+                "observed_generation": 3,
+                "generation": 3,
+            },
+        }
+    ]
+
+
+def test_managed_monitoring_rejects_cilium_policy_gap_without_opt_in(tmp_path):
+    result, manifest, _, _ = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED": "true",
+            "AKS_MANAGED_MONITORING_CONVERGENCE_TIMEOUT_SECONDS": "5",
+            "AKS_MANAGED_MONITORING_CILIUM_QUIET_SECONDS": "0",
+            "AKS_MANAGED_MONITORING_POLL_SECONDS": "0",
+            "CL2_ACCEPT_CILIUM_POLICY_GAP": "false",
+            "FAKE_CILIUM_POLICY": "never",
+        },
+    )
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert "ACNS DNS L7 telemetry would be invalid" in result.stderr
+
+
+def test_managed_monitoring_manifest_ignores_stale_role_evidence(tmp_path):
+    (tmp_path / "managed-monitoring-convergence-mesh-99.json").write_text(
+        json.dumps(
+            {
+                "role": "mesh-99",
+                "enabled": True,
+                "extension_state": "Succeeded",
+                "policy_before": "never",
+                "policy_after": "never",
+                "accepted_policy_gap": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result, manifest, _, _ = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest is not None
+    assert [
+        row["role"]
+        for row in manifest["control_plane"][
+            "managed_monitoring_convergence"
+        ]
+    ] == ["mesh-1"]
+
+
+def test_managed_monitoring_evidence_write_failure_is_fatal(tmp_path):
+    stale_path = tmp_path / "managed-monitoring-convergence-mesh-1.json"
+    stale_path.write_text(
+        json.dumps(
+            {
+                "role": "mesh-1",
+                "enabled": True,
+                "extension_state": "Succeeded",
+                "policy_before": "never",
+                "policy_after": "never",
+                "accepted_policy_gap": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result, manifest, _, _ = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "FAKE_CONVERGENCE_MV_FAILURE": "true",
+        },
+    )
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert (
+        "unable to write managed-monitoring convergence evidence"
+        in result.stderr
+    )
+    assert json.loads(stale_path.read_text(encoding="utf-8"))[
+        "accepted_policy_gap"
+    ] is True
+
+
+def test_managed_monitoring_bounds_hung_extension_reads(tmp_path):
+    started = time.monotonic()
+    result, manifest, _, _ = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED": "true",
+            "AKS_MANAGED_MONITORING_CONVERGENCE_TIMEOUT_SECONDS": "2",
+            "AKS_MANAGED_MONITORING_POLL_SECONDS": "0",
+            "AKS_MANAGED_ROUTE_COMMAND_TIMEOUT_SECONDS": "1",
+            "FAKE_EXTENSION_SLEEP_SECONDS": "5",
+        },
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert elapsed < 5
+    assert "timed out waiting for managed-monitoring extension" in result.stderr
+
+
+def test_managed_monitoring_bounds_hung_cilium_reads(tmp_path):
+    started = time.monotonic()
+    result, manifest, _, _ = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED": "true",
+            "AKS_MANAGED_MONITORING_CONVERGENCE_TIMEOUT_SECONDS": "2",
+            "AKS_MANAGED_MONITORING_CILIUM_QUIET_SECONDS": "0",
+            "AKS_MANAGED_MONITORING_POLL_SECONDS": "0",
+            "AKS_MANAGED_ROUTE_COMMAND_TIMEOUT_SECONDS": "1",
+            "FAKE_CILIUM_GET_SLEEP_SECONDS": "5",
+        },
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert elapsed < 6
+    assert (
+        "timed out waiting for a stable Cilium rollout"
+        in result.stderr
+    )
+
+
+def test_managed_monitoring_revalidates_extension_before_evidence(tmp_path):
+    result, manifest, _, _ = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED": "true",
+            "AKS_MANAGED_MONITORING_CONVERGENCE_TIMEOUT_SECONDS": "5",
+            "AKS_MANAGED_MONITORING_CILIUM_QUIET_SECONDS": "0",
+            "AKS_MANAGED_MONITORING_POLL_SECONDS": "0",
+            "FAKE_EXTENSION_FAIL_AFTER_SUCCEEDED": "true",
+        },
+    )
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert (
+        "extension reached terminal state Failed during Cilium convergence"
+        in result.stderr
+    )
+
+
+def test_managed_monitoring_bounds_initial_policy_read(tmp_path):
+    started = time.monotonic()
+    result, manifest, _, _ = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_ROUTE_COMMAND_TIMEOUT_SECONDS": "1",
+            "FAKE_CILIUM_POLICY_READ_SLEEP_SECONDS": "5",
+        },
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert elapsed < 5
+    assert "unable to read the initial Cilium policy mode" in result.stderr
+
+
+def test_managed_route_recovers_from_transient_association_503(tmp_path):
+    result, manifest, _, az_log = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_ROUTE_ATTEMPTS": "2",
+            "FAKE_ASSOCIATION_503_ONCE": "true",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest is not None
+    assert "transient failure on attempt 1/2" in result.stderr
+    assert "recovered on attempt 2/2" in result.stderr
+    association_calls = [
+        line
+        for line in az_log.read_text(encoding="utf-8").splitlines()
+        if "/dataCollectionRuleAssociations?" in line
+    ]
+    assert len(association_calls) == 2
+
+
+def test_managed_route_does_not_retry_status_digits_in_correlation_id(tmp_path):
+    result, manifest, _, az_log = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_ROUTE_ATTEMPTS": "2",
+            "FAKE_ASSOCIATION_PERMANENT_ERROR": "true",
+        },
+    )
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert "failed with a non-transient error" in result.stderr
+    association_calls = [
+        line
+        for line in az_log.read_text(encoding="utf-8").splitlines()
+        if "/dataCollectionRuleAssociations?" in line
+    ]
+    assert len(association_calls) == 1
+
+
+def test_managed_route_waits_after_lost_aks_update_response(tmp_path):
+    result, manifest, _, az_log = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "FAKE_AKS_UPDATE_LOST_RESPONSE": "true",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest is not None
+    assert "ambiguous or pending-operation error" in result.stderr
+    assert "AKS managed-Prometheus update state=Updating" in result.stdout
+    assert "AKS enablement converged after attempt 1/4" in result.stdout
+    update_calls = [
+        line
+        for line in az_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("aks update")
+    ]
+    assert len(update_calls) == 1
+
+
+def test_managed_route_polls_after_forced_update_timeout(tmp_path):
+    result, manifest, _, az_log = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "FAKE_AKS_UPDATE_FORCED_TIMEOUT": "true",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest is not None
+    assert "ambiguous or pending-operation error" in result.stderr
+    update_calls = [
+        line
+        for line in az_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("aks update")
+    ]
+    assert len(update_calls) == 1
+
+
+def test_managed_route_rejects_unverified_forced_update_timeout(tmp_path):
+    result, manifest, _, az_log = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_ROUTE_ATTEMPTS": "1",
+            "AKS_MANAGED_UPDATE_TIMEOUT_SECONDS": "2",
+            "FAKE_AKS_UPDATE_FORCED_TIMEOUT_UNACCEPTED": "true",
+        },
+    )
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert "timed out waiting for the managed-Prometheus DCR association" in (
+        result.stderr
+    )
+    association_calls = [
+        line
+        for line in az_log.read_text(encoding="utf-8").splitlines()
+        if "/dataCollectionRuleAssociations?" in line
+    ]
+    assert len(association_calls) >= 2
+
+
+def test_managed_route_rejects_enabled_profile_before_terminal_success(tmp_path):
+    result, manifest, _, az_log = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "FAKE_AKS_PROFILE_UPDATING_THEN_FAILED": "true",
+        },
+    )
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert "AKS managed-Prometheus update state=Updating" in result.stdout
+    assert "reached terminal state Failed" in result.stderr
+    profile_calls = [
+        line
+        for line in az_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("aks show")
+    ]
+    assert len(profile_calls) >= 3
+
+
+def test_managed_route_stops_on_permanent_profile_read_error(tmp_path):
+    result, manifest, _, az_log = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "FAKE_AKS_PROFILE_PERMANENT_ERROR": "true",
+        },
+    )
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert "failed with a non-transient error" in result.stderr
+    profile_calls = [
+        line
+        for line in az_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("aks show")
+    ]
+    assert len(profile_calls) == 1
+
+
+def test_managed_route_bounds_hung_profile_reads(tmp_path):
+    started = time.monotonic()
+    result, manifest, _, az_log = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        env_overrides={
+            "AKS_MANAGED_ROUTE_COMMAND_TIMEOUT_SECONDS": "1",
+            "AKS_MANAGED_UPDATE_TIMEOUT_SECONDS": "2",
+            "FAKE_AKS_PROFILE_SLEEP_SECONDS": "5",
+        },
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert manifest is None
+    assert elapsed < 5
+    assert "command timed out after 1s" in result.stderr
+    assert "timed out waiting for AKS managed-Prometheus update" in result.stderr
+    profile_calls = [
+        line
+        for line in az_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("aks show")
+    ]
+    assert 1 <= len(profile_calls) <= 2
 
 
 def test_rotation_selects_base_when_missing(tmp_path):

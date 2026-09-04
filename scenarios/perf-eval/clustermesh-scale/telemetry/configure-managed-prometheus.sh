@@ -129,6 +129,12 @@ amw_max_events_per_minute="${AKS_AMW_MAX_EVENTS_PER_MINUTE:-$amw_default_max_eve
 amw_regional_workspace_limit="${AKS_AMW_REGIONAL_WORKSPACE_LIMIT:-100}"
 manifest_apply_attempts="${AKS_MANAGED_PROMETHEUS_APPLY_ATTEMPTS:-5}"
 manifest_apply_retry_seconds="${AKS_MANAGED_PROMETHEUS_APPLY_RETRY_SECONDS:-15}"
+managed_route_attempts="${AKS_MANAGED_ROUTE_ATTEMPTS:-4}"
+managed_route_retry_seconds="${AKS_MANAGED_ROUTE_RETRY_SECONDS:-30}"
+managed_route_command_timeout_seconds="${AKS_MANAGED_ROUTE_COMMAND_TIMEOUT_SECONDS:-120}"
+managed_update_timeout_seconds="${AKS_MANAGED_UPDATE_TIMEOUT_SECONDS:-3600}"
+managed_update_poll_seconds="${AKS_MANAGED_UPDATE_POLL_SECONDS:-30}"
+accept_cilium_policy_gap="${CL2_ACCEPT_CILIUM_POLICY_GAP:-false}"
 # Shared across the metricsContainers deployment below and its ARM-level
 # verification, so both always target the same child-resource API version.
 amw_metrics_container_api_version="2025-05-03-preview"
@@ -149,7 +155,8 @@ if ! [[ "$amw_clusters_per_workspace" =~ ^[1-9][0-9]*$ ]] ||
 fi
 for name_value in \
   "AKS_AMW_FORCE_SHARD_NAMING=$amw_force_shard_naming" \
-  "AKS_MANAGED_PROMETHEUS_REBALANCE_EXISTING=$amw_rebalance_existing"; do
+  "AKS_MANAGED_PROMETHEUS_REBALANCE_EXISTING=$amw_rebalance_existing" \
+  "CL2_ACCEPT_CILIUM_POLICY_GAP=$accept_cilium_policy_gap"; do
   name="${name_value%%=*}"
   value="${name_value#*=}"
   if [ "${value,,}" != "true" ] && [ "${value,,}" != "false" ]; then
@@ -157,6 +164,17 @@ for name_value in \
     exit 1
   fi
 done
+if ! [[ "$managed_route_attempts" =~ ^[1-9][0-9]*$ ]] ||
+   ! [[ "$managed_route_retry_seconds" =~ ^[0-9]+$ ]] ||
+   ! [[ "$managed_route_command_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  echo "AKS_MANAGED_ROUTE_ATTEMPTS/RETRY_SECONDS/COMMAND_TIMEOUT_SECONDS must be positive/non-negative/positive integers." >&2
+  exit 1
+fi
+if ! [[ "$managed_update_timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
+   ! [[ "$managed_update_poll_seconds" =~ ^[0-9]+$ ]]; then
+  echo "AKS_MANAGED_UPDATE_TIMEOUT_SECONDS/POLL_SECONDS must be positive/non-negative integers." >&2
+  exit 1
+fi
 for name_value in \
   "AKS_AMW_REBALANCE_SETTLE_SECONDS=$amw_rebalance_settle_seconds" \
   "AKS_AMW_REBALANCE_VERIFY_RETRY_SECONDS=$amw_rebalance_verify_retry_seconds" \
@@ -782,6 +800,18 @@ for row in "${cluster_rows[@]}"; do
   fi
 done
 
+read_managed_monitoring_extension_state() {
+  local extension_id="$1"
+  local extension_api_version="$2"
+  local command_timeout="$3"
+  timeout --signal=TERM --kill-after=10s \
+    "${command_timeout}s" \
+    az resource show \
+      --ids "$extension_id" \
+      --api-version "$extension_api_version" \
+      --query properties.provisioningState -o tsv 2>/dev/null
+}
+
 wait_for_managed_monitoring_convergence() {
   local role="$1" cluster_id="$2" kubeconfig="$3" policy_before="$4"
   local enabled="${AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED:-false}"
@@ -792,8 +822,29 @@ wait_for_managed_monitoring_convergence() {
   local extension_id="${cluster_id}/providers/Microsoft.KubernetesConfiguration/extensions/aks-managed-azure-monitor-metrics"
   local deadline state cm_json ds_json policy_after desired ready updated
   local observed generation fingerprint last_fingerprint="" stable_since=0 now
+  local remaining command_timeout sleep_seconds
+  local policy_gap_reported=false
+  local convergence_file convergence_tmp
+  convergence_file="$(dirname "$MANIFEST_PATH")/managed-monitoring-convergence-${role}.json"
+  convergence_tmp="${convergence_file}.tmp.$$"
 
   if [ "${enabled,,}" != "true" ]; then
+    if ! jq -n \
+        --arg role "$role" \
+        --arg policy_before "$policy_before" \
+        '{
+          role: $role,
+          enabled: false,
+          extension_state: "not_checked",
+          policy_before: $policy_before,
+          policy_after: null,
+          accepted_policy_gap: false
+        }' >"$convergence_tmp" ||
+       ! mv "$convergence_tmp" "$convergence_file"; then
+      rm -f "$convergence_tmp"
+      echo "[$role] unable to write managed-monitoring convergence evidence." >&2
+      return 1
+    fi
     return 0
   fi
   for value in "$timeout_seconds" "$quiet_seconds" "$poll_seconds"; do
@@ -806,10 +857,17 @@ wait_for_managed_monitoring_convergence() {
   echo "[$role] waiting for managed-monitoring extension and Cilium convergence..."
   deadline=$(( $(date +%s) + timeout_seconds ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    state=$(az resource show \
-      --ids "$extension_id" \
-      --api-version "$extension_api_version" \
-      --query properties.provisioningState -o tsv 2>/dev/null || true)
+    now=$(date +%s)
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      break
+    fi
+    command_timeout="$managed_route_command_timeout_seconds"
+    if [ "$command_timeout" -gt "$remaining" ]; then
+      command_timeout="$remaining"
+    fi
+    state=$(read_managed_monitoring_extension_state \
+      "$extension_id" "$extension_api_version" "$command_timeout" || true)
     case "$state" in
       Succeeded)
         break
@@ -820,7 +878,15 @@ wait_for_managed_monitoring_convergence() {
         ;;
       *)
         echo "[$role] managed-monitoring extension state=${state:-not-created}; waiting ${poll_seconds}s..."
-        sleep "$poll_seconds"
+        now=$(date +%s)
+        remaining=$((deadline - now))
+        sleep_seconds="$poll_seconds"
+        if [ "$sleep_seconds" -gt "$remaining" ]; then
+          sleep_seconds="$remaining"
+        fi
+        if [ "$sleep_seconds" -gt 0 ]; then
+          sleep "$sleep_seconds"
+        fi
         ;;
     esac
   done
@@ -831,14 +897,46 @@ wait_for_managed_monitoring_convergence() {
 
   deadline=$(( $(date +%s) + timeout_seconds ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    cm_json=$(KUBECONFIG="$kubeconfig" kubectl -n kube-system \
-      get configmap cilium-config -o json 2>/dev/null || true)
-    ds_json=$(KUBECONFIG="$kubeconfig" kubectl -n kube-system \
-      get daemonset cilium -o json 2>/dev/null || true)
+    now=$(date +%s)
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      break
+    fi
+    command_timeout="$managed_route_command_timeout_seconds"
+    if [ "$command_timeout" -gt "$remaining" ]; then
+      command_timeout="$remaining"
+    fi
+    cm_json=$(timeout --signal=TERM --kill-after=10s \
+      "${command_timeout}s" \
+      env KUBECONFIG="$kubeconfig" \
+      kubectl --request-timeout="${command_timeout}s" -n kube-system \
+        get configmap cilium-config -o json 2>/dev/null || true)
+    now=$(date +%s)
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      break
+    fi
+    command_timeout="$managed_route_command_timeout_seconds"
+    if [ "$command_timeout" -gt "$remaining" ]; then
+      command_timeout="$remaining"
+    fi
+    ds_json=$(timeout --signal=TERM --kill-after=10s \
+      "${command_timeout}s" \
+      env KUBECONFIG="$kubeconfig" \
+      kubectl --request-timeout="${command_timeout}s" -n kube-system \
+        get daemonset cilium -o json 2>/dev/null || true)
     if [ -z "$cm_json" ] || [ -z "$ds_json" ]; then
       last_fingerprint=""
       stable_since=0
-      sleep "$poll_seconds"
+      now=$(date +%s)
+      remaining=$((deadline - now))
+      sleep_seconds="$poll_seconds"
+      if [ "$sleep_seconds" -gt "$remaining" ]; then
+        sleep_seconds="$remaining"
+      fi
+      if [ "$sleep_seconds" -gt 0 ]; then
+        sleep "$sleep_seconds"
+      fi
       continue
     fi
 
@@ -855,10 +953,15 @@ wait_for_managed_monitoring_convergence() {
       '$cm_rv + ":" + $checksum + ":" + $generation')
 
     if [ "$policy_after" = "never" ]; then
-      echo "[$role] Cilium reconciled to enable-policy=never; ACNS DNS L7 telemetry would be invalid" >&2
-      return 1
-    fi
-    if [ -n "$policy_before" ] && [ "$policy_after" != "$policy_before" ]; then
+      if [ "${accept_cilium_policy_gap,,}" != "true" ]; then
+        echo "[$role] Cilium reconciled to enable-policy=never; ACNS DNS L7 telemetry would be invalid" >&2
+        return 1
+      fi
+      if [ "$policy_gap_reported" != "true" ]; then
+        echo "[$role] accepting documented Cilium policy/L7 gap after managed-monitoring reconciliation: ${policy_before:-missing} -> never"
+        policy_gap_reported=true
+      fi
+    elif [ -n "$policy_before" ] && [ "$policy_after" != "$policy_before" ]; then
       echo "[$role] Cilium policy mode changed during managed-monitoring setup: $policy_before -> ${policy_after:-missing}" >&2
       return 1
     fi
@@ -872,14 +975,77 @@ wait_for_managed_monitoring_convergence() {
         last_fingerprint="$fingerprint"
         stable_since="$now"
       elif [ $((now - stable_since)) -ge "$quiet_seconds" ]; then
-        echo "[$role] managed-monitoring extension is Succeeded and Cilium remained stable for ${quiet_seconds}s (policy=$policy_after, desired=$desired)."
+        now=$(date +%s)
+        remaining=$((deadline - now))
+        if [ "$remaining" -le 0 ]; then
+          break
+        fi
+        command_timeout="$managed_route_command_timeout_seconds"
+        if [ "$command_timeout" -gt "$remaining" ]; then
+          command_timeout="$remaining"
+        fi
+        state=$(read_managed_monitoring_extension_state \
+          "$extension_id" "$extension_api_version" "$command_timeout" || true)
+        case "$state" in
+          Succeeded)
+            ;;
+          Failed|Canceled)
+            echo "[$role] managed-monitoring extension reached terminal state $state during Cilium convergence" >&2
+            return 1
+            ;;
+          *)
+            echo "[$role] managed-monitoring extension left Succeeded state (${state:-unavailable}); restarting Cilium stability observation." >&2
+            last_fingerprint=""
+            stable_since=0
+            continue
+            ;;
+        esac
+        if ! jq -n \
+            --arg role "$role" \
+            --arg policy_before "$policy_before" \
+            --arg policy_after "$policy_after" \
+            --argjson accepted_policy_gap "$policy_gap_reported" \
+            --argjson desired "$desired" \
+            --argjson ready "$ready" \
+            --argjson updated "$updated" \
+            --argjson observed_generation "$observed" \
+            --argjson generation "$generation" \
+            '{
+              role: $role,
+              enabled: true,
+              extension_state: "Succeeded",
+              policy_before: $policy_before,
+              policy_after: $policy_after,
+              accepted_policy_gap: $accepted_policy_gap,
+              cilium: {
+                desired: $desired,
+                ready: $ready,
+                updated: $updated,
+                observed_generation: $observed_generation,
+                generation: $generation
+              }
+            }' >"$convergence_tmp" ||
+           ! mv "$convergence_tmp" "$convergence_file"; then
+          rm -f "$convergence_tmp"
+          echo "[$role] unable to write managed-monitoring convergence evidence." >&2
+          return 1
+        fi
+        echo "[$role] managed-monitoring extension is Succeeded and Cilium remained stable for ${quiet_seconds}s (policy=$policy_after, accepted_gap=$policy_gap_reported, desired=$desired)."
         return 0
       fi
     else
       last_fingerprint=""
       stable_since=0
     fi
-    sleep "$poll_seconds"
+    now=$(date +%s)
+    remaining=$((deadline - now))
+    sleep_seconds="$poll_seconds"
+    if [ "$sleep_seconds" -gt "$remaining" ]; then
+      sleep_seconds="$remaining"
+    fi
+    if [ "$sleep_seconds" -gt 0 ]; then
+      sleep "$sleep_seconds"
+    fi
   done
 
   echo "[$role] timed out waiting for a stable Cilium rollout after managed-monitoring setup" >&2
@@ -921,6 +1087,311 @@ normalize_resource_id() {
   tr '[:upper:]' '[:lower:]' <<<"$1"
 }
 
+managed_route_error_is_transient() {
+  grep -Eqi \
+    'Service Unavailable|ServiceUnavailable|temporarily unavailable|Our services aren.t available|Internal Server Error|InternalServerError|InternalOperationError|Bad Gateway|Gateway Timeout|TooManyRequests|RetryableError|HTTP([/[:space:]]+[0-9.]+)?[[:space:]]+(429|500|502|503|504)|status([[:space:]]+code)?[=:[:space:]]+(429|500|502|503|504)|timeout|timed out|connection reset|client connection lost|TLS handshake timeout|i/o timeout|unexpected EOF|Temporary failure in name resolution|Name or service not known' \
+    <<<"$1"
+}
+
+aks_update_error_is_pending() {
+  grep -Eqi \
+    'AnotherOperationInProgress|OperationInProgress|OperationNotAllowed.*(another|progress|pending)|HTTP([/[:space:]]+[0-9.]+)?[[:space:]]+409|status([[:space:]]+code)?[=:[:space:]]+409' \
+    <<<"$1"
+}
+
+managed_route_command() {
+  local description="$1"
+  shift
+  local require_json=false
+  local command_attempts="$managed_route_attempts"
+  local command_timeout_seconds="$managed_route_command_timeout_seconds"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json)
+        require_json=true
+        shift
+        ;;
+      --attempts)
+        command_attempts="$2"
+        shift 2
+        ;;
+      --timeout-seconds)
+        command_timeout_seconds="$2"
+        shift 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  local attempt rc output_file error_file detail retryable
+  if ! [[ "$command_attempts" =~ ^[1-9][0-9]*$ ]] ||
+     ! [[ "$command_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$description received invalid retry/timeout bounds." >&2
+    return 2
+  fi
+  for attempt in $(seq 1 "$command_attempts"); do
+    output_file=$(mktemp)
+    error_file=$(mktemp)
+    rc=0
+    timeout --signal=TERM --kill-after=10s \
+      "${command_timeout_seconds}s" \
+      "$@" >"$output_file" 2>"$error_file" || rc=$?
+    retryable=false
+    if [ "$rc" -eq 0 ] &&
+       [ "$require_json" = "true" ] &&
+       ! jq -e . "$output_file" >/dev/null 2>&1; then
+      detail="command returned invalid JSON: $(tr '\n' ' ' <"$output_file" | cut -c1-1000)"
+      retryable=true
+    elif [ "$rc" -eq 0 ]; then
+      if [ -s "$error_file" ]; then
+        sed "s/^/${description}: /" "$error_file" >&2
+      fi
+      cat "$output_file"
+      rm -f "$output_file" "$error_file"
+      if [ "$attempt" -gt 1 ]; then
+        echo "$description recovered on attempt $attempt/$command_attempts." >&2
+      fi
+      return 0
+    else
+      detail=$(cat "$error_file" "$output_file" | tr '\n' ' ' | cut -c1-2000)
+      if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        detail="command timed out after ${command_timeout_seconds}s${detail:+: $detail}"
+        retryable=true
+      elif managed_route_error_is_transient "$detail"; then
+        retryable=true
+      fi
+    fi
+    rm -f "$output_file" "$error_file"
+    if [ "$retryable" != "true" ]; then
+      echo "$description failed with a non-transient error: $detail" >&2
+      return 2
+    fi
+    echo "$description transient failure on attempt $attempt/$command_attempts: $detail" >&2
+    if [ "$attempt" -lt "$command_attempts" ] &&
+       [ "$managed_route_retry_seconds" -gt 0 ]; then
+      sleep "$managed_route_retry_seconds"
+    fi
+  done
+  echo "$description did not recover after $command_attempts attempts." >&2
+  return 1
+}
+
+wait_for_managed_prometheus_profile() {
+  local role="$1"
+  local resource_group="$2"
+  local name="$3"
+  local deadline profile profile_read_rc now remaining command_timeout sleep_seconds
+  local provisioning_state metrics_enabled controlplane_enabled
+  deadline=$(( $(date +%s) + managed_update_timeout_seconds ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    now=$(date +%s)
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      break
+    fi
+    command_timeout="$managed_route_command_timeout_seconds"
+    if [ "$command_timeout" -gt "$remaining" ]; then
+      command_timeout="$remaining"
+    fi
+    profile_read_rc=0
+    profile=$(managed_route_command \
+        "[$role] managed-Prometheus AKS profile convergence read" \
+        --json \
+        --attempts 1 \
+        --timeout-seconds "$command_timeout" \
+        az aks show \
+          --resource-group "$resource_group" \
+          --name "$name" \
+          --output json \
+          --only-show-errors) || profile_read_rc=$?
+    if [ "$profile_read_rc" -eq 0 ]; then
+      if ! jq -e 'type == "object"' <<<"$profile" >/dev/null; then
+        echo "[$role] managed-Prometheus AKS profile response was not an object." >&2
+        return 1
+      fi
+      provisioning_state=$(jq -r '.provisioningState // empty' <<<"$profile")
+      metrics_enabled=$(jq -r \
+        '.azureMonitorProfile.metrics.enabled // false' <<<"$profile")
+      controlplane_enabled=$(jq -r \
+        '.azureMonitorProfile.metrics.controlPlane.enabled // false' \
+        <<<"$profile")
+      case "$provisioning_state" in
+        Succeeded)
+          if [ "${metrics_enabled,,}" = "true" ] &&
+             [ "${controlplane_enabled,,}" = "true" ]; then
+            return 0
+          fi
+          return 2
+          ;;
+        Failed|Canceled)
+          echo "[$role] AKS managed-Prometheus update reached terminal state $provisioning_state." >&2
+          return 1
+          ;;
+        "")
+          echo "[$role] AKS profile omitted provisioningState while managed Prometheus remained disabled." >&2
+          return 1
+          ;;
+        *)
+          echo "[$role] AKS managed-Prometheus update state=$provisioning_state; waiting ${managed_update_poll_seconds}s..."
+          ;;
+      esac
+    elif [ "$profile_read_rc" -eq 2 ]; then
+      return 1
+    fi
+    now=$(date +%s)
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      break
+    fi
+    sleep_seconds="$managed_update_poll_seconds"
+    if [ "$sleep_seconds" -gt "$remaining" ]; then
+      sleep_seconds="$remaining"
+    fi
+    if [ "$sleep_seconds" -gt 0 ]; then
+      sleep "$sleep_seconds"
+    fi
+  done
+  echo "[$role] timed out waiting for AKS managed-Prometheus update convergence." >&2
+  return 1
+}
+
+enable_managed_prometheus_route() {
+  local role="$1"
+  local resource_group="$2"
+  local name="$3"
+  local workspace_id="$4"
+  local attempt rc output_file error_file detail profile_rc
+  managed_update_ambiguous=false
+  for attempt in $(seq 1 "$managed_route_attempts"); do
+    output_file=$(mktemp)
+    error_file=$(mktemp)
+    rc=0
+    timeout --signal=TERM --kill-after=10s \
+      "${managed_route_command_timeout_seconds}s" \
+      az aks update \
+        --resource-group "$resource_group" \
+        --name "$name" \
+        --enable-azure-monitor-metrics \
+        --azure-monitor-workspace-resource-id "$workspace_id" \
+        --only-show-errors \
+        --output none >"$output_file" 2>"$error_file" || rc=$?
+    detail=$(cat "$error_file" "$output_file" | tr '\n' ' ' | cut -c1-2000)
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+      detail="command timed out after ${managed_route_command_timeout_seconds}s${detail:+: $detail}"
+    fi
+    rm -f "$output_file" "$error_file"
+    if [ "$rc" -ne 0 ] &&
+       [ "$rc" -ne 124 ] &&
+       [ "$rc" -ne 137 ] &&
+       ! managed_route_error_is_transient "$detail" &&
+       ! aks_update_error_is_pending "$detail"; then
+      echo "[$role] managed-Prometheus AKS enablement failed with a non-transient error: $detail" >&2
+      return 1
+    fi
+    if [ "$rc" -ne 0 ]; then
+      managed_update_ambiguous=true
+      echo "[$role] managed-Prometheus AKS enablement returned an ambiguous or pending-operation error on attempt $attempt/$managed_route_attempts: $detail" >&2
+    fi
+
+    profile_rc=0
+    wait_for_managed_prometheus_profile \
+      "$role" "$resource_group" "$name" || profile_rc=$?
+    case "$profile_rc" in
+      0)
+        if [ "$attempt" -gt 1 ] || [ "$rc" -ne 0 ]; then
+          echo "[$role] managed-Prometheus AKS enablement converged after attempt $attempt/$managed_route_attempts."
+        fi
+        return 0
+        ;;
+      2)
+        echo "[$role] AKS is idle but managed Prometheus is still disabled after attempt $attempt/$managed_route_attempts." >&2
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    if [ "$attempt" -lt "$managed_route_attempts" ] &&
+       [ "$managed_route_retry_seconds" -gt 0 ]; then
+      sleep "$managed_route_retry_seconds"
+    fi
+  done
+  echo "[$role] managed-Prometheus AKS enablement did not converge after $managed_route_attempts attempts." >&2
+  return 1
+}
+
+wait_for_managed_prometheus_association() {
+  local role="$1"
+  local cluster_id="$2"
+  local deadline response response_rc association_count
+  local now remaining command_timeout sleep_seconds
+  deadline=$(( $(date +%s) + managed_update_timeout_seconds ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    now=$(date +%s)
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      break
+    fi
+    command_timeout="$managed_route_command_timeout_seconds"
+    if [ "$command_timeout" -gt "$remaining" ]; then
+      command_timeout="$remaining"
+    fi
+    response_rc=0
+    response=$(managed_route_command \
+        "[$role] managed-Prometheus association convergence query" \
+        --json \
+        --attempts 1 \
+        --timeout-seconds "$command_timeout" \
+        az rest \
+          --method get \
+          --url "https://management.azure.com${cluster_id}/providers/Microsoft.Insights/dataCollectionRuleAssociations?api-version=${monitor_dcr_api_version}" \
+          --output json) || response_rc=$?
+    if [ "$response_rc" -eq 0 ]; then
+      if ! association_count=$(jq -er '
+          if (.value | type) != "array" then
+            error("association value is not an array")
+          else
+            [
+              .value[]
+              | select(
+                  .name == "ContainerInsightsMetricsExtension" or
+                  ((.properties.dataCollectionRuleId // "") | contains("/MSProm-"))
+                )
+            ]
+            | length
+          end
+        ' <<<"$response"); then
+        echo "[$role] managed-Prometheus association convergence response had an invalid schema." >&2
+        return 1
+      fi
+      if [ "$association_count" -eq 1 ]; then
+        managed_prometheus_associations="$response"
+        return 0
+      fi
+      if [ "$association_count" -gt 1 ]; then
+        echo "[$role] found $association_count managed-Prometheus DCR associations after AKS update." >&2
+        return 1
+      fi
+    elif [ "$response_rc" -eq 2 ]; then
+      return 1
+    fi
+    now=$(date +%s)
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      break
+    fi
+    sleep_seconds="$managed_update_poll_seconds"
+    if [ "$sleep_seconds" -gt "$remaining" ]; then
+      sleep_seconds="$remaining"
+    fi
+    if [ "$sleep_seconds" -gt 0 ]; then
+      sleep "$sleep_seconds"
+    fi
+  done
+  echo "[$role] timed out waiting for the managed-Prometheus DCR association." >&2
+  return 1
+}
+
 configure_managed_prometheus_route() {
   local role="$1"
   local name="$2"
@@ -932,34 +1403,49 @@ configure_managed_prometheus_route() {
   local associations association_count dcr_id dcr_url
   local dcr_file dcr_body current_workspace_id verified_workspace_id
 
-  associations=$(az rest \
-    --method get \
-    --url "https://management.azure.com${cluster_id}/providers/Microsoft.Insights/dataCollectionRuleAssociations?api-version=${monitor_dcr_api_version}" \
-    --output json)
-  association_count=$(jq '
-    [
-      .value[]?
-      | select(
-          .name == "ContainerInsightsMetricsExtension" or
-          ((.properties.dataCollectionRuleId // "") | contains("/MSProm-"))
-        )
-    ]
-    | length
-  ' <<<"$associations")
+  if ! associations=$(managed_route_command \
+      "[$role] managed-Prometheus association query" \
+      --json \
+      az rest \
+        --method get \
+        --url "https://management.azure.com${cluster_id}/providers/Microsoft.Insights/dataCollectionRuleAssociations?api-version=${monitor_dcr_api_version}" \
+        --output json); then
+    return 1
+  fi
+  if ! association_count=$(jq -er '
+    if (.value | type) != "array" then
+      error("association value is not an array")
+    else
+      [
+        .value[]
+        | select(
+            .name == "ContainerInsightsMetricsExtension" or
+            ((.properties.dataCollectionRuleId // "") | contains("/MSProm-"))
+          )
+      ]
+      | length
+    end
+  ' <<<"$associations"); then
+    echo "[$role] managed-Prometheus association response had an invalid schema." >&2
+    return 1
+  fi
   if [ "$association_count" -gt 1 ]; then
     echo "[$role] found $association_count managed-Prometheus DCR associations; refusing an ambiguous workspace migration." >&2
     return 1
   fi
   if [ "$association_count" -eq 0 ]; then
     echo "[$role] enabling managed Prometheus -> $workspace_name"
-    az aks update \
-      --resource-group "$resource_group" \
-      --name "$name" \
-      --enable-azure-monitor-metrics \
-      --azure-monitor-workspace-resource-id "$workspace_id" \
-      --only-show-errors \
-      --output none
-    return
+    if ! enable_managed_prometheus_route \
+        "$role" "$resource_group" "$name" "$workspace_id"; then
+      return 1
+    fi
+    if [ "$managed_update_ambiguous" != "true" ]; then
+      return 0
+    fi
+    if ! wait_for_managed_prometheus_association "$role" "$cluster_id"; then
+      return 1
+    fi
+    associations="$managed_prometheus_associations"
   fi
 
   dcr_id=$(jq -r '
@@ -980,7 +1466,10 @@ configure_managed_prometheus_route() {
   dcr_url="https://management.azure.com${dcr_id}?api-version=${monitor_dcr_api_version}"
   dcr_file=$(mktemp)
   dcr_body=$(mktemp)
-  if ! az rest --method get --url "$dcr_url" --output json >"$dcr_file"; then
+  if ! managed_route_command \
+      "[$role] managed-Prometheus DCR read" \
+      --json \
+      az rest --method get --url "$dcr_url" --output json >"$dcr_file"; then
     rm -f "$dcr_file" "$dcr_body"
     return 1
   fi
@@ -1018,11 +1507,13 @@ configure_managed_prometheus_route() {
         }
         | if .tags == null then del(.tags) else . end' \
         "$dcr_file" >"$dcr_body" ||
-       ! az rest \
-          --method put \
-          --url "$dcr_url" \
-          --body "@$dcr_body" \
-          --output none; then
+       ! managed_route_command \
+          "[$role] managed-Prometheus DCR update" \
+          az rest \
+            --method put \
+            --url "$dcr_url" \
+            --body "@$dcr_body" \
+            --output none >/dev/null; then
       rm -f "$dcr_file" "$dcr_body"
       return 1
     fi
@@ -1030,7 +1521,10 @@ configure_managed_prometheus_route() {
     echo "[$role] managed Prometheus DCR already targets $workspace_name"
   fi
 
-  if ! az rest --method get --url "$dcr_url" --output json >"$dcr_file"; then
+  if ! managed_route_command \
+      "[$role] managed-Prometheus DCR verification" \
+      --json \
+      az rest --method get --url "$dcr_url" --output json >"$dcr_file"; then
     rm -f "$dcr_file" "$dcr_body"
     return 1
   fi
@@ -1161,7 +1655,7 @@ verify_rebalanced_workspace_assignments() {
 
 configure_one() {
   local row="$1"
-  local role name resource_group kubeconfig metrics_enabled controlplane_enabled
+  local role name resource_group kubeconfig profile_rc
   local cluster_alias rendered_config cluster_id categories_file logs_file metrics_file
   local workspace_name workspace_id workspace_account_id
   local cilium_policy_before namespace_manifest
@@ -1174,9 +1668,16 @@ configure_one() {
   kubeconfig="$HOME/.kube/$role.config"
   cluster_alias=$(echo "$row" | jq -r '.prometheus_cluster_alias')
   cluster_id=$(echo "$row" | jq -r '.id')
-  cilium_policy_before=$(KUBECONFIG="$kubeconfig" kubectl -n kube-system \
-    get configmap cilium-config -o jsonpath='{.data.enable-policy}' \
-    2>/dev/null || true)
+  if ! cilium_policy_before=$(timeout --signal=TERM --kill-after=10s \
+      "${managed_route_command_timeout_seconds}s" \
+      env KUBECONFIG="$kubeconfig" \
+      kubectl --request-timeout="${managed_route_command_timeout_seconds}s" \
+        -n kube-system get configmap cilium-config \
+        -o jsonpath='{.data.enable-policy}' 2>/dev/null) ||
+     [ -z "$cilium_policy_before" ]; then
+    echo "[$role] unable to read the initial Cilium policy mode within ${managed_route_command_timeout_seconds}s." >&2
+    return 1
+  fi
 
   rendered_config=$(mktemp)
   namespace_manifest=$(mktemp)
@@ -1234,19 +1735,13 @@ configure_one() {
     return 1
   fi
   rm -f "$rendered_config"
-  metrics_enabled=$(az aks show \
-    --resource-group "$resource_group" \
-    --name "$name" \
-    --query azureMonitorProfile.metrics.enabled \
-    -o tsv)
-  controlplane_enabled=$(az aks show \
-    --resource-group "$resource_group" \
-    --name "$name" \
-    --query azureMonitorProfile.metrics.controlPlane.enabled \
-    -o tsv)
-  if [ "${metrics_enabled,,}" != "true" ] || \
-     [ "${controlplane_enabled,,}" != "true" ]; then
-    echo "[$role] azureMonitorProfile.metrics enabled=$metrics_enabled controlPlane=$controlplane_enabled" >&2
+  profile_rc=0
+  wait_for_managed_prometheus_profile \
+    "$role" "$resource_group" "$name" || profile_rc=$?
+  if [ "$profile_rc" -ne 0 ]; then
+    if [ "$profile_rc" -eq 2 ]; then
+      echo "[$role] AKS reached Succeeded without the required managed-Prometheus profile." >&2
+    fi
     return 1
   fi
   if ! wait_for_managed_monitoring_convergence \
@@ -1257,9 +1752,20 @@ configure_one() {
   categories_file=$(mktemp)
   logs_file=$(mktemp)
   metrics_file=$(mktemp)
-  az monitor diagnostic-settings categories list \
-    --resource "$cluster_id" \
-    -o json > "$categories_file"
+  if ! managed_route_command \
+      "[$role] diagnostic categories query" \
+      --json \
+      az monitor diagnostic-settings categories list \
+        --resource "$cluster_id" \
+        -o json > "$categories_file"; then
+    rm -f "$categories_file" "$logs_file" "$metrics_file"
+    return 1
+  fi
+  if ! jq -e '.value | type == "array"' "$categories_file" >/dev/null; then
+    echo "[$role] diagnostic categories response had an invalid schema." >&2
+    rm -f "$categories_file" "$logs_file" "$metrics_file"
+    return 1
+  fi
   jq '[
     .value[]
     | select(.categoryType == "Logs")
@@ -1278,14 +1784,19 @@ configure_one() {
         retentionPolicy: {enabled: false, days: 0}
       }
   ]' "$categories_file" > "$metrics_file"
-  az monitor diagnostic-settings create \
-    --name "$diagnostic_setting_name" \
-    --resource "$cluster_id" \
-    --workspace "$law_id" \
-    --export-to-resource-specific true \
-    --logs @"$logs_file" \
-    --metrics @"$metrics_file" \
-    --output none
+  if ! managed_route_command \
+      "[$role] diagnostic setting update" \
+      az monitor diagnostic-settings create \
+        --name "$diagnostic_setting_name" \
+        --resource "$cluster_id" \
+        --workspace "$law_id" \
+        --export-to-resource-specific true \
+        --logs @"$logs_file" \
+        --metrics @"$metrics_file" \
+        --output none >/dev/null; then
+    rm -f "$categories_file" "$logs_file" "$metrics_file"
+    return 1
+  fi
   jq -n \
     --arg role "$role" \
     --arg cluster_id "$cluster_id" \
@@ -1404,6 +1915,19 @@ fi
 
 configured_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 diagnostics_json=$(jq -s '.' "$(dirname "$MANIFEST_PATH")"/diagnostics-*.json)
+managed_monitoring_convergence_files=()
+for row in "${cluster_rows[@]}"; do
+  role=$(jq -r '.role' <<<"$row")
+  convergence_file="$(dirname "$MANIFEST_PATH")/managed-monitoring-convergence-${role}.json"
+  if [ ! -f "$convergence_file" ]; then
+    echo "Missing managed-monitoring convergence evidence for $role: $convergence_file" >&2
+    exit 1
+  fi
+  managed_monitoring_convergence_files+=("$convergence_file")
+done
+managed_monitoring_convergence_json=$(
+  jq -s '.' "${managed_monitoring_convergence_files[@]}"
+)
 resource_group_count=$(echo "$clusters_with_ids" | jq '[.[].rg] | unique | length')
 if [ "$resource_group_count" -eq 1 ]; then
   run_resource_group=$(echo "$clusters_with_ids" | jq -r '.[0].rg')
@@ -1433,10 +1957,13 @@ manifest_workspaces_file=$(mktemp)
 manifest_diagnostics_file=$(mktemp)
 manifest_clusters_file=$(mktemp)
 manifest_rebalance_assignment_file=$(mktemp)
+manifest_managed_monitoring_convergence_file=$(mktemp)
 printf '%s' "$workspace_catalog" >"$manifest_workspaces_file"
 printf '%s' "$diagnostics_json" >"$manifest_diagnostics_file"
 printf '%s' "$clusters_with_ids" >"$manifest_clusters_file"
 cat "$rebalance_assignment_summary" >"$manifest_rebalance_assignment_file"
+printf '%s' "$managed_monitoring_convergence_json" \
+  >"$manifest_managed_monitoring_convergence_file"
 
 jq -n \
   --arg run_id "$RUN_ID" \
@@ -1454,6 +1981,7 @@ jq -n \
   --slurpfile diagnostics_arr "$manifest_diagnostics_file" \
   --slurpfile clusters_arr "$manifest_clusters_file" \
   --slurpfile rebalance_assignment_arr "$manifest_rebalance_assignment_file" \
+  --slurpfile managed_monitoring_convergence_arr "$manifest_managed_monitoring_convergence_file" \
   --arg amw_base_prefix "$amw_base_prefix" \
   --arg amw_selected_prefix "$amw_name_prefix" \
   --arg amw_generation "$amw_generation" \
@@ -1472,6 +2000,7 @@ jq -n \
   ($diagnostics_arr[0]) as $diagnostics |
   ($clusters_arr[0]) as $clusters |
   ($rebalance_assignment_arr[0]) as $rebalance_assignment |
+  ($managed_monitoring_convergence_arr[0]) as $managed_monitoring_convergence |
   {
     schema_version: 2,
     run_id: $run_id,
@@ -1529,6 +2058,7 @@ jq -n \
     control_plane: {
       collection_scope: "control-plane-only",
       minimal_ingestion_profile: false,
+      managed_monitoring_convergence: $managed_monitoring_convergence,
       targets: [
         "apiserver",
         "etcd",
@@ -1556,7 +2086,8 @@ rm -f \
   "$manifest_workspaces_file" \
   "$manifest_diagnostics_file" \
   "$manifest_clusters_file" \
-  "$manifest_rebalance_assignment_file"
+  "$manifest_rebalance_assignment_file" \
+  "$manifest_managed_monitoring_convergence_file"
 
 echo "Managed Prometheus configured for ${#cluster_rows[@]} cluster(s)."
 echo "Persistent workspaces: $(echo "$workspace_catalog" | jq -r 'map(.name) | join(", ")')"

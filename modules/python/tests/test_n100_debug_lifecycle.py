@@ -247,6 +247,17 @@ def _write_resume_manifest_fixture(
     fail_aks_inventory=False,
     extra_aks=False,
     no_fleet=False,
+    transient_incomplete_aks=False,
+    transient_empty_fleet=False,
+    wrong_fleet=False,
+    malformed_account=False,
+    malformed_group=False,
+    malformed_group_tags=False,
+    fleet_lookup_group_missing=False,
+    wrong_aks_id=False,
+    wrong_fleet_id=False,
+    malformed_lease_type=False,
+    invalid_lease_timestamp=False,
 ):
     fake_bin = tmp_path / "manifest-bin"
     fake_bin.mkdir()
@@ -258,27 +269,61 @@ def _write_resume_manifest_fixture(
         "import sys\n"
         "args = sys.argv[1:]\n"
         "if args[:2] == ['account', 'show']:\n"
-        "    print(json.dumps({'id': 'test-subscription'}))\n"
+        "    if 'MALFORMED_ACCOUNT' in __import__('os').environ:\n"
+        "        print('[]')\n"
+        "    else:\n"
+        "        print(json.dumps({'id': 'test-subscription'}))\n"
         "elif args[:2] == ['group', 'exists']:\n"
         "    print('true')\n"
         "elif args[:2] == ['group', 'show']:\n"
-        "    print(json.dumps({'tags': {'deletion_due_time': '2099-01-01T00:00:00Z'}}))\n"
+        "    if 'MALFORMED_GROUP' in __import__('os').environ:\n"
+        "        print('[]')\n"
+        "    elif 'MALFORMED_GROUP_TAGS' in __import__('os').environ:\n"
+        "        print(json.dumps({'tags': 'invalid'}))\n"
+        "    elif 'MALFORMED_LEASE_TYPE' in __import__('os').environ:\n"
+        "        print(json.dumps({'tags': {'deletion_due_time': ['invalid']}}))\n"
+        "    elif 'INVALID_LEASE_TIMESTAMP' in __import__('os').environ:\n"
+        "        print(json.dumps({'tags': {'deletion_due_time': 'not-a-timestamp'}}))\n"
+        "    else:\n"
+        "        print(json.dumps({'tags': {'deletion_due_time': '2099-01-01T00:00:00Z'}}))\n"
         "elif args[:2] == ['aks', 'list']:\n"
         "    if 'FAIL_AKS' in __import__('os').environ:\n"
         "        print('transient AKS inventory failure', file=sys.stderr)\n"
         "        raise SystemExit(1)\n"
         "    clusters = [\n"
-        "        {'id': '/subscriptions/test/resourceGroups/run/providers/Microsoft.ContainerService/managedClusters/clustermesh-1', 'name': 'clustermesh-1', 'runId': 'run', 'role': 'mesh-1', 'location': 'eastus2euap', 'provisioningState': 'Succeeded', 'powerState': 'Running', 'nodeResourceGroup': 'MC_run_1'},\n"
-        "        {'id': '/subscriptions/test/resourceGroups/run/providers/Microsoft.ContainerService/managedClusters/clustermesh-2', 'name': 'clustermesh-2', 'runId': 'run', 'role': 'mesh-2', 'location': 'eastus2euap', 'provisioningState': 'Succeeded', 'powerState': 'Running', 'nodeResourceGroup': 'MC_run_2'},\n"
+        "        {'id': '/subscriptions/test-subscription/resourceGroups/run/providers/Microsoft.ContainerService/managedClusters/clustermesh-1', 'name': 'clustermesh-1', 'runId': 'run', 'role': 'mesh-1', 'location': 'eastus2euap', 'provisioningState': 'Succeeded', 'powerState': 'Running', 'nodeResourceGroup': 'MC_run_1'},\n"
+        "        {'id': '/subscriptions/test-subscription/resourceGroups/run/providers/Microsoft.ContainerService/managedClusters/clustermesh-2', 'name': 'clustermesh-2', 'runId': 'run', 'role': 'mesh-2', 'location': 'eastus2euap', 'provisioningState': 'Succeeded', 'powerState': 'Running', 'nodeResourceGroup': 'MC_run_2'},\n"
         "    ]\n"
+        "    if 'WRONG_AKS_ID' in __import__('os').environ:\n"
+        "        clusters[0]['id'] = '/subscriptions/other/resourceGroups/run/providers/Microsoft.ContainerService/managedClusters/clustermesh-1'\n"
         "    if 'EXTRA_AKS' in __import__('os').environ:\n"
         "        clusters.append({'id': '/subscriptions/test/resourceGroups/run/providers/Microsoft.ContainerService/managedClusters/untracked', 'name': 'untracked', 'runId': None, 'role': None, 'location': 'eastus2euap', 'provisioningState': 'Succeeded', 'powerState': 'Running', 'nodeResourceGroup': 'MC_run_extra'})\n"
+        "    state = __import__('os').environ.get('INCOMPLETE_AKS_ONCE_STATE')\n"
+        "    if state and not __import__('os').path.exists(state):\n"
+        "        open(state, 'w', encoding='utf-8').close()\n"
+        "        clusters = clusters[:1]\n"
         "    print(json.dumps(clusters))\n"
-        "elif args[:2] == ['resource', 'list']:\n"
+        "elif args[:2] == ['fleet', 'show']:\n"
+        "    if 'FLEET_LOOKUP_GROUP_MISSING' in __import__('os').environ:\n"
+        "        print('(ResourceGroupNotFound) Resource group run could not be found', file=sys.stderr)\n"
+        "        raise SystemExit(3)\n"
         "    if 'NO_FLEET' in __import__('os').environ:\n"
+        "        print(\"(ResourceNotFound) The Resource 'Microsoft.ContainerService/fleets/clustermesh-flt' under resource group 'run' was not found\", file=sys.stderr)\n"
+        "        raise SystemExit(3)\n"
+        "    name = 'wrong-fleet' if 'WRONG_FLEET' in __import__('os').environ else 'clustermesh-flt'\n"
+        "    subscription = 'other' if 'WRONG_FLEET_ID' in __import__('os').environ else 'test-subscription'\n"
+        "    print(json.dumps({'id': f'/subscriptions/{subscription}/resourceGroups/run/providers/Microsoft.ContainerService/fleets/{name}', 'name': name, 'provisioningState': 'Succeeded'}))\n"
+        "elif args[:2] == ['resource', 'list']:\n"
+        "    state = __import__('os').environ.get('EMPTY_FLEET_ONCE_STATE')\n"
+        "    if state and not __import__('os').path.exists(state):\n"
+        "        open(state, 'w', encoding='utf-8').close()\n"
+        "        print('[]')\n"
+        "    elif 'NO_FLEET' in __import__('os').environ:\n"
         "        print('[]')\n"
         "    else:\n"
-        "        print(json.dumps([{'name': 'clustermesh-flt', 'provisioningState': 'Succeeded'}]))\n"
+        "        name = 'wrong-fleet' if 'WRONG_FLEET' in __import__('os').environ else 'clustermesh-flt'\n"
+        "        subscription = 'other' if 'WRONG_FLEET_ID' in __import__('os').environ else 'test-subscription'\n"
+        "        print(json.dumps([{'id': f'/subscriptions/{subscription}/resourceGroups/run/providers/Microsoft.ContainerService/fleets/{name}', 'name': name, 'provisioningState': 'Succeeded'}]))\n"
         "else:\n"
         "    raise SystemExit(f'unexpected az command: {args}')\n",
         encoding="utf-8",
@@ -310,6 +355,32 @@ def _write_resume_manifest_fixture(
     if no_fleet:
         env["NO_FLEET"] = "1"
         env["CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT"] = "0"
+    if transient_incomplete_aks:
+        env["INCOMPLETE_AKS_ONCE_STATE"] = str(
+            tmp_path / "incomplete-aks-once"
+        )
+    if transient_empty_fleet:
+        env["EMPTY_FLEET_ONCE_STATE"] = str(
+            tmp_path / "empty-fleet-once"
+        )
+    if wrong_fleet:
+        env["WRONG_FLEET"] = "1"
+    if malformed_account:
+        env["MALFORMED_ACCOUNT"] = "1"
+    if malformed_group:
+        env["MALFORMED_GROUP"] = "1"
+    if malformed_group_tags:
+        env["MALFORMED_GROUP_TAGS"] = "1"
+    if fleet_lookup_group_missing:
+        env["FLEET_LOOKUP_GROUP_MISSING"] = "1"
+    if wrong_aks_id:
+        env["WRONG_AKS_ID"] = "1"
+    if wrong_fleet_id:
+        env["WRONG_FLEET_ID"] = "1"
+    if malformed_lease_type:
+        env["MALFORMED_LEASE_TYPE"] = "1"
+    if invalid_lease_timestamp:
+        env["INVALID_LEASE_TIMESTAMP"] = "1"
     return env, output_path
 
 
@@ -686,6 +757,189 @@ def test_resume_manifest_does_not_silently_publish_empty_inventory(tmp_path):
     assert "clusters" not in manifest
 
 
+def test_resume_manifest_retries_valid_but_incomplete_inventory(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        transient_incomplete_aks=True,
+        transient_empty_fleet=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "ready"
+    assert manifest["cluster_count"] == 2
+    assert len(manifest["fleet"]) == 1
+    assert result.stderr.count("valid but incomplete response") == 2
+
+
+def test_resume_manifest_rejects_wrong_fleet_identity(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        wrong_fleet=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "inventory_invalid"
+    assert "clustermesh-flt" in manifest["fatal_error"]
+
+
+def test_resume_manifest_rejects_wrong_shaped_account_json(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        malformed_account=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "account_query_failed"
+    assert "expected object" in manifest["fatal_error"]
+
+
+def test_resume_manifest_rejects_wrong_shaped_resource_group_json(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        malformed_group=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "resource_group_inventory_failed"
+    assert "expected object" in manifest["fatal_error"]
+
+
+def test_resume_manifest_rejects_invalid_resource_group_tags(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        malformed_group_tags=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "resource_group_inventory_failed"
+    assert "invalid tags or deletion_due_time" in manifest["fatal_error"]
+
+
+def test_resume_manifest_rejects_malformed_deletion_lease_type(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        malformed_lease_type=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "resource_group_inventory_failed"
+    assert "invalid tags or deletion_due_time" in manifest["fatal_error"]
+
+
+def test_resume_manifest_rejects_unparseable_deletion_lease(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        invalid_lease_timestamp=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "resource_group_inventory_failed"
+    assert "invalid deletion_due_time timestamp" in manifest["fatal_error"]
+
+
+def test_resume_manifest_rejects_wrong_aks_resource_id(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        wrong_aks_id=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "inventory_invalid"
+    assert "not exactly mesh-1..mesh-2" in manifest["fatal_error"]
+
+
+def test_resume_manifest_rejects_wrong_fleet_resource_id(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        wrong_fleet_id=True,
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "inventory_invalid"
+    assert "clustermesh-flt" in manifest["fatal_error"]
+
+
 def test_resume_manifest_rejects_extra_untagged_aks_cluster(tmp_path):
     env, output_path = _write_resume_manifest_fixture(
         tmp_path,
@@ -725,6 +979,50 @@ def test_resume_manifest_allows_explicit_post_reset_fleet_absence(tmp_path):
     manifest = json.loads(output_path.read_text(encoding="utf-8"))
     assert manifest["status"] == "ready"
     assert manifest["fleet"] == []
+
+
+def test_resume_manifest_reset_rejects_transient_empty_fleet_list(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        transient_empty_fleet=True,
+    )
+    env["CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT"] = "0"
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "inventory_invalid"
+    assert len(manifest["fleet"]) == 1
+    assert "exactly 0" in manifest["fatal_error"]
+
+
+def test_resume_manifest_reset_rejects_parent_group_loss(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        transient_empty_fleet=True,
+        fleet_lookup_group_missing=True,
+    )
+    env["CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT"] = "0"
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "fleet_inventory_failed"
+    assert "lost the parent resource group" in manifest["fatal_error"]
 
 
 def test_preserved_validation_rejects_missing_node_resource_group(tmp_path):

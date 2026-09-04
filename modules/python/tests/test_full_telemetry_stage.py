@@ -758,7 +758,7 @@ def test_required_platform_metrics_fail_the_wait_task():
     assert "--argjson capacity_audits" not in wait_script
 
 
-def test_managed_monitoring_convergence_blocks_policy_disable_rollout():
+def test_managed_monitoring_convergence_records_accepted_policy_gap():
     configure_script = (
         REPOSITORY_ROOT
         / "scenarios"
@@ -771,9 +771,13 @@ def test_managed_monitoring_convergence_blocks_policy_disable_rollout():
     assert "aks-managed-azure-monitor-metrics" in configure_script
     assert "AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED" in configure_script
     assert 'if [ "$policy_after" = "never" ]' in configure_script
+    assert "CL2_ACCEPT_CILIUM_POLICY_GAP" in configure_script
+    assert "accepting documented Cilium policy/L7 gap" in configure_script
     assert "Cilium policy mode changed during managed-monitoring setup" in (
         configure_script
     )
+    assert "AKS_MANAGED_ROUTE_ATTEMPTS" in configure_script
+    assert "managed_route_command" in configure_script
     assert "Cilium remained stable for" in configure_script
 
 
