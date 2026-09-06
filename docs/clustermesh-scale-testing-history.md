@@ -1,13 +1,14 @@
 # ClusterMesh scale-testing program history
 
-Last updated: 2026-09-04
+Last updated: 2026-09-05
 
-Status cutoff: 2026-09-04 10:30 PDT / 17:30 UTC. Build 79006 had a failed
-handoff task and was still `InProgress` while finalization continued.
+Status cutoff: 2026-09-05 20:50 PDT / 2026-09-06 03:50 UTC. Build 79006 was
+manually canceled after a six-hour finalization stall. The preserved
+100-cluster environment was revalidated and the finalization path was hardened.
 
 This document records the engineering history of the ClusterMesh scale-testing
-program from the first Telescope vertical slice through the preserved n=100
-workload attempt in build 79006.
+program from the first Telescope vertical slice through the terminal outcome
+and hardening follow-up for preserved n=100 workload build 79006.
 
 It is a chronological engineering record: why the framework was created, how
 the architecture evolved, which builds proved each capability, which failures
@@ -21,7 +22,7 @@ replace, the
 The history was reconstructed from:
 
 - the branch history after the April 28, 2026 merge base with `origin/main`;
-- 423 program commits through `3746878`;
+- 426 program commits through `2e979d2`;
 - Azure DevOps definition 23 build records and retained artifacts;
 - the original and consolidated session handoffs;
 - the complete checkpoint history for the lifecycle, telemetry, preservation,
@@ -80,12 +81,16 @@ The primary remaining gap is:
 
 - The complete eight-scenario n=100 suite has still not started on the final
   preserved environment.
-- Builds 78903 and 78916 failed safely before scenario one. In build 79006, the
-  handoff task failed before scenario one while the overall build remained
-  `InProgress` while finalizing evidence.
+- Builds 78903, 78916, and 79006 all failed safely before scenario one.
+- Build 79006 was manually canceled only after its post-handoff telemetry audit
+  had run for six hours without a total deadline. The strict resume manifest
+  still published; managed telemetry upload did not.
 - Build 79006 proved the final telemetry recovery, but its handoff rejected a
   real-node-drain recreation of one controller-owned mock-agent Pod with a new
   UID.
+- Terminal verification still found 100 healthy AKS clusters, 201 healthy
+  pools, 100 Connected Fleet members, 312/312 exact Cilium agents, 10,000 Ready
+  KWOK Nodes, and 10,000 Running/Ready mock agents.
 
 ## 3. Program timeline at a glance
 
@@ -1008,9 +1013,12 @@ Build
 [79006](https://dev.azure.com/akstelescope/telescope/_build/results?buildId=79006)
 was pinned to `37468780ada3c900a055c0dfa303e636119529db`.
 
-At this document's status cutoff, the handoff task had failed but the overall
-ADO build was still `InProgress` while telemetry and lifecycle finalization
-continued.
+The handoff task failed and the build then spent six hours in
+`Audit managed telemetry and export platform metrics`. The task had neither a
+whole-phase deadline nor a subprocess deadline for every Azure CLI export.
+Because no scenario had started, the continuing platform export could no longer
+change the suite outcome. The build was manually canceled and finished
+`Canceled`.
 
 Live gates that passed:
 
@@ -1055,6 +1063,51 @@ Kubernetes evidence:
 The environment recovered functionally, but the exact preservation identity
 contract was broken. The handoff artifact was published and all eight workload
 scenarios were suppressed.
+
+Cancellation allowed the `always()` strict resume-manifest tasks to run. The
+published terminal artifacts were:
+
+- `n100-workload-handoff-79006`;
+- `n100-resume-manifest-79006-1`.
+
+Managed telemetry upload and publication were skipped by whole-build
+cancellation. The strict manifest recorded 100 Succeeded/Running AKS clusters
+and the preserved parent lease.
+
+Terminal live validation independently proved:
+
+- parent RG `78751-f36f3d5a` Succeeded;
+- 100/100 AKS Succeeded and Running;
+- 201/201 pools Succeeded and Running;
+- Fleet `clustermesh-flt` Succeeded with 100/100 members Connected and zero
+  operation/mesh errors;
+- all 312 named Cilium agents had the exact 99/99 remote identities;
+- all 10,000 KWOK Nodes were Ready;
+- all 10,000 mock agents were Running and Ready;
+- `mesh-99/kwok-node-28` had recovered with zero restarts but retained the new
+  UID, so the exact baseline contract remained broken.
+
+The stall was fixed in `dac7f8a`:
+
+- 150-minute whole-phase supervisor under a 165-minute task backstop;
+- 90-minute managed audit and 30-second total HTTP request deadlines;
+- atomic managed-audit reports and explicit timeout/failure fallbacks;
+- bounded platform export with per-command, per-cluster, and total deadlines;
+- incremental platform manifests that preserve partial progress;
+- optional platform-export skip when no scenario window exists;
+- truthful graceful versus SIGKILL timeout classification.
+
+Terminal lease inspection also found that the late `mesh-86` AKS monitoring
+update had rewritten its managed-RG tags to the original September 9 lease,
+after preflight had extended all resource groups. The live tag was restored to
+the parent September 11 lease. Commit `2e979d2` added an `always()` post-update
+lease refresh, authoritative post-update rereads of all exact managed RGs, and
+strict resume-manifest validation of the observed lease evidence.
+
+Definition 23 preview run `-1` compiled commit `2e979d2` with only
+`azure_eastus2euap_n100_debug_resume_37deca`, the exact build-79006 parameters,
+the bounded telemetry finalizer, and the new lease-refresh/manifest chain. No
+new pipeline run was queued.
 
 This failure was not:
 
@@ -1141,7 +1194,7 @@ session, artifact, or snapshot evidence.
 | 78851 | cross-run verify | Succeeded | No | Exact 20k UID proof and bounded fault recovery |
 | 78903 | workload resume | Failed | No | Failed before handoff; unsafe 79-role repair expansion rejected |
 | 78916 | workload resume | Failed | No | Failed in telemetry; 99/100 monitoring and policy-gap defect |
-| 79006 | workload resume | InProgress at cutoff | No | Handoff task failed; telemetry 100/100, one drain-driven Pod UID mutation, finalization continuing |
+| 79006 | workload resume | Canceled | No | Telemetry 100/100; handoff rejected one drain-driven Pod UID mutation; manual cancellation ended a six-hour unbounded audit; strict resume manifest published |
 
 ## 6. Current architecture
 
@@ -1523,6 +1576,8 @@ Still not live-proven:
 | `a6bbb03` | 2026-09-03 | Workload rerun hardening |
 | `943a3d6` | 2026-09-03 | Every-agent live validation |
 | `3746878` | 2026-09-04 | Managed telemetry resume hardening |
+| `dac7f8a` | 2026-09-05 | Bounded telemetry finalization and partial evidence |
+| `2e979d2` | 2026-09-05 | Post-update managed-RG lease refresh and strict evidence |
 
 ## 11. Source map
 
