@@ -669,6 +669,8 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     )
     assert "preserved_mock_verify.py" in resume
     assert "Verify preserved n100 KWOK identities and exact recovery" in resume
+    assert "--capture-attempts" in resume
+    assert "--capture-retry-seconds" in resume
     assert "Revalidate cross-cluster data path after KWOK recovery" in resume
     assert "Publish preserved n100 KWOK verification" in resume
     assert "cross_cluster_data_path_failed" in resume

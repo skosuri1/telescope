@@ -297,7 +297,9 @@ jobs:
           --fault-agent-start 0 \
           --fault-node-start 10 \
           --max-concurrent "${MOCK_VERIFY_CONCURRENCY:-8}" \
-          --reconcile-concurrent "${MOCK_RECONCILE_CONCURRENCY:-8}"
+          --reconcile-concurrent "${MOCK_RECONCILE_CONCURRENCY:-8}" \
+          --capture-attempts "${MOCK_VERIFY_CAPTURE_ATTEMPTS:-5}" \
+          --capture-retry-seconds "${MOCK_VERIFY_CAPTURE_RETRY_SECONDS:-15}"
       displayName: "Verify preserved n100 KWOK identities and exact recovery"
       env:
         PRESERVED_MOCK_VERIFY: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_mock_verify.py

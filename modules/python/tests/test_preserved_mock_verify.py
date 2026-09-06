@@ -196,6 +196,47 @@ def test_pre_boundary_requires_every_uid_to_survive(tmp_path):
         verify.compare_pre_boundary(by_role, live)
 
 
+def test_capture_live_retries_transient_cluster_probe(monkeypatch):
+    cluster = verify.capture.Cluster(
+        name="clustermesh-1",
+        resource_group="run-id",
+        role="mesh-1",
+        kubeconfig="/tmp/mesh-1.config",
+    )
+    attempts = []
+
+    def flaky_probe(observed_cluster, **_kwargs):
+        attempts.append(observed_cluster.role)
+        if len(attempts) == 1:
+            raise verify.capture.CaptureError("502 Bad Gateway")
+        return {
+            "role": observed_cluster.role,
+            "node_uids": {"kwok-node-0": "node-uid"},
+            "agent_uids": {"kwok-node-0": "agent-uid"},
+        }
+
+    monkeypatch.setattr(verify.capture, "probe_cluster", flaky_probe)
+    monkeypatch.setattr(verify.capture.time, "sleep", lambda _seconds: None)
+
+    result = verify.capture_live(
+        [cluster],
+        state_root="/tmp/state",
+        run_id="run-id",
+        expected_cluster_count=1,
+        expected_mock_count=1,
+        max_concurrent=1,
+        command_timeout_seconds=30,
+        resource_ids={"mesh-1": "cluster-id"},
+        expected_cilium_names={"mesh-1": "mesh-11"},
+        runner=lambda _args, _timeout: "",
+        capture_attempts=3,
+        capture_retry_seconds=0,
+    )
+
+    assert attempts == ["mesh-1", "mesh-1"]
+    assert result[0]["resource_id"] == "cluster-id"
+
+
 def test_fault_plan_is_bounded_and_post_changes_are_exact(tmp_path):
     baseline_dir, rows = _write_baseline(
         tmp_path,

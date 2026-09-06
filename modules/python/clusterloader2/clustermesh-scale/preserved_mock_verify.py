@@ -462,11 +462,13 @@ def capture_live(
     resource_ids: Dict[str, str],
     expected_cilium_names: Dict[str, str],
     runner: Runner,
+    capture_attempts: int = 5,
+    capture_retry_seconds: int = 15,
 ) -> List[dict]:
     """Capture exact live identities and Cilium health for every cluster."""
 
-    def capture_one(cluster: capture.Cluster) -> dict:
-        result = capture.probe_cluster(
+    def capture_once(cluster: capture.Cluster) -> dict:
+        return capture.probe_cluster(
             cluster,
             state_root=state_root,
             run_id=run_id,
@@ -479,6 +481,14 @@ def capture_live(
                 for role, name in expected_cilium_names.items()
                 if role != cluster.role
             },
+        )
+
+    def capture_one(cluster: capture.Cluster) -> dict:
+        result = capture.probe_cluster_with_retries(
+            cluster,
+            capture_once,
+            capture_attempts,
+            capture_retry_seconds,
         )
         result["resource_id"] = resource_ids[cluster.role]
         print(
@@ -837,6 +847,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reconcile-concurrent", type=int, default=8)
     parser.add_argument("--command-timeout-seconds", type=int, default=120)
     parser.add_argument("--reconcile-timeout-seconds", type=int, default=3600)
+    parser.add_argument("--capture-attempts", type=int, default=5)
+    parser.add_argument("--capture-retry-seconds", type=int, default=15)
     args = parser.parse_args(argv)
     for name in (
         "baseline_build_id",
@@ -847,9 +859,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "reconcile_concurrent",
         "command_timeout_seconds",
         "reconcile_timeout_seconds",
+        "capture_attempts",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.capture_retry_seconds < 0:
+        parser.error("--capture-retry-seconds must be non-negative")
     return args
 
 
@@ -920,6 +935,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             resource_ids=platform_before["resource_ids"],
             expected_cilium_names=expected_cilium_names,
             runner=capture.run_command,
+            capture_attempts=args.capture_attempts,
+            capture_retry_seconds=args.capture_retry_seconds,
         )
         pre_boundary = compare_pre_boundary(baseline_by_role, live_before)
         write_json_atomic(
@@ -1003,6 +1020,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             resource_ids=platform_after["resource_ids"],
             expected_cilium_names=expected_cilium_names,
             runner=capture.run_command,
+            capture_attempts=args.capture_attempts,
+            capture_retry_seconds=args.capture_retry_seconds,
         )
         post_recovery = compare_post_recovery(
             baseline_by_role,
