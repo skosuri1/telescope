@@ -1294,7 +1294,10 @@ steps:
         export KUBECONFIG="$kubeconfig"
 
         echo "--- nodes ---"
-        kubectl --request-timeout=30s get nodes "${node_selector_args[@]}" -o wide
+        if ! kubectl --request-timeout=30s \
+            get nodes "${node_selector_args[@]}" -o wide; then
+          echo "##vso[task.logissue type=warning;] $role: initial node inventory diagnostic failed; continuing to the bounded readiness probe."
+        fi
         # Wait until ALL nodes reach Ready. Originally a single
         # `kubectl wait --timeout=5m` call, but a 5min hard timeout is
         # brittle when 1-2 of N nodes flap NotReady transiently at

@@ -165,6 +165,21 @@ def test_node_readiness_has_final_recovery_grace_before_failure():
     ) < snapshot_capture.index('[[ "$xtrace_state" != *x* ]] || set -x')
 
 
+def test_initial_node_inventory_is_diagnostic_not_a_gate():
+    validate = VALIDATE_RESOURCES_PATH.read_text(encoding="utf-8")
+    command = (
+        'if ! kubectl --request-timeout=30s \\\n'
+        '            get nodes "${node_selector_args[@]}" -o wide; then'
+    )
+
+    assert command in validate
+    assert (
+        "$role: initial node inventory diagnostic failed; continuing to "
+        "the bounded readiness probe."
+    ) in validate
+    assert validate.index(command) < validate.index("node_readiness_snapshot()")
+
+
 def test_cilium_status_exec_has_wall_clock_and_command_timeouts():
     validate = VALIDATE_RESOURCES_PATH.read_text(encoding="utf-8")
 
