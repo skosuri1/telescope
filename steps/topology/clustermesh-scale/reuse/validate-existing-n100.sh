@@ -251,6 +251,73 @@ if [ "$extend_lease_hours" -gt 0 ]; then
     --set tags.deletion_due_time="$deletion_due_time" \
           tags.clustermesh_debug_last_validation_build="${BUILD_BUILDID:-manual}" \
     --only-show-errors >/dev/null
+
+  az group list \
+    --query '[].{name:name,location:location,managedBy:managedBy,deletion_due_time:tags.deletion_due_time}' \
+    -o json \
+    --only-show-errors > "$subscription_groups_file"
+  node_resource_group_inventory=$(jq -cn \
+    --slurpfile expected "$node_resource_groups_file" \
+    --slurpfile actual "$subscription_groups_file" '
+      ($actual[0] | INDEX(.name | ascii_downcase)) as $by_name
+      | [$expected[0][] as $item
+        | ($by_name[($item.name | ascii_downcase)] // null) as $group
+        | $item + {
+            exists: ($group != null),
+            actual_location: ($group.location // ""),
+            managed_by: ($group.managedBy // ""),
+            deletion_due_time: ($group.deletion_due_time // "")
+          }]
+    ')
+  invalid_refreshed_node_resource_groups=$(jq -c \
+    --arg region "$expected_region" '
+      [.[] | select(
+        (.exists | not) or
+        ((.actual_location | ascii_downcase) !=
+          ($region | ascii_downcase)) or
+        ((.managed_by | ascii_downcase) !=
+          (.cluster_id | ascii_downcase))
+      ) | {
+        role,
+        cluster_name,
+        node_resource_group: .name,
+        exists,
+        expected_cluster_id: .cluster_id,
+        managed_by,
+        expected_location: $region,
+        actual_location
+      }]
+    ' <<< "$node_resource_group_inventory")
+  if [ "$(jq 'length' <<< "$invalid_refreshed_node_resource_groups")" -ne 0 ]; then
+    invalid_refreshed_sample=$(jq -c \
+      '.[0:20]' <<< "$invalid_refreshed_node_resource_groups")
+    echo "Preserved AKS node resource groups changed during lease refresh: $invalid_refreshed_sample" >&2
+    exit 1
+  fi
+  stale_refreshed_node_resource_groups=$(jq -c \
+    --arg required "$deletion_due_time" '
+      ($required | fromdateiso8601) as $required_epoch
+      | [.[] |
+          (.deletion_due_time |
+            try fromdateiso8601 catch null) as $observed_epoch
+          | select(
+              $observed_epoch == null or
+              $observed_epoch < $required_epoch
+            )
+          | {
+              role,
+              cluster_name,
+              node_resource_group: .name,
+              observed_deletion_due_time: .deletion_due_time,
+              required_deletion_due_time: $required
+            }]
+    ' <<< "$node_resource_group_inventory")
+  if [ "$(jq 'length' <<< "$stale_refreshed_node_resource_groups")" -ne 0 ]; then
+    stale_refreshed_sample=$(jq -c \
+      '.[0:20]' <<< "$stale_refreshed_node_resource_groups")
+    echo "Managed resource-group lease refresh did not converge: $stale_refreshed_sample" >&2
+    exit 1
+  fi
 else
   deletion_due_time="$existing_deletion_due_time"
 fi

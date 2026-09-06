@@ -214,6 +214,17 @@ def _write_validation_fixture(tmp_path, *, include_second_node_group):
         "elif args[:2] == ['group', 'list']:\n"
         "    print(json.dumps(fixture['groups']))\n"
         "elif args[:2] == ['group', 'update']:\n"
+        "    name = args[args.index('--name') + 1]\n"
+        "    values = args[args.index('--set') + 1:]\n"
+        "    values = [value for value in values if not value.startswith('--')]\n"
+        "    lease = next(value.split('=', 1)[1] for value in values if value.startswith('tags.deletion_due_time='))\n"
+        "    if name == os.environ['CLUSTERMESH_DEBUG_TARGET_RUN_ID']:\n"
+        "        fixture['parent']['tags']['deletion_due_time'] = lease\n"
+        "    else:\n"
+        "        group = next(item for item in fixture['groups'] if item['name'] == name)\n"
+        "        group['deletion_due_time'] = lease\n"
+        "    with open(os.environ['AZ_FIXTURE'], 'w', encoding='utf-8') as handle:\n"
+        "        json.dump(fixture, handle)\n"
         "    print('{}')\n"
         "else:\n"
         "    raise SystemExit(f'unexpected az command: {args}')\n",
@@ -258,6 +269,7 @@ def _write_resume_manifest_fixture(
     wrong_fleet_id=False,
     malformed_lease_type=False,
     invalid_lease_timestamp=False,
+    lease_refresh_state=None,
 ):
     fake_bin = tmp_path / "manifest-bin"
     fake_bin.mkdir()
@@ -381,6 +393,50 @@ def _write_resume_manifest_fixture(
         env["MALFORMED_LEASE_TYPE"] = "1"
     if invalid_lease_timestamp:
         env["INVALID_LEASE_TIMESTAMP"] = "1"
+    if lease_refresh_state is not None:
+        lease_refresh_path = tmp_path / "lease-refresh-validation.json"
+        lease_refresh_path.write_text(
+            json.dumps(
+                {
+                    "target_run_id": "run",
+                    "subscription_id": "test-subscription",
+                    "region": "eastus2euap",
+                    "deletion_due_time": (
+                        "2099-01-01T00:00:00Z"
+                        if lease_refresh_state == "valid"
+                        else "2000-01-01T00:00:00Z"
+                    ),
+                    "cluster_count": 2,
+                    "fleet_count": 1,
+                    "node_resource_group_count": 2,
+                    "node_resource_groups_extended": 1,
+                    "node_resource_groups": [
+                        {
+                            "name": "MC_run_1",
+                            "deletion_due_time": (
+                                "2099-01-01T00:00:00Z"
+                            ),
+                            "required_deletion_due_time": (
+                                "2099-01-01T00:00:00Z"
+                            ),
+                        },
+                        {
+                            "name": "MC_run_2",
+                            "deletion_due_time": (
+                                "2099-01-01T00:00:00Z"
+                            ),
+                            "required_deletion_due_time": (
+                                "2099-01-01T00:00:00Z"
+                            ),
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        env["CLUSTERMESH_DEBUG_LEASE_REFRESH_MANIFEST_PATH"] = str(
+            lease_refresh_path
+        )
     return env, output_path
 
 
@@ -752,6 +808,46 @@ def test_resume_manifest_requires_exact_live_inventory(tmp_path):
         "mesh-2",
     ]
     assert len(manifest["fleet"]) == 1
+
+
+def test_resume_manifest_requires_matching_lease_refresh_evidence(tmp_path):
+    env, output_path = _write_resume_manifest_fixture(
+        tmp_path,
+        lease_refresh_state="valid",
+    )
+
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "ready"
+    assert manifest["lease_refresh"]["node_resource_group_count"] == 2
+    assert manifest["lease_refresh"]["node_resource_groups_extended"] == 1
+
+    invalid_tmp_path = tmp_path / "invalid"
+    invalid_tmp_path.mkdir()
+    env, output_path = _write_resume_manifest_fixture(
+        invalid_tmp_path,
+        lease_refresh_state="stale",
+    )
+    result = subprocess.run(
+        ["bash", str(MANIFEST_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "inventory_invalid"
+    assert "lease refresh evidence is invalid" in manifest["fatal_error"]
 
 
 def test_resume_manifest_does_not_silently_publish_empty_inventory(tmp_path):
@@ -1432,3 +1528,29 @@ def test_resume_manifest_template_preserves_legacy_defaults():
 
     assert "- name: expected_cluster_count\n  type: number\n  default: 100" in template
     assert "- name: expected_fleet_count\n  type: number\n  default: -1" in template
+    assert "Refresh preserved n100 managed RG leases" in template
+    assert "timeoutInMinutes: 15" in template
+    assert "timeoutInMinutes: 45" in template
+    assert 'CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"' in template
+    assert 'CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET: "false"' in template
+    assert "validate-existing-n100.sh" in template
+    assert template.count("condition: always()") == 3
+    assert template.index(
+        "Refresh preserved n100 managed RG leases"
+    ) < template.index("Write preserved n100 resume manifest")
+
+
+def test_manifest_enabled_jobs_allow_cancellation_finalizers_to_finish():
+    pipeline = PIPELINE_PATH.read_text(encoding="utf-8")
+    fresh = _stage_block(
+        "azure_eastus2euap_n100_debug_preserve_37deca",
+        "azure_eastus2euap_n100_debug_reset_fleet_37deca",
+    )
+    reset = _stage_block(
+        "azure_eastus2euap_n100_debug_reset_fleet_37deca",
+        "azure_eastus2euap_n100_debug_resume_37deca",
+    )
+
+    assert "cancel_timeout_in_minutes: 90" in fresh
+    assert "cancelTimeoutInMinutes: 90" in reset
+    assert "cancel_timeout_in_minutes: 120" in pipeline

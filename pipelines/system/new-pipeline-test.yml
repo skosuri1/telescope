@@ -2821,7 +2821,7 @@ stages:
             cancel_timeout_in_minutes: 120
           ${{ else }}:
             timeout_in_minutes: 600
-            cancel_timeout_in_minutes: 60
+            cancel_timeout_in_minutes: 90
           credential_type: service_connection
           ssh_key_enabled: false
           skip_execute: ${{ not(parameters.scaleDebugRunWorkload) }}
@@ -2849,6 +2849,7 @@ stages:
     jobs:
       - job: reset_fleet
         timeoutInMinutes: 180
+        cancelTimeoutInMinutes: 90
         steps:
           - template: /steps/setup-tests.yml
             parameters:

@@ -10,6 +10,7 @@ expected_fleet_name="${CLUSTERMESH_DEBUG_EXPECTED_FLEET_NAME:-clustermesh-flt}"
 expected_subscription_id="${CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}"
 tfvars_path="${CLUSTERMESH_DEBUG_TFVARS_PATH:-}"
 output_path="${CLUSTERMESH_DEBUG_MANIFEST_PATH:?CLUSTERMESH_DEBUG_MANIFEST_PATH is required}"
+lease_refresh_path="${CLUSTERMESH_DEBUG_LEASE_REFRESH_MANIFEST_PATH:-}"
 inventory_attempts="${CLUSTERMESH_DEBUG_MANIFEST_INVENTORY_ATTEMPTS:-3}"
 inventory_retry_seconds="${CLUSTERMESH_DEBUG_MANIFEST_RETRY_SECONDS:-10}"
 inventory_timeout_seconds="${CLUSTERMESH_DEBUG_MANIFEST_INVENTORY_TIMEOUT_SECONDS:-600}"
@@ -378,6 +379,41 @@ fi
 if [ -z "$inventory_error" ] && [ -z "$deletion_due_time" ]; then
   inventory_error="Preserved resource group has no deletion_due_time lease tag"
 fi
+lease_refresh="null"
+if [ -z "$inventory_error" ] && [ -n "$lease_refresh_path" ]; then
+  if [ ! -s "$lease_refresh_path" ]; then
+    inventory_error="Managed resource-group lease refresh evidence is missing at $lease_refresh_path"
+  elif ! jq -e \
+      --arg run_id "$target_run_id" \
+      --arg subscription_id "$subscription_id" \
+      --arg region "$region" \
+      --arg deletion_due_time "$deletion_due_time" \
+      --argjson clusters "$clusters" \
+      --argjson expected "$expected_count" '
+        type == "object" and
+        .target_run_id == $run_id and
+        ((.subscription_id | ascii_downcase) ==
+          ($subscription_id | ascii_downcase)) and
+        ((.region | ascii_downcase) == ($region | ascii_downcase)) and
+        .deletion_due_time == $deletion_due_time and
+        .cluster_count == $expected and
+        .node_resource_group_count == $expected and
+        (.node_resource_groups | type == "array") and
+        (.node_resource_groups | length) == $expected and
+        ([.node_resource_groups[].name] | unique | length) == $expected and
+        ([.node_resource_groups[].name | ascii_downcase] | sort) ==
+          ([$clusters[].nodeResourceGroup | ascii_downcase] | sort) and
+        all(.node_resource_groups[];
+          .required_deletion_due_time == $deletion_due_time and
+          ((.deletion_due_time |
+              try fromdateiso8601 catch null) //
+            0) >= ($deletion_due_time | fromdateiso8601))
+      ' "$lease_refresh_path" >/dev/null; then
+    inventory_error="Managed resource-group lease refresh evidence is invalid"
+  else
+    lease_refresh=$(cat "$lease_refresh_path")
+  fi
+fi
 
 manifest_tmp="${output_path}.tmp.$$"
 jq -n \
@@ -392,6 +428,7 @@ jq -n \
   --arg tfvars_sha256 "$tfvars_sha" \
   --argjson clusters "$clusters" \
   --argjson fleet "$fleet" \
+  --argjson lease_refresh "$lease_refresh" \
   '{
     status:$status,
     run_id:$run_id,
@@ -404,7 +441,11 @@ jq -n \
     cluster_count:($clusters|length),
     clusters:$clusters,
     fleet:$fleet
-  } + (if ($fatal_error | length) > 0
+  } + (if $lease_refresh == null
+       then {}
+       else {lease_refresh:$lease_refresh}
+       end
+  ) + (if ($fatal_error | length) > 0
        then {fatal_error:$fatal_error}
        else {}
        end)' > "$manifest_tmp"

@@ -20,11 +20,49 @@ parameters:
 
 steps:
 - ${{ if parameters.enabled }}:
-  - script: |
-      bash "$(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/reuse/write-resume-manifest.sh"
+  - task: AzureCLI@2
+    displayName: "Refresh preserved n100 managed RG leases"
+    condition: always()
+    timeoutInMinutes: 15
+    inputs:
+      azureSubscription: $(AZURE_SERVICE_CONNECTION)
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        az account set --subscription "$TARGET_SUBSCRIPTION_ID"
+        export CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256
+        CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256=$(
+          sha256sum "$CLUSTERMESH_DEBUG_TFVARS_PATH" | awk '{print $1}'
+        )
+        bash "$CLUSTERMESH_DEBUG_LEASE_REFRESH_SCRIPT"
+    env:
+      TARGET_SUBSCRIPTION_ID: ${{ parameters.expected_subscription_id }}
+      BUILD_BUILDID: $(Build.BuildId)
+      CLUSTERMESH_DEBUG_TARGET_RUN_ID: $(RUN_ID)
+      CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID: ${{ parameters.expected_subscription_id }}
+      CLUSTERMESH_DEBUG_EXPECTED_REGION: ${{ parameters.region }}
+      CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"
+      CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET: "false"
+      CLUSTERMESH_DEBUG_TFVARS_PATH: $(Pipeline.Workspace)/s/${{ parameters.tfvars_path }}
+      CLUSTERMESH_DEBUG_MANIFEST_PATH: $(Build.ArtifactStagingDirectory)/n100-resume/lease-refresh-validation.json
+      CLUSTERMESH_DEBUG_LEASE_REFRESH_SCRIPT: $(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/reuse/validate-existing-n100.sh
+
+  - task: AzureCLI@2
     displayName: "Write preserved n100 resume manifest"
     condition: always()
+    timeoutInMinutes: 45
+    inputs:
+      azureSubscription: $(AZURE_SERVICE_CONNECTION)
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        az account set --subscription "$TARGET_SUBSCRIPTION_ID"
+        bash "$CLUSTERMESH_DEBUG_RESUME_MANIFEST_SCRIPT"
     env:
+      TARGET_SUBSCRIPTION_ID: ${{ parameters.expected_subscription_id }}
       RUN_ID: $(RUN_ID)
       BUILD_BUILDID: $(Build.BuildId)
       BUILD_SOURCEVERSION: $(Build.SourceVersion)
@@ -34,6 +72,8 @@ steps:
       CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT: "${{ parameters.expected_fleet_count }}"
       CLUSTERMESH_DEBUG_TFVARS_PATH: $(Pipeline.Workspace)/s/${{ parameters.tfvars_path }}
       CLUSTERMESH_DEBUG_MANIFEST_PATH: $(Build.ArtifactStagingDirectory)/n100-resume/manifest.json
+      CLUSTERMESH_DEBUG_LEASE_REFRESH_MANIFEST_PATH: $(Build.ArtifactStagingDirectory)/n100-resume/lease-refresh-validation.json
+      CLUSTERMESH_DEBUG_RESUME_MANIFEST_SCRIPT: $(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/reuse/write-resume-manifest.sh
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish preserved n100 resume manifest"
