@@ -3,7 +3,10 @@
 
 import argparse
 import json
+import os
 import subprocess
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,12 +19,13 @@ from amw_tsdb_snapshot import (
 )
 
 
-def run_az(arguments):
+def run_az(arguments, timeout_seconds):
     result = subprocess.run(
         ["az", *arguments, "-o", "json"],
         check=True,
         capture_output=True,
         text=True,
+        timeout=timeout_seconds,
     )
     return json.loads(result.stdout)
 
@@ -49,7 +53,106 @@ def render_labels(labels):
     return f"{{{rendered}}}"
 
 
-def export_aggregation(output, definition, aggregation, args, start, end):
+def write_text_atomic(path, content):
+    """Write text through a same-directory atomic replacement."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def error_detail(error):
+    """Return a stable error string for subprocess and decoding failures."""
+    detail = getattr(error, "stderr", "") or str(error)
+    if isinstance(detail, bytes):
+        detail = detail.decode("utf-8", errors="replace")
+    return detail.strip()
+
+
+def effective_command_timeout(command_timeout_seconds, deadline):
+    """Cap one Azure CLI command by the remaining exporter deadline."""
+    if deadline is None:
+        return command_timeout_seconds
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(
+            cmd="AKS platform export total deadline",
+            timeout=0,
+        )
+    return min(command_timeout_seconds, remaining)
+
+
+def manifest_payload(
+    args,
+    start,
+    end,
+    definitions,
+    exported,
+    no_data,
+    errors,
+    status,
+):
+    """Build the incrementally checkpointed export manifest."""
+    return {
+        "schema_version": 1,
+        "resource": args.resource,
+        "cluster_label": args.cluster_label,
+        "start": start,
+        "end": end,
+        "status": status,
+        "complete": status == "complete" and not errors,
+        "definitions": definitions,
+        "exported": exported,
+        "no_data": no_data,
+        "errors": errors,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def checkpoint_manifest(
+    args,
+    start,
+    end,
+    definitions,
+    exported,
+    no_data,
+    errors,
+    status,
+):
+    """Atomically preserve current export progress."""
+    write_text_atomic(
+        args.manifest,
+        json.dumps(
+            manifest_payload(
+                args,
+                start,
+                end,
+                definitions,
+                exported,
+                no_data,
+                errors,
+                status,
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+
+def export_aggregation(
+    output,
+    definition,
+    aggregation,
+    args,
+    start,
+    end,
+    timeout_seconds,
+):
     metric_name = definition["name"]["value"]
     value_key = aggregation.lower()
     local_name = sanitize_metric_name(
@@ -76,7 +179,8 @@ def export_aggregation(output, definition, aggregation, args, start, end):
             start,
             "--end-time",
             end,
-        ]
+        ],
+        timeout_seconds,
     )
 
     sample_count = 0
@@ -113,7 +217,13 @@ def main():
     parser.add_argument("--end", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--command-timeout-seconds", type=int, default=60)
+    parser.add_argument("--total-timeout-seconds", type=int, default=0)
     args = parser.parse_args()
+    if args.command_timeout_seconds <= 0:
+        parser.error("--command-timeout-seconds must be positive")
+    if args.total_timeout_seconds < 0:
+        parser.error("--total-timeout-seconds must be non-negative")
 
     start = datetime.fromtimestamp(parse_time(args.start), timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -121,21 +231,80 @@ def main():
     end = datetime.fromtimestamp(parse_time(args.end), timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    definitions = run_az(
-        [
-            "monitor",
-            "metrics",
-            "list-definitions",
-            "--resource",
-            args.resource,
-        ]
-    )
-
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     exported = []
     no_data = []
     errors = []
+    definition_count = 0
+    deadline = (
+        time.monotonic() + args.total_timeout_seconds
+        if args.total_timeout_seconds
+        else None
+    )
+    checkpoint_manifest(
+        args,
+        start,
+        end,
+        definition_count,
+        exported,
+        no_data,
+        errors,
+        "querying-definitions",
+    )
+    try:
+        definitions = run_az(
+            [
+                "monitor",
+                "metrics",
+                "list-definitions",
+                "--resource",
+                args.resource,
+            ],
+            effective_command_timeout(
+                args.command_timeout_seconds,
+                deadline,
+            ),
+        )
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+    ) as error:
+        errors.append(
+            {
+                "stage": "list-definitions",
+                "error": error_detail(error),
+            }
+        )
+        checkpoint_manifest(
+            args,
+            start,
+            end,
+            definition_count,
+            exported,
+            no_data,
+            errors,
+            "failed",
+        )
+        print(
+            f"platform metric definition query failed: {error_detail(error)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    definition_count = len(definitions)
+    checkpoint_manifest(
+        args,
+        start,
+        end,
+        definition_count,
+        exported,
+        no_data,
+        errors,
+        "exporting",
+    )
+    deadline_exhausted = False
     with output_path.open("w", encoding="utf-8") as output:
         for index, definition in enumerate(definitions, start=1):
             metric_name = definition["name"]["value"]
@@ -149,6 +318,10 @@ def main():
                     "PT1M",
                 )
                 try:
+                    command_timeout = effective_command_timeout(
+                        args.command_timeout_seconds,
+                        deadline,
+                    )
                     local_name, interval, sample_count = export_aggregation(
                         output,
                         definition,
@@ -156,16 +329,45 @@ def main():
                         args,
                         start,
                         end,
+                        command_timeout,
                     )
-                except subprocess.CalledProcessError as error:
+                except (
+                    subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                    json.JSONDecodeError,
+                ) as error:
+                    detail = error_detail(error)
                     errors.append(
                         {
                             "metric": metric_name,
                             "aggregation": aggregation,
                             "interval": interval,
-                            "error": error.stderr.strip(),
+                            "error": detail,
                         }
                     )
+                    print(
+                        f"platform metric export failed for "
+                        f"{metric_name}:{aggregation}: "
+                        f"{detail}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    checkpoint_manifest(
+                        args,
+                        start,
+                        end,
+                        definition_count,
+                        exported,
+                        no_data,
+                        errors,
+                        "exporting",
+                    )
+                    if (
+                        deadline is not None
+                        and deadline - time.monotonic() <= 0.1
+                    ):
+                        deadline_exhausted = True
+                        break
                     continue
 
                 key = f"{metric_name}:{aggregation}"
@@ -181,30 +383,46 @@ def main():
                     )
                 else:
                     no_data.append(key)
+                output.flush()
+                checkpoint_manifest(
+                    args,
+                    start,
+                    end,
+                    definition_count,
+                    exported,
+                    no_data,
+                    errors,
+                    "exporting",
+                )
                 print(
                     f"platform metrics {index}/{len(definitions)}: "
                     f"{key} samples={sample_count}",
                     flush=True,
                 )
-        output.write("# EOF\n")
+            if deadline_exhausted:
+                break
+        if not deadline_exhausted:
+            output.write("# EOF\n")
 
-    manifest = {
-        "schema_version": 1,
-        "resource": args.resource,
-        "cluster_label": args.cluster_label,
-        "start": start,
-        "end": end,
-        "definitions": len(definitions),
-        "exported": exported,
-        "no_data": no_data,
-        "errors": errors,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    Path(args.manifest).write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    checkpoint_manifest(
+        args,
+        start,
+        end,
+        definition_count,
+        exported,
+        no_data,
+        errors,
+        "failed" if errors or deadline_exhausted else "complete",
     )
+    if errors:
+        print(
+            f"{len(errors)} platform metric export request(s) failed; "
+            f"inspect {args.manifest}.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

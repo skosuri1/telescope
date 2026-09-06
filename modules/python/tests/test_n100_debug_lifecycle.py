@@ -535,6 +535,24 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "Unsupported CLUSTERMESH_DEBUG_MODE" in invalid
 
 
+def test_n100_resume_bounds_failed_workload_telemetry_finalization():
+    resume = _stage_block(
+        "azure_eastus2euap_n100_debug_resume_37deca",
+        "azure_eastus2euap_n100_debug_cleanup_37deca",
+    )
+
+    for expected in (
+        'AKS_MANAGED_TELEMETRY_AUDIT_PHASE_TIMEOUT_SECONDS: "9000"',
+        'AKS_MANAGED_PROMETHEUS_AUDIT_TIMEOUT_SECONDS: "5400"',
+        'AKS_MANAGED_PROMETHEUS_REQUEST_TIMEOUT_SECONDS: "30"',
+        'AKS_PLATFORM_EXPORT_SKIP_WITHOUT_SCENARIOS: "true"',
+        'AKS_PLATFORM_EXPORT_TOTAL_TIMEOUT_SECONDS: "2700"',
+        'AKS_PLATFORM_EXPORT_CLUSTER_TIMEOUT_SECONDS: "180"',
+        'AKS_PLATFORM_AZ_COMMAND_TIMEOUT_SECONDS: "60"',
+    ):
+        assert expected in resume
+
+
 def test_resume_job_skips_terraform_and_preserves_resources():
     resume = RESUME_JOB_PATH.read_text(encoding="utf-8")
     set_run_id = SET_RUN_ID_PATH.read_text(encoding="utf-8")

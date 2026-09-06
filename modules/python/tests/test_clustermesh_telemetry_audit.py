@@ -3,6 +3,7 @@
 import argparse
 import importlib.util
 import json
+import os
 import re
 import threading
 import time
@@ -31,6 +32,67 @@ MODULE_SPEC.loader.exec_module(audit_module)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PIPELINE_PATH = REPO_ROOT / "pipelines" / "system" / "new-pipeline-test.yml"
+
+
+def test_write_report_uses_atomic_replacements(tmp_path, monkeypatch):
+    replacements = []
+    real_replace = os.replace
+
+    def record_replace(source, destination):
+        replacements.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(audit_module.os, "replace", record_replace)
+    report = {
+        "source": "azure-monitor-managed-prometheus",
+        "complete": False,
+        "checks": [],
+    }
+
+    json_path, markdown_path = audit_module.write_report(
+        report,
+        tmp_path / "managed-audit",
+    )
+
+    assert json.loads(json_path.read_text(encoding="utf-8")) == report
+    assert markdown_path.read_text(encoding="utf-8").startswith(
+        "# AKS control-plane managed Prometheus telemetry audit"
+    )
+    assert [destination for _, destination in replacements] == [
+        json_path,
+        markdown_path,
+    ]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_managed_http_request_uses_total_curl_deadline(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(
+            stdout='{"status":"success","data":{"result":[]}}'
+        )
+
+    monkeypatch.setenv("PROMETHEUS_BEARER_TOKEN", "test-token")
+    monkeypatch.setattr(audit_module.subprocess, "run", fake_run)
+
+    result = audit_module._http_prometheus_get(  # pylint: disable=protected-access
+        "https://example.test",
+        "/api/v1/series",
+        params={"match[]": ["up"]},
+        scope="/subscriptions/test",
+        timeout_seconds=17,
+    )
+
+    assert result == {"result": []}
+    command, kwargs = calls[0]
+    assert command == ["curl", "--config", "-"]
+    assert "test-token" not in command
+    assert kwargs["timeout"] == 22
+    assert "max-time = 17" in kwargs["input"]
+    assert "Authorization: Bearer test-token" in kwargs["input"]
+    assert "x-ms-azure-scoping: /subscriptions/test" in kwargs["input"]
 
 
 def identity_series(manifest):
@@ -191,8 +253,15 @@ def test_managed_audit_queries_each_cluster_workspace(tmp_path, monkeypatch):
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     calls = []
 
-    def fake_get(endpoint, path, params=None, scope=""):
+    def fake_get(
+        endpoint,
+        path,
+        params=None,
+        scope="",
+        timeout_seconds=120,
+    ):
         calls.append((endpoint, path, scope))
+        assert timeout_seconds == 17
         cluster = clusters[0] if "amw-1" in endpoint else clusters[1]
         alias = cluster["prometheus_cluster_alias"]
         jobs = [
@@ -254,6 +323,7 @@ def test_managed_audit_queries_each_cluster_workspace(tmp_path, monkeypatch):
             endpoint="",
             resource_scope="",
             workers=1,
+            request_timeout_seconds=17,
         )
     )
 
@@ -539,7 +609,7 @@ def _schema_v2_manifest(tmp_path, cluster_defs):
     return manifest, manifest_path
 
 
-def _managed_args(manifest_path, workers):
+def _managed_args(manifest_path, workers, request_timeout_seconds=17):
     return SimpleNamespace(
         manifest=str(manifest_path),
         start="2026-07-19T00:00:00Z",
@@ -547,6 +617,7 @@ def _managed_args(manifest_path, workers):
         endpoint="",
         resource_scope="",
         workers=workers,
+        request_timeout_seconds=request_timeout_seconds,
     )
 
 
@@ -565,7 +636,13 @@ def test_run_managed_workers_execute_concurrently(tmp_path, monkeypatch):
     # would leave threads waiting alone and the barrier would time out.
     barrier = threading.Barrier(cluster_count, timeout=5)
 
-    def fake_run_managed_query(_args, _cluster_manifest, _endpoint, _scope):
+    def fake_run_managed_query(
+        _args,
+        _cluster_manifest,
+        _endpoint,
+        _scope,
+        _request_timeout_seconds,
+    ):
         barrier.wait()
         return {"complete": True, "checks": []}
 
@@ -590,7 +667,13 @@ def test_run_managed_single_worker_does_not_overlap(tmp_path, monkeypatch):
     )
     barrier = threading.Barrier(2, timeout=0.5)
 
-    def fake_run_managed_query(_args, _cluster_manifest, _endpoint, _scope):
+    def fake_run_managed_query(
+        _args,
+        _cluster_manifest,
+        _endpoint,
+        _scope,
+        _request_timeout_seconds,
+    ):
         barrier.wait()
         return {"complete": True, "checks": []}
 
@@ -619,7 +702,13 @@ def test_run_managed_preserves_manifest_cluster_order(tmp_path, monkeypatch):
     # manifest order, cluster_reports/checks would come back as c, b, a.
     sleep_by_role = {"mesh-a": 0.3, "mesh-b": 0.15, "mesh-c": 0.0}
 
-    def fake_run_managed_query(_args, cluster_manifest, _endpoint, _scope):
+    def fake_run_managed_query(
+        _args,
+        cluster_manifest,
+        _endpoint,
+        _scope,
+        _request_timeout_seconds,
+    ):
         role = cluster_manifest["clusters"][0]["role"]
         time.sleep(sleep_by_role[role])
         return {
@@ -657,7 +746,13 @@ def test_run_managed_propagates_worker_exception(tmp_path, monkeypatch):
         ],
     )
 
-    def fake_run_managed_query(_args, cluster_manifest, _endpoint, _scope):
+    def fake_run_managed_query(
+        _args,
+        cluster_manifest,
+        _endpoint,
+        _scope,
+        _request_timeout_seconds,
+    ):
         role = cluster_manifest["clusters"][0]["role"]
         if role == "mesh-2":
             raise RuntimeError("simulated managed Prometheus query failure")
@@ -686,9 +781,15 @@ def test_run_managed_uses_exact_scope_for_shared_workspace_clusters(
     calls = []
     lock = threading.Lock()
 
-    def fake_get(endpoint, path, params=None, scope=""):
+    def fake_get(
+        endpoint,
+        path,
+        params=None,
+        scope="",
+        timeout_seconds=120,
+    ):
         with lock:
-            calls.append((endpoint, scope))
+            calls.append((endpoint, scope, timeout_seconds))
         del path, params
         return []
 
@@ -702,14 +803,15 @@ def test_run_managed_uses_exact_scope_for_shared_workspace_clusters(
     # Both clusters share the SAME workspace endpoint, but concurrency must
     # not leak or mix up the per-cluster x-ms-azure-scoping resource id: all
     # calls hit the shared endpoint, tagged with exactly the right scope.
-    endpoints = {endpoint for endpoint, _ in calls}
+    endpoints = {endpoint for endpoint, _, _ in calls}
     assert endpoints == {shared_endpoint}
     expected_calls_per_cluster = 1 + len(audit_module.MANAGED_SERIES_METRICS)
-    counts = Counter(scope for _, scope in calls)
+    counts = Counter(scope for _, scope, _ in calls)
     assert counts == {
         "cluster-1": expected_calls_per_cluster,
         "cluster-2": expected_calls_per_cluster,
     }
+    assert {timeout for _, _, timeout in calls} == {17}
     del manifest
 
 
@@ -760,6 +862,27 @@ def test_managed_parser_workers_defaults_to_one():
         ]
     )
     assert args.workers == 1
+    assert args.request_timeout_seconds == 120
+
+
+def test_managed_parser_rejects_invalid_request_timeout(capsys):
+    with pytest.raises(SystemExit):
+        audit_module.parse_args(
+            [
+                "managed",
+                "--manifest",
+                "manifest.json",
+                "--start",
+                "s",
+                "--end",
+                "e",
+                "--output-prefix",
+                "out",
+                "--request-timeout-seconds",
+                "0",
+            ]
+        )
+    assert "positive" in capsys.readouterr().err
 
 
 def _pipeline_stage_block(pipeline_text, stage_name):

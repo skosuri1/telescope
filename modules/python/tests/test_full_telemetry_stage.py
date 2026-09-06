@@ -641,6 +641,15 @@ def test_managed_collection_phases_are_separate_visible_tasks():
     assert "AKS_TELEMETRY_CONFIGURED" in template
     assert "AKS_PLATFORM_METRICS_PRE_SCENARIO_READY" in template
     assert template.count("succeededOrFailed()") >= 4
+    assert template.count("timeoutInMinutes: 165") == 1
+    audit_task = template[
+        template.rfind(
+            "- task: AzureCLI@2",
+            0,
+            template.index("Audit managed telemetry and export platform metrics"),
+        ) : template.index("Audit managed telemetry and export platform metrics")
+    ]
+    assert "timeoutInMinutes: 165" in audit_task
 
 
 def test_native_snapshots_are_relabelled_before_publish_and_upload():

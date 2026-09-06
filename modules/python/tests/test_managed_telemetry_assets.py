@@ -995,6 +995,452 @@ def test_wait_marks_throttled_amw_unready(tmp_path):
     assert (output_dir / "aks-platform-mesh-1.openmetrics").is_file()
 
 
+def test_audit_phase_times_out_and_skips_platform_without_scenarios(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    manifest_path = tmp_path / "run-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "run_id": "test-run",
+                "configured_at": "2026-09-04T00:00:00Z",
+                "workspace": {"mode": "per-cluster"},
+                "workspaces": [
+                    {
+                        "slot": "mesh-1",
+                        "name": "test-amw-mesh-1",
+                        "id": "test-amw",
+                        "capacity_guard": {
+                            "monitoring_window_start": "2026-09-04T00:00:00Z"
+                        },
+                    }
+                ],
+                "query": {
+                    "resource_endpoint": "https://example",
+                    "resource_scope": "/subscriptions/test",
+                },
+                "logs": {"workspace": {"customer_id": "law-id"}},
+                "clusters": [
+                    {
+                        "role": "mesh-1",
+                        "id": "cluster-id",
+                        "prometheus_cluster_alias": "test_run_mesh_1",
+                        "workspace": {
+                            "slot": "mesh-1",
+                            "name": "test-amw-mesh-1",
+                            "id": "test-amw",
+                            "prometheus_query_endpoint": "https://example",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "run-manifest.json").write_text(
+        json.dumps(
+            {
+                "collected_at": "2026-09-04T00:10:00Z",
+                "audit_window": {
+                    "start": "2026-09-04T00:00:00Z",
+                    "end": "2026-09-04T00:10:00Z",
+                },
+                "logs_window": {"end": None},
+                "scenario_windows": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_az = fake_bin / "az"
+    fake_az.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -euo pipefail
+            if [ "${1:-} ${2:-} ${3:-}" = "monitor metrics list" ]; then
+              if [[ " $* " == *" TimeSeriesSamplesDropped "* ]]; then
+                echo '{"value":[{"name":{"value":"TimeSeriesSamplesDropped"},"timeseries":[]},{"name":{"value":"EventsDropped"},"timeseries":[]}]}'
+              else
+                echo '{"value":[{"name":{"value":"ActiveTimeSeries"},"timeseries":[{"data":[{"maximum":100}]}]},{"name":{"value":"ActiveTimeSeriesLimit"},"timeseries":[{"data":[{"maximum":1000000}]}]},{"name":{"value":"ActiveTimeSeriesPercentUtilization"},"timeseries":[{"data":[{"maximum":0.01}]}]},{"name":{"value":"EventsPerMinuteIngested"},"timeseries":[{"data":[{"maximum":100}]}]},{"name":{"value":"EventsPerMinuteIngestedLimit"},"timeseries":[{"data":[{"maximum":1000000}]}]},{"name":{"value":"EventsPerMinuteIngestedPercentUtilization"},"timeseries":[{"data":[{"maximum":0.01}]}]}]}'
+              fi
+            elif [ "${1:-} ${2:-}" = "account get-access-token" ]; then
+              echo fake-token
+            else
+              echo "Unexpected az command: $*" >&2
+              exit 1
+            fi
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_az.chmod(fake_az.stat().st_mode | stat.S_IXUSR)
+    audit_script = tmp_path / "slow-audit.py"
+    audit_script.write_text(
+        "import pathlib\nimport sys\nimport time\n"
+        "prefix = pathlib.Path(sys.argv[sys.argv.index('--output-prefix') + 1])\n"
+        "prefix.with_suffix('.json').write_text('{\"complete\":')\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    platform_marker = tmp_path / "platform-ran"
+    platform_script = tmp_path / "platform.py"
+    platform_script.write_text(
+        "import os\nfrom pathlib import Path\n"
+        "Path(os.environ['PLATFORM_MARKER']).touch()\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "AKS_CONTROL_PLANE_METRICS_ENABLED": "true",
+            "AKS_CONTROL_PLANE_METRICS_CONCURRENCY": "1",
+            "AKS_AMW_METRICS_QUERY_ATTEMPTS": "1",
+            "AKS_AMW_METRICS_QUERY_RETRY_SECONDS": "0",
+            "AKS_MANAGED_TELEMETRY_AUDIT_PHASE_TIMEOUT_SECONDS": "10",
+            "AKS_MANAGED_PROMETHEUS_AUDIT_TIMEOUT_SECONDS": "1",
+            "AKS_MANAGED_PROMETHEUS_REQUEST_TIMEOUT_SECONDS": "1",
+            "AKS_PLATFORM_EXPORT_SKIP_WITHOUT_SCENARIOS": "true",
+            "AKS_PLATFORM_EXPORT_TOTAL_TIMEOUT_SECONDS": "2",
+            "AKS_PLATFORM_EXPORT_CLUSTER_TIMEOUT_SECONDS": "1",
+            "AKS_PLATFORM_AZ_COMMAND_TIMEOUT_SECONDS": "1",
+            "MANIFEST_PATH": str(manifest_path),
+            "OUTPUT_DIR": str(output_dir),
+            "RUN_ID": "test-run",
+            "AUDIT_SCRIPT": str(audit_script),
+            "PLATFORM_EXPORT_SCRIPT": str(platform_script),
+            "PLATFORM_MARKER": str(platform_marker),
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+        }
+    )
+
+    started = time.monotonic()
+    result = subprocess.run(
+        ["bash", str(TELEMETRY_DIR / "audit-managed-prometheus.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert elapsed < 5
+    assert "audit returned 124" in result.stdout
+    assert "skipping optional per-cluster platform export" in result.stdout
+    execution = json.loads(
+        (output_dir / "telemetry-audit-managed-execution.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert execution["timed_out"] is True
+    assert execution["timeout_seconds"] == 1
+    assert execution["report_valid"] is False
+    assert execution["fallback_written"] is True
+    fallback = json.loads(
+        (output_dir / "telemetry-audit-managed.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert fallback["complete"] is False
+    assert "valid report pair" in (
+        output_dir / "telemetry-audit-managed.md"
+    ).read_text(encoding="utf-8")
+    platform_summary = json.loads(
+        (output_dir / "aks-platform-export-summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert platform_summary["skipped"] is True
+    assert platform_summary["scenario_window_count"] == 0
+    assert not platform_marker.exists()
+
+    killed_output_dir = tmp_path / "killed-output"
+    killed_output_dir.mkdir()
+    (killed_output_dir / "run-manifest.json").write_text(
+        (output_dir / "run-manifest.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    audit_script.write_text(
+        "import os\nimport signal\nos.kill(os.getpid(), signal.SIGKILL)\n",
+        encoding="utf-8",
+    )
+    environment["OUTPUT_DIR"] = str(killed_output_dir)
+    killed = subprocess.run(
+        ["bash", str(TELEMETRY_DIR / "audit-managed-prometheus.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+
+    assert killed.returncode == 0, killed.stdout + killed.stderr
+    killed_execution = json.loads(
+        (
+            killed_output_dir
+            / "telemetry-audit-managed-execution.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert killed_execution["exit_code"] == 137
+    assert killed_execution["timed_out"] is False
+
+
+def test_audit_phase_supervisor_bounds_capacity_collection(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "telemetry-audit-managed.json").write_text(
+        json.dumps({"complete": True, "checks": []}),
+        encoding="utf-8",
+    )
+    (output_dir / "telemetry-audit-managed.md").write_text(
+        "# stale successful audit\n",
+        encoding="utf-8",
+    )
+    stale_workspace_dir = output_dir / "workspace-mesh-1"
+    stale_workspace_dir.mkdir()
+    for stale_name in (
+        "amw-capacity.json",
+        "amw-capacity.json.tmp",
+        "amw-capacity-summary.json",
+        "amw-capacity-summary.json.tmp",
+        "amw-capacity-summary.md",
+    ):
+        (stale_workspace_dir / stale_name).write_text(
+            "stale capacity evidence\n",
+            encoding="utf-8",
+        )
+    manifest_path = tmp_path / "run-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "run_id": "test-run",
+                "configured_at": "2026-09-04T00:00:00Z",
+                "workspace": {"mode": "per-cluster"},
+                "workspaces": [
+                    {
+                        "slot": "mesh-1",
+                        "name": "test-amw-mesh-1",
+                        "id": "test-amw",
+                        "capacity_guard": {
+                            "monitoring_window_start": "2026-09-04T00:00:00Z"
+                        },
+                    }
+                ],
+                "query": {
+                    "resource_endpoint": "https://example",
+                    "resource_scope": "/subscriptions/test",
+                },
+                "logs": {"workspace": {"customer_id": "law-id"}},
+                "clusters": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "run-manifest.json").write_text(
+        json.dumps(
+            {
+                "collected_at": "2026-09-04T00:10:00Z",
+                "audit_window": {
+                    "start": "2026-09-04T00:00:00Z",
+                    "end": "2026-09-04T00:10:00Z",
+                },
+                "logs_window": {"end": None},
+                "scenario_windows": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_az = fake_bin / "az"
+    stubborn_pid_path = tmp_path / "stubborn-az.pid"
+    fake_az.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo $$ > \"$STUBBORN_PID_PATH\"\n"
+        "trap '' TERM\n"
+        "sleep 5\n",
+        encoding="utf-8",
+    )
+    fake_az.chmod(fake_az.stat().st_mode | stat.S_IXUSR)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "AKS_CONTROL_PLANE_METRICS_ENABLED": "true",
+            "AKS_MANAGED_TELEMETRY_AUDIT_PHASE_TIMEOUT_SECONDS": "1",
+            "AKS_MANAGED_TELEMETRY_TIMEOUT_KILL_AFTER_SECONDS": "1",
+            "MANIFEST_PATH": str(manifest_path),
+            "OUTPUT_DIR": str(output_dir),
+            "RUN_ID": "test-run",
+            "AUDIT_SCRIPT": str(tmp_path / "unused-audit.py"),
+            "PLATFORM_EXPORT_SCRIPT": str(tmp_path / "unused-platform.py"),
+            "STUBBORN_PID_PATH": str(stubborn_pid_path),
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+        }
+    )
+
+    started = time.monotonic()
+    result = subprocess.run(
+        ["bash", str(TELEMETRY_DIR / "audit-managed-prometheus.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert elapsed < 5
+    phase = json.loads(
+        (output_dir / "telemetry-audit-phase-execution.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert phase["timed_out"] is True
+    assert phase["exit_code"] == 137
+    assert phase["timeout_seconds"] == 1
+    stubborn_pid = int(stubborn_pid_path.read_text(encoding="utf-8"))
+    process_exit_deadline = time.monotonic() + 2
+    while time.monotonic() < process_exit_deadline:
+        try:
+            os.kill(stubborn_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError(
+            f"phase timeout left descendant process {stubborn_pid} running"
+        )
+    fallback = json.loads(
+        (output_dir / "telemetry-audit-managed.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert fallback["complete"] is False
+    assert fallback["execution"]["timed_out"] is True
+    assert "stale successful audit" not in (
+        output_dir / "telemetry-audit-managed.md"
+    ).read_text(encoding="utf-8")
+    assert not list(stale_workspace_dir.glob("amw-capacity*"))
+
+    graceful_output_dir = tmp_path / "graceful-output"
+    graceful_output_dir.mkdir()
+    (graceful_output_dir / "run-manifest.json").write_text(
+        (output_dir / "run-manifest.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    fake_az.write_text(
+        "#!/usr/bin/env bash\nsleep 5\n",
+        encoding="utf-8",
+    )
+    fake_az.chmod(fake_az.stat().st_mode | stat.S_IXUSR)
+    environment["OUTPUT_DIR"] = str(graceful_output_dir)
+    environment["AKS_MANAGED_TELEMETRY_TIMEOUT_KILL_AFTER_SECONDS"] = "3"
+
+    graceful_started = time.monotonic()
+    graceful = subprocess.run(
+        ["bash", str(TELEMETRY_DIR / "audit-managed-prometheus.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+    graceful_elapsed = time.monotonic() - graceful_started
+
+    assert graceful.returncode != 0
+    assert graceful_elapsed < 3
+    graceful_phase = json.loads(
+        (
+            graceful_output_dir
+            / "telemetry-audit-phase-execution.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert graceful_phase["exit_code"] == 124
+    assert graceful_phase["timed_out"] is True
+
+
+def test_platform_exporter_bounds_azure_cli_calls(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_az = fake_bin / "az"
+    fake_az.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            if [[ " $* " == *" list-definitions "* ]]; then
+              echo '[{"name":{"value":"fast_metric"},"unit":"Count","supportedAggregationTypes":["Average"],"metricAvailabilities":[{"timeGrain":"PT1M"}]},{"name":{"value":"slow_metric"},"unit":"Count","supportedAggregationTypes":["Average"],"metricAvailabilities":[{"timeGrain":"PT1M"}]}]'
+            elif [[ " $* " == *" fast_metric "* ]]; then
+              echo '{"value":[{"timeseries":[{"metadatavalues":[],"data":[{"timeStamp":"2026-09-04T00:01:00Z","average":1}]}]}]}'
+            else
+              sleep 5
+            fi
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_az.chmod(fake_az.stat().st_mode | stat.S_IXUSR)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    script = (
+        REPO_ROOT
+        / "modules"
+        / "python"
+        / "clusterloader2"
+        / "clustermesh-scale"
+        / "telemetry"
+        / "aks_platform_to_openmetrics.py"
+    )
+
+    started = time.monotonic()
+    result = subprocess.run(
+        [
+            "python3",
+            str(script),
+            "--resource",
+            "cluster-id",
+            "--cluster-label",
+            "mesh-1",
+            "--start",
+            "2026-09-04T00:00:00Z",
+            "--end",
+            "2026-09-04T00:10:00Z",
+            "--output",
+            str(tmp_path / "platform.openmetrics"),
+            "--manifest",
+            str(tmp_path / "platform.json"),
+            "--command-timeout-seconds",
+            "1",
+            "--total-timeout-seconds",
+            "2",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=5,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert elapsed < 4
+    assert "timed out after" in result.stderr
+    manifest = json.loads(
+        (tmp_path / "platform.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "failed"
+    assert manifest["complete"] is False
+    assert len(manifest["exported"]) == 1
+    assert manifest["exported"][0]["source_metric"] == "fast_metric"
+    assert len(manifest["errors"]) == 1
+    assert manifest["errors"][0]["metric"] == "slow_metric"
+
+
 def test_required_platform_metrics_make_wait_task_fail_after_preserving_manifest(
     tmp_path,
 ):
@@ -1442,6 +1888,16 @@ def test_scripts_use_current_aks_profile_and_full_export():
     assert "capture_workspace_capacity" in audit
     assert "export_platform_cluster" in audit
     assert "platform_export_ok" in audit
+    assert "AKS_MANAGED_PROMETHEUS_AUDIT_TIMEOUT_SECONDS" in audit
+    assert "AKS_MANAGED_PROMETHEUS_REQUEST_TIMEOUT_SECONDS" in audit
+    assert "AKS_PLATFORM_EXPORT_TOTAL_TIMEOUT_SECONDS" in audit
+    assert "AKS_PLATFORM_EXPORT_CLUSTER_TIMEOUT_SECONDS" in audit
+    assert "AKS_PLATFORM_EXPORT_SKIP_WITHOUT_SCENARIOS" in audit
+    assert "AKS_MANAGED_TELEMETRY_AUDIT_PHASE_CHILD" in audit
+    assert "telemetry-audit-phase-execution.json" in audit
+    assert "--request-timeout-seconds" in audit
+    assert "--command-timeout-seconds" in audit
+    assert "--total-timeout-seconds" in audit
     assert "Reconstruct managed Prometheus TSDB" not in collect_template
     assert "--arg end " not in common
     assert "--arg window_end " in common

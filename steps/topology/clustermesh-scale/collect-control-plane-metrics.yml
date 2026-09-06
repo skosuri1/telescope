@@ -39,6 +39,7 @@ steps:
                       eq(variables['AKS_PLATFORM_METRICS_PRE_SCENARIO_READY'], 'true')))
 
   - task: AzureCLI@2
+    timeoutInMinutes: 165
     inputs:
       azureSubscription: $(AZURE_SERVICE_CONNECTION)
       scriptType: bash

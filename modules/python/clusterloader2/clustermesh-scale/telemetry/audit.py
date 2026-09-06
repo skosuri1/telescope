@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 
 SELF_HOSTED_METRIC_GROUPS = {
@@ -532,12 +531,23 @@ def write_report(report, output_prefix):
     prefix.parent.mkdir(parents=True, exist_ok=True)
     json_path = prefix.with_suffix(".json")
     markdown_path = prefix.with_suffix(".md")
-    json_path.write_text(
+    _write_text_atomic(
+        json_path,
         json.dumps(report, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
     )
-    markdown_path.write_text(_markdown(report), encoding="utf-8")
+    _write_text_atomic(markdown_path, _markdown(report))
     return json_path, markdown_path
+
+
+def _write_text_atomic(path, content):
+    """Write text through a same-directory atomic replacement."""
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _kubectl_prometheus_get(kubeconfig, api_path):
@@ -554,22 +564,50 @@ def _kubectl_prometheus_get(kubeconfig, api_path):
     return response["data"]
 
 
-def _http_prometheus_get(endpoint, api_path, params=None, scope=""):
+def _http_prometheus_get(
+    endpoint,
+    api_path,
+    params=None,
+    scope="",
+    timeout_seconds=120,
+):
     token = os.environ.get("PROMETHEUS_BEARER_TOKEN", "")
     if not token:
         raise RuntimeError("PROMETHEUS_BEARER_TOKEN is required")
     query = f"?{urlencode(params, doseq=True)}" if params else ""
-    request = Request(
-        f"{endpoint.rstrip('/')}{api_path}{query}",
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    url = f"{endpoint.rstrip('/')}{api_path}{query}"
+    config = [
+        "silent",
+        "show-error",
+        "fail",
+        f"max-time = {timeout_seconds}",
+        f'url = "{_curl_config_escape(url)}"',
+        f'header = "Authorization: Bearer {_curl_config_escape(token)}"',
+    ]
     if scope:
-        request.add_header("x-ms-azure-scoping", scope)
-    with urlopen(request, timeout=120) as response:
-        payload = json.load(response)
+        config.append(
+            f'header = "x-ms-azure-scoping: {_curl_config_escape(scope)}"'
+        )
+    result = subprocess.run(
+        ["curl", "--config", "-"],
+        check=True,
+        capture_output=True,
+        text=True,
+        input="\n".join(config) + "\n",
+        timeout=timeout_seconds + 5,
+    )
+    payload = json.loads(result.stdout)
     if payload.get("status") != "success":
         raise RuntimeError(f"Prometheus API returned {payload}")
     return payload["data"]
+
+
+def _curl_config_escape(value):
+    """Escape a value embedded in a curl config line."""
+    value = str(value)
+    if "\n" in value or "\r" in value:
+        raise RuntimeError("curl config values cannot contain newlines")
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def run_self_hosted(args):
@@ -610,6 +648,11 @@ def run_managed(args):
         # the Azure Monitor query endpoint) against wall-clock audit time
         # per environment size.
         workers = getattr(args, "workers", 1)
+        request_timeout_seconds = getattr(
+            args,
+            "request_timeout_seconds",
+            120,
+        )
 
         def _query_cluster(cluster):
             cluster_manifest = dict(manifest)
@@ -622,6 +665,7 @@ def run_managed(args):
                 cluster_manifest,
                 endpoint,
                 cluster["id"],
+                request_timeout_seconds,
             )
 
         # executor.map() preserves input order in its result iterator
@@ -674,14 +718,22 @@ def run_managed(args):
         manifest,
         args.endpoint,
         args.resource_scope,
+        getattr(args, "request_timeout_seconds", 120),
     )
 
 
-def _run_managed_query(args, manifest, endpoint, resource_scope):
+def _run_managed_query(
+    args,
+    manifest,
+    endpoint,
+    resource_scope,
+    request_timeout_seconds,
+):
     metric_names = _http_prometheus_get(
         endpoint,
         "/api/v1/label/__name__/values",
         scope=resource_scope,
+        timeout_seconds=request_timeout_seconds,
     )
     series_by_metric = {}
     for metric_name in MANAGED_SERIES_METRICS:
@@ -694,6 +746,7 @@ def _run_managed_query(args, manifest, endpoint, resource_scope):
                 ("end", args.end),
             ],
             scope=resource_scope,
+            timeout_seconds=request_timeout_seconds,
         )
     return build_managed_audit(metric_names, series_by_metric, manifest)
 
@@ -743,6 +796,12 @@ def parse_args(argv=None):
             "Number of concurrent worker threads used to query per-cluster "
             "workspaces in schema-v2 manifests (default: 1)"
         ),
+    )
+    managed.add_argument(
+        "--request-timeout-seconds",
+        type=_positive_int,
+        default=120,
+        help="Per-request managed Prometheus HTTP timeout (default: 120)",
     )
     return parser.parse_args(argv)
 
