@@ -235,6 +235,56 @@ def test_probe_cluster_validates_every_cilium_agent(tmp_path, monkeypatch):
     ]
 
 
+def test_probe_cluster_retries_transient_capture_error(monkeypatch):
+    attempts = []
+
+    def flaky_probe(cluster):
+        attempts.append(cluster.role)
+        if len(attempts) == 1:
+            raise capture.CaptureError("502 Bad Gateway")
+        return {"role": cluster.role}
+
+    sleeps = []
+    monkeypatch.setattr(capture.time, "sleep", sleeps.append)
+    cluster = capture.Cluster(
+        name="clustermesh-12",
+        resource_group="run-id",
+        role="mesh-12",
+        kubeconfig="/tmp/mesh-12.config",
+    )
+
+    result = capture.probe_cluster_with_retries(
+        cluster,
+        flaky_probe,
+        attempts=3,
+        retry_seconds=7,
+    )
+
+    assert result == {"role": "mesh-12"}
+    assert attempts == ["mesh-12", "mesh-12"]
+    assert sleeps == [7]
+
+
+def test_probe_cluster_retry_exhaustion_preserves_last_error(monkeypatch):
+    monkeypatch.setattr(capture.time, "sleep", lambda _seconds: None)
+    cluster = capture.Cluster(
+        name="clustermesh-12",
+        resource_group="run-id",
+        role="mesh-12",
+        kubeconfig="/tmp/mesh-12.config",
+    )
+
+    with pytest.raises(capture.CaptureError, match="kubelet unavailable"):
+        capture.probe_cluster_with_retries(
+            cluster,
+            lambda _cluster: (_ for _ in ()).throw(
+                capture.CaptureError("kubelet unavailable")
+            ),
+            attempts=2,
+            retry_seconds=0,
+        )
+
+
 def test_capture_loads_exact_expected_cilium_names(tmp_path):
     clusters = []
     for number in (1, 2):

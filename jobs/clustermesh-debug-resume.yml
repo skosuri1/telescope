@@ -258,7 +258,9 @@ jobs:
           --run-id "$RUN_ID" \
           --expected-cluster-count "${{ parameters.expected_cluster_count }}" \
           --expected-mock-count "${MOCK_NODE_COUNT:-100}" \
-          --max-concurrent "${MOCK_CAPTURE_CONCURRENCY:-8}"
+          --max-concurrent "${MOCK_CAPTURE_CONCURRENCY:-8}" \
+          --capture-attempts "${MOCK_CAPTURE_ATTEMPTS:-5}" \
+          --capture-retry-seconds "${MOCK_CAPTURE_RETRY_SECONDS:-15}"
       displayName: "Capture preserved n100 KWOK baseline"
       env:
         PRESERVED_MOCK_CAPTURE: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_mock_capture.py

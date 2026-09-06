@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Sequence
@@ -38,6 +39,7 @@ class Cluster:
 
 
 Runner = Callable[[Sequence[str], int], str]
+ClusterProbe = Callable[[Cluster], dict]
 
 
 def utc_now() -> str:
@@ -441,6 +443,35 @@ def probe_cluster(
     }
 
 
+def probe_cluster_with_retries(
+    cluster: Cluster,
+    probe: ClusterProbe,
+    attempts: int,
+    retry_seconds: int,
+) -> dict:
+    """Retry a read-only exact cluster capture after transient failures."""
+
+    last_error: Optional[CaptureError] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return probe(cluster)
+        except CaptureError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                raise
+            print(
+                f"{cluster.role}: capture attempt {attempt}/{attempts} "
+                f"failed; retrying: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if retry_seconds > 0:
+                time.sleep(retry_seconds)
+    if last_error is None:
+        raise CaptureError(f"{cluster.role}: capture retry loop did not run")
+    raise last_error
+
+
 def validate_aks_inventory(payload: object, clusters: List[Cluster]) -> Dict[str, str]:
     """Require exact healthy AKS IDs for all cluster roles."""
 
@@ -536,15 +567,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--expected-mock-count", type=int, required=True)
     parser.add_argument("--max-concurrent", type=int, default=8)
     parser.add_argument("--command-timeout-seconds", type=int, default=120)
+    parser.add_argument("--capture-attempts", type=int, default=5)
+    parser.add_argument("--capture-retry-seconds", type=int, default=15)
     args = parser.parse_args(argv)
     for name in (
         "expected_cluster_count",
         "expected_mock_count",
         "max_concurrent",
         "command_timeout_seconds",
+        "capture_attempts",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.capture_retry_seconds < 0:
+        parser.error("--capture-retry-seconds must be non-negative")
     return args
 
 
@@ -585,8 +621,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.expected_mock_count,
         )
 
-        def capture_one(cluster: Cluster) -> dict:
-            result = probe_cluster(
+        def capture_once(cluster: Cluster) -> dict:
+            return probe_cluster(
                 cluster,
                 state_root=args.state_root,
                 run_id=args.run_id,
@@ -599,6 +635,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     for role, name in expected_cilium_names.items()
                     if role != cluster.role
                 },
+            )
+
+        def capture_one(cluster: Cluster) -> dict:
+            result = probe_cluster_with_retries(
+                cluster,
+                capture_once,
+                args.capture_attempts,
+                args.capture_retry_seconds,
             )
             result["resource_id"] = resource_ids[cluster.role]
             print(

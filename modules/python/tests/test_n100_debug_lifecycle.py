@@ -651,6 +651,8 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     assert "mock_preservation_verification_build_id" in resume
     assert "preserved_mock_capture.py" in resume
     assert "Capture preserved n100 KWOK baseline" in resume
+    assert "--capture-attempts" in resume
+    assert "--capture-retry-seconds" in resume
     assert "Publish preserved n100 KWOK baseline" in resume
     assert "DownloadPipelineArtifact@2" in resume
     assert "Download preserved n100 KWOK baseline" in resume
