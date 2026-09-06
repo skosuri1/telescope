@@ -55,6 +55,7 @@ class PoolState:
     vmss_capacity: int
     vmss_provisioning_state: str
     instance_ids: List[str]
+    failed_instance_ids: List[str]
     node_instance_ids: List[str]
     ready_instance_ids: List[str]
     unschedulable_nodes: List[str]
@@ -330,6 +331,13 @@ def build_cluster_state(
             raise ReconcileError(
                 f"{cluster.role}/{pool_name}: VMSS instance is missing instanceId"
             )
+        failed_instance_ids = sorted(
+            str(instance["instanceId"])
+            for instance in instances
+            if isinstance(instance, dict)
+            and instance.get("instanceId") is not None
+            and instance.get("provisioningState") == "Failed"
+        )
 
         current_instance_ids = set(instance_ids)
         matched_nodes = [
@@ -361,6 +369,13 @@ def build_cluster_state(
         vmss_provisioning_state = str(
             vmss.get("provisioningState") or "Unknown"
         )
+        repairable_terminal_vmss_failure = (
+            vmss_provisioning_state == "Failed"
+            and bool(failed_instance_ids)
+            and set(failed_instance_ids) == set(stale_instance_ids)
+            and capacity <= desired_count
+            and len(instance_ids) <= desired_count
+        )
 
         unsafe_reasons: List[str] = []
         if pool_provisioning_state not in ("Succeeded",):
@@ -369,7 +384,10 @@ def build_cluster_state(
             )
         if pool_power_state not in ("", "Running", "Stopped"):
             unsafe_reasons.append(f"node pool powerState={pool_power_state}")
-        if vmss_provisioning_state != "Succeeded":
+        if (
+            vmss_provisioning_state != "Succeeded"
+            and not repairable_terminal_vmss_failure
+        ):
             unsafe_reasons.append(
                 f"VMSS provisioningState={vmss_provisioning_state}"
             )
@@ -402,6 +420,7 @@ def build_cluster_state(
                 vmss_capacity=capacity,
                 vmss_provisioning_state=vmss_provisioning_state,
                 instance_ids=instance_ids,
+                failed_instance_ids=failed_instance_ids,
                 node_instance_ids=node_instance_ids,
                 ready_instance_ids=ready_instance_ids,
                 unschedulable_nodes=unschedulable_nodes,

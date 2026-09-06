@@ -63,17 +63,23 @@ def pool(name, count):
     }
 
 
-def vmss(name, pool_name, capacity):
+def vmss(name, pool_name, capacity, *, provisioning_state="Succeeded"):
     return {
         "name": name,
         "sku": {"capacity": capacity},
-        "provisioningState": "Succeeded",
+        "provisioningState": provisioning_state,
         "tags": {"aks-managed-poolName": pool_name},
     }
 
 
-def instances(*ids):
-    return [{"instanceId": value} for value in ids]
+def instances(*ids, provisioning_state="Succeeded"):
+    return [
+        {
+            "instanceId": value,
+            "provisioningState": provisioning_state,
+        }
+        for value in ids
+    ]
 
 
 def test_healthy_pool_requires_matching_ready_kubernetes_nodes():
@@ -128,6 +134,56 @@ def test_not_ready_instance_is_replaced_but_ready_unschedulable_is_uncordoned():
     assert observed.stale_instance_ids == ["0"]
     assert observed.unschedulable_nodes == ["aks-aks-default-1"]
     assert not observed.healthy
+
+
+def test_terminal_failed_vmss_is_repairable_only_for_matching_stale_instances():
+    state = workers.build_cluster_state(
+        CLUSTER,
+        "MC_rg_cluster_region",
+        [pool("prompool", 1)],
+        [
+            vmss(
+                "aks-prom",
+                "prompool",
+                1,
+                provisioning_state="Failed",
+            )
+        ],
+        {
+            "aks-prom": instances(
+                "0",
+                provisioning_state="Failed",
+            )
+        },
+        [node("aks-prom", "0", ready=False)],
+    )
+
+    observed = state.pools[0]
+    assert observed.failed_instance_ids == ["0"]
+    assert observed.stale_instance_ids == ["0"]
+    assert observed.unsafe_reasons == []
+    assert not observed.healthy
+
+
+def test_failed_vmss_without_matching_failed_instance_remains_unsafe():
+    state = workers.build_cluster_state(
+        CLUSTER,
+        "MC_rg_cluster_region",
+        [pool("prompool", 1)],
+        [
+            vmss(
+                "aks-prom",
+                "prompool",
+                1,
+                provisioning_state="Failed",
+            )
+        ],
+        {"aks-prom": instances("0")},
+        [node("aks-prom", "0", ready=False)],
+    )
+
+    assert state.pools[0].failed_instance_ids == []
+    assert "VMSS provisioningState=Failed" in state.pools[0].unsafe_reasons
 
 
 def test_capacity_above_desired_is_unsafe_for_automatic_repair():
