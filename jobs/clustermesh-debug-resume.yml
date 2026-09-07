@@ -64,6 +64,9 @@ parameters:
 - name: mock_preservation_verification_build_id
   type: number
   default: 0
+- name: mock_preservation_verification_resume_build_id
+  type: number
+  default: 0
 
 jobs:
 - job: azure
@@ -91,6 +94,7 @@ jobs:
         baseline_dir="$(Pipeline.Workspace)/n100-kwok-baseline"
         rm -rf "$baseline_dir"
         rm -rf "$(Pipeline.Workspace)/n100-kwok-verification-input"
+        rm -rf "$(Pipeline.Workspace)/n100-kwok-verification-resume"
         if [ "$BASELINE_BUILD_ID" -le 0 ]; then
           echo "##vso[task.logissue type=error;] scaleDebugKwokBaselineBuildId must be a positive build ID."
           exit 1
@@ -119,6 +123,19 @@ jobs:
         pipelineId: ${{ parameters.mock_preservation_baseline_build_id }}
         artifactName: n100-kwok-preservation-${{ parameters.mock_preservation_baseline_build_id }}
         targetPath: $(Pipeline.Workspace)/n100-kwok-baseline
+
+  - ${{ if and(eq(parameters.mock_preservation_mode, 'verify'), gt(parameters.mock_preservation_verification_resume_build_id, 0)) }}:
+    - task: DownloadPipelineArtifact@2
+      displayName: "Download incomplete n100 KWOK verification evidence"
+      inputs:
+        buildType: specific
+        project: $(System.TeamProjectId)
+        definition: $(System.DefinitionId)
+        specificBuildWithTriggering: false
+        buildVersionToDownload: specific
+        pipelineId: ${{ parameters.mock_preservation_verification_resume_build_id }}
+        artifactName: n100-kwok-verification-${{ parameters.mock_preservation_verification_resume_build_id }}
+        targetPath: $(Pipeline.Workspace)/n100-kwok-verification-resume
 
   - ${{ if and(parameters.run_workload, eq(parameters.mock_preservation_mode, 'none'), eq(parameters.topology, 'clustermesh-scale-mock')) }}:
     - task: DownloadPipelineArtifact@2
@@ -276,6 +293,13 @@ jobs:
     - script: |
         set -euo pipefail
         artifact_dir="$(Build.ArtifactStagingDirectory)/n100-kwok-verification"
+        resume_args=()
+        if [ "$RESUME_BUILD_ID" -gt 0 ]; then
+          resume_args+=(
+            --resume-dir "$(Pipeline.Workspace)/n100-kwok-verification-resume"
+            --resume-build-id "$RESUME_BUILD_ID"
+          )
+        fi
         python3 "$PRESERVED_MOCK_VERIFY" \
           --baseline-dir "$(Pipeline.Workspace)/n100-kwok-baseline" \
           --baseline-build-id "${{ parameters.mock_preservation_baseline_build_id }}" \
@@ -299,12 +323,14 @@ jobs:
           --max-concurrent "${MOCK_VERIFY_CONCURRENCY:-8}" \
           --reconcile-concurrent "${MOCK_RECONCILE_CONCURRENCY:-8}" \
           --capture-attempts "${MOCK_VERIFY_CAPTURE_ATTEMPTS:-5}" \
-          --capture-retry-seconds "${MOCK_VERIFY_CAPTURE_RETRY_SECONDS:-15}"
+          --capture-retry-seconds "${MOCK_VERIFY_CAPTURE_RETRY_SECONDS:-15}" \
+          "${resume_args[@]}"
       displayName: "Verify preserved n100 KWOK identities and exact recovery"
       env:
         PRESERVED_MOCK_VERIFY: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_mock_verify.py
         MOCK_LAYER_RECONCILER: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/mock_layer_reconcile.py
         RUN_ID: ${{ parameters.target_run_id }}
+        RESUME_BUILD_ID: "${{ parameters.mock_preservation_verification_resume_build_id }}"
 
     - script: |
         set -euo pipefail

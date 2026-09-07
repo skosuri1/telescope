@@ -489,6 +489,7 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "default: 78812" in pipeline
     assert "- name: scaleDebugKwokVerificationBuildId" in pipeline
     assert "default: 78851" in pipeline
+    assert "- name: scaleDebugKwokVerificationResumeBuildId" in pipeline
     assert "- verify" in pipeline
 
     assert "CLUSTERMESH_DEBUG_MODE'], 'fresh-preserve'" in fresh
@@ -549,6 +550,7 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "parameters.scaleDebugKwokPreservationMode" in resume
     assert "parameters.scaleDebugKwokBaselineBuildId" in resume
     assert "parameters.scaleDebugKwokVerificationBuildId" in resume
+    assert "parameters.scaleDebugKwokVerificationResumeBuildId" in resume
     assert 'cl2_prom_snapshot_storage_account: "cmshscaleprom"' in resume
     assert 'AKS_AMW_CLUSTERS_PER_WORKSPACE: "1"' in resume
     assert 'AKS_AMW_FORCE_SHARD_NAMING: "true"' in resume
@@ -649,6 +651,10 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     assert "mock_preservation_mode" in resume
     assert "mock_preservation_baseline_build_id" in resume
     assert "mock_preservation_verification_build_id" in resume
+    assert "mock_preservation_verification_resume_build_id" in resume
+    assert "Download incomplete n100 KWOK verification evidence" in resume
+    assert "--resume-dir" in resume
+    assert "--resume-build-id" in resume
     assert "preserved_mock_capture.py" in resume
     assert "Capture preserved n100 KWOK baseline" in resume
     assert "--capture-attempts" in resume

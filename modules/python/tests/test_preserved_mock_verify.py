@@ -272,6 +272,157 @@ def test_fault_plan_is_bounded_and_post_changes_are_exact(tmp_path):
         verify.compare_post_recovery(by_role, post, plan)
 
 
+def test_resume_evidence_requires_exact_completed_fault_chain(tmp_path):
+    baseline_dir, rows = _write_baseline(
+        tmp_path,
+        cluster_count=5,
+        mock_count=20,
+    )
+    _, baseline_by_role = verify.load_baseline(
+        str(baseline_dir),
+        "run-id",
+        5,
+        20,
+    )
+    plan = verify.build_fault_plan(
+        ["mesh-1", "mesh-3", "mesh-5"],
+        expected_cluster_count=5,
+        expected_mock_count=20,
+        fault_count=2,
+        agent_start=0,
+        node_start=10,
+    )
+    resume_dir = tmp_path / "resume"
+    resume_dir.mkdir()
+    platform = {
+        "aks_count": 5,
+        "pool_count": 11,
+        "fleet_member_count": 5,
+        "fleet_connected_count": 5,
+        "resource_ids": {
+            row["role"]: row["resource_id"] for row in rows
+        },
+    }
+    (resume_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "healthy": False,
+                "identity_verification_healthy": False,
+                "cross_cluster_data_path_valid": False,
+                "no_cl2_scenarios_run": True,
+                "stage": "capturing_post_recovery",
+                "run_id": "run-id",
+                "baseline_build_id": 100,
+                "started_at": "2026-09-06T00:00:00Z",
+                "finished_at": "2026-09-06T00:05:00Z",
+                "fatal_error": "transient post-recovery capture failure",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (resume_dir / "live-pre.json").write_text(
+        json.dumps(
+            {
+                "captured_at": "2026-09-06T00:01:00Z",
+                "platform": platform,
+                "clusters": rows,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (resume_dir / "fault-plan.json").write_text(
+        json.dumps(plan),
+        encoding="utf-8",
+    )
+    (resume_dir / "fault-results.json").write_text(
+        json.dumps(
+            {
+                "injected_at": "2026-09-06T00:02:00Z",
+                "results": [
+                    {"role": role, "success": True}
+                    for role in plan["roles"]
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    reconcile_results = []
+    for row in rows:
+        role = row["role"]
+        reconcile_results.append(
+            {
+                "role": role,
+                "status": "ok",
+                "recreated_nodes": (
+                    plan["node_names"] if role in plan["roles"] else []
+                ),
+                "recreated_agents": (
+                    plan["node_names"] if role in plan["roles"] else []
+                ),
+            }
+        )
+    (resume_dir / "mock-reconcile-summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-id",
+                "success": True,
+                "total_clusters": 5,
+                "healthy_count": 5,
+                "failed_count": 0,
+                "partial": False,
+                "pending_roles": [],
+                "generated_at": "2026-09-06T00:04:00Z",
+                "results": reconcile_results,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = verify.load_resume_evidence(
+        str(resume_dir),
+        baseline_by_role,
+        run_id="run-id",
+        baseline_build_id=100,
+        expected_cluster_count=5,
+        expected_pool_count=11,
+        expected_fault_plan=plan,
+    )
+
+    assert evidence["pre_boundary"]["kwok_uids_preserved"] == 100
+    assert evidence["reconcile"]["healthy_count"] == 5
+
+    reconcile_results[0]["recreated_nodes"] = ["kwok-node-19"]
+    (resume_dir / "mock-reconcile-summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-id",
+                "success": True,
+                "total_clusters": 5,
+                "healthy_count": 5,
+                "failed_count": 0,
+                "partial": False,
+                "pending_roles": [],
+                "generated_at": "2026-09-06T00:04:00Z",
+                "results": reconcile_results,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        verify.VerificationError,
+        match="recreated Node set",
+    ):
+        verify.load_resume_evidence(
+            str(resume_dir),
+            baseline_by_role,
+            run_id="run-id",
+            baseline_build_id=100,
+            expected_cluster_count=5,
+            expected_pool_count=11,
+            expected_fault_plan=plan,
+        )
+
+
 def test_fault_plan_rejects_broad_or_overlapping_mutation():
     with pytest.raises(verify.VerificationError, match="at most five"):
         verify.build_fault_plan(

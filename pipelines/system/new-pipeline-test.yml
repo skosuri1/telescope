@@ -65,6 +65,9 @@ parameters:
   - name: scaleDebugKwokVerificationBuildId
     type: number
     default: 78851
+  - name: scaleDebugKwokVerificationResumeBuildId
+    type: number
+    default: 0
 
 pool: AKS-Telescope-Airlock
 
@@ -3041,6 +3044,7 @@ stages:
           mock_preservation_mode: ${{ parameters.scaleDebugKwokPreservationMode }}
           mock_preservation_baseline_build_id: ${{ parameters.scaleDebugKwokBaselineBuildId }}
           mock_preservation_verification_build_id: ${{ parameters.scaleDebugKwokVerificationBuildId }}
+          mock_preservation_verification_resume_build_id: ${{ parameters.scaleDebugKwokVerificationResumeBuildId }}
           manifest_subdir: scale-resume
           target_run_id: ${{ parameters.debugTargetRunId }}
           ${{ if eq(parameters.debugMode, 'resume-existing') }}:

@@ -620,6 +620,250 @@ def build_fault_plan(
     }
 
 
+def _parse_timestamp(value: object, description: str) -> datetime:
+    """Parse one timezone-aware evidence timestamp."""
+
+    if not isinstance(value, str) or not value:
+        raise VerificationError(f"{description} timestamp is missing")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise VerificationError(
+            f"{description} timestamp is invalid: {value!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise VerificationError(f"{description} timestamp has no timezone")
+    return parsed
+
+
+def _validate_platform_snapshot(
+    payload: object,
+    baseline_by_role: Dict[str, dict],
+    *,
+    expected_cluster_count: int,
+    expected_pool_count: int,
+    description: str,
+) -> dict:
+    """Validate platform evidence embedded in a prior snapshot."""
+
+    if not isinstance(payload, dict):
+        raise VerificationError(f"{description} platform is not an object")
+    expected_counts = {
+        "aks_count": expected_cluster_count,
+        "pool_count": expected_pool_count,
+        "fleet_member_count": expected_cluster_count,
+        "fleet_connected_count": expected_cluster_count,
+    }
+    for key, expected in expected_counts.items():
+        if payload.get(key) != expected:
+            raise VerificationError(
+                f"{description} platform {key}={payload.get(key)!r}, "
+                f"expected {expected}"
+            )
+    resource_ids = payload.get("resource_ids")
+    if not isinstance(resource_ids, dict) or set(resource_ids) != set(
+        baseline_by_role
+    ):
+        raise VerificationError(
+            f"{description} platform AKS role inventory is not exact"
+        )
+    for role, baseline in baseline_by_role.items():
+        resource_id = resource_ids.get(role)
+        if (
+            not isinstance(resource_id, str)
+            or normalize_resource_id(resource_id)
+            != normalize_resource_id(baseline["resource_id"])
+        ):
+            raise VerificationError(
+                f"{description} platform AKS ID changed for {role}"
+            )
+    return payload
+
+
+def load_resume_evidence(
+    resume_dir: str,
+    baseline_by_role: Dict[str, dict],
+    *,
+    run_id: str,
+    baseline_build_id: int,
+    expected_cluster_count: int,
+    expected_pool_count: int,
+    expected_fault_plan: dict,
+) -> dict:
+    """Validate an incomplete proof that reached post-recovery capture."""
+
+    summary = load_json(
+        os.path.join(resume_dir, "summary.json"),
+        "resumed verification summary",
+    )
+    live_pre = load_json(
+        os.path.join(resume_dir, "live-pre.json"),
+        "resumed verification pre-boundary snapshot",
+    )
+    fault_plan = load_json(
+        os.path.join(resume_dir, "fault-plan.json"),
+        "resumed verification fault plan",
+    )
+    fault_results_payload = load_json(
+        os.path.join(resume_dir, "fault-results.json"),
+        "resumed verification fault results",
+    )
+    reconcile = load_json(
+        os.path.join(resume_dir, "mock-reconcile-summary.json"),
+        "resumed verification reconcile summary",
+    )
+    if not all(
+        isinstance(payload, dict)
+        for payload in (
+            summary,
+            live_pre,
+            fault_plan,
+            fault_results_payload,
+            reconcile,
+        )
+    ):
+        raise VerificationError("resumed verification evidence is malformed")
+    expected_summary = {
+        "healthy": False,
+        "identity_verification_healthy": False,
+        "cross_cluster_data_path_valid": False,
+        "no_cl2_scenarios_run": True,
+        "stage": "capturing_post_recovery",
+        "run_id": run_id,
+        "baseline_build_id": baseline_build_id,
+    }
+    for key, expected in expected_summary.items():
+        if summary.get(key) != expected:
+            raise VerificationError(
+                f"resumed verification summary {key}="
+                f"{summary.get(key)!r}, expected {expected!r}"
+            )
+    if not isinstance(summary.get("fatal_error"), str) or not summary[
+        "fatal_error"
+    ]:
+        raise VerificationError(
+            "resumed verification summary has no terminal capture error"
+        )
+
+    live_rows = live_pre.get("clusters")
+    if not isinstance(live_rows, list):
+        raise VerificationError(
+            "resumed verification pre-boundary clusters are missing"
+        )
+    pre_boundary = compare_pre_boundary(baseline_by_role, live_rows)
+    platform_before = _validate_platform_snapshot(
+        live_pre.get("platform"),
+        baseline_by_role,
+        expected_cluster_count=expected_cluster_count,
+        expected_pool_count=expected_pool_count,
+        description="resumed verification pre-boundary",
+    )
+    if fault_plan != expected_fault_plan:
+        raise VerificationError(
+            "resumed verification fault plan is not the expected bounded plan"
+        )
+    fault_results = fault_results_payload.get("results")
+    if (
+        not isinstance(fault_results, list)
+        or {
+            result.get("role")
+            for result in fault_results
+            if isinstance(result, dict)
+        }
+        != set(expected_fault_plan["roles"])
+        or not all(
+            isinstance(result, dict) and result.get("success") is True
+            for result in fault_results
+        )
+    ):
+        raise VerificationError(
+            "resumed verification fault injection was not fully successful"
+        )
+    reconcile_results = reconcile.get("results")
+    reconcile_summary_valid = all(
+        (
+            reconcile.get("run_id") == run_id,
+            reconcile.get("success") is True,
+            reconcile.get("total_clusters") == expected_cluster_count,
+            reconcile.get("healthy_count") == expected_cluster_count,
+            reconcile.get("failed_count") == 0,
+            reconcile.get("partial") is False,
+            not reconcile.get("pending_roles"),
+        )
+    )
+    reconcile_results_valid = (
+        isinstance(reconcile_results, list)
+        and len(reconcile_results) == expected_cluster_count
+        and {
+            result.get("role")
+            for result in reconcile_results
+            if isinstance(result, dict)
+        }
+        == set(baseline_by_role)
+        and all(
+            isinstance(result, dict) and result.get("status") == "ok"
+            for result in reconcile_results
+        )
+    )
+    if not reconcile_summary_valid or not reconcile_results_valid:
+        raise VerificationError(
+            "resumed verification reconcile result is not exact"
+        )
+    recreated_nodes = {
+        (result["role"], name)
+        for result in reconcile_results
+        for name in result.get("recreated_nodes", [])
+    }
+    expected_recreated_nodes = {
+        (role, name)
+        for role in expected_fault_plan["roles"]
+        for name in expected_fault_plan["node_names"]
+    }
+    if recreated_nodes != expected_recreated_nodes:
+        raise VerificationError(
+            "resumed verification recreated Node set does not match fault plan"
+        )
+    allowed_agents = {
+        (role, name)
+        for role in expected_fault_plan["roles"]
+        for name in expected_fault_plan["agent_names"]
+    }
+    recreated_agents = {
+        (result["role"], name)
+        for result in reconcile_results
+        for name in result.get("recreated_agents", [])
+    }
+    if not recreated_agents.issubset(allowed_agents):
+        raise VerificationError(
+            "resumed verification recreated an unplanned agent Pod"
+        )
+
+    timestamps = [
+        _parse_timestamp(summary.get("started_at"), "verification start"),
+        _parse_timestamp(live_pre.get("captured_at"), "pre-boundary capture"),
+        _parse_timestamp(
+            fault_results_payload.get("injected_at"),
+            "fault injection",
+        ),
+        _parse_timestamp(reconcile.get("generated_at"), "reconciliation"),
+        _parse_timestamp(summary.get("finished_at"), "verification failure"),
+    ]
+    if timestamps != sorted(timestamps):
+        raise VerificationError(
+            "resumed verification evidence timestamps are out of order"
+        )
+    return {
+        "summary": summary,
+        "live_pre": live_pre,
+        "platform_before": platform_before,
+        "pre_boundary": pre_boundary,
+        "fault_plan": fault_plan,
+        "fault_results": fault_results,
+        "fault_results_payload": fault_results_payload,
+        "reconcile": reconcile,
+    }
+
+
 def inject_faults(
     clusters: List[capture.Cluster],
     fault_plan: dict,
@@ -849,6 +1093,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reconcile-timeout-seconds", type=int, default=3600)
     parser.add_argument("--capture-attempts", type=int, default=5)
     parser.add_argument("--capture-retry-seconds", type=int, default=15)
+    parser.add_argument("--resume-dir")
+    parser.add_argument("--resume-build-id", type=int, default=0)
     args = parser.parse_args(argv)
     for name in (
         "baseline_build_id",
@@ -865,6 +1111,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.capture_retry_seconds < 0:
         parser.error("--capture-retry-seconds must be non-negative")
+    if bool(args.resume_dir) != (args.resume_build_id > 0):
+        parser.error(
+            "--resume-dir and a positive --resume-build-id must be used together"
+        )
     return args
 
 
@@ -904,6 +1154,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         expected_cilium_names = {
             role: str(row["cluster_name"]) for role, row in baseline_by_role.items()
         }
+        fault_plan = build_fault_plan(
+            args.fault_roles,
+            expected_cluster_count=args.expected_cluster_count,
+            expected_mock_count=args.expected_mock_count,
+            fault_count=args.fault_count,
+            agent_start=args.fault_agent_start,
+            node_start=args.fault_node_start,
+        )
 
         stage = "restoring_desired_state"
         restore_state(
@@ -914,90 +1172,128 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.expected_mock_count,
         )
 
-        stage = "capturing_pre_boundary"
-        platform_before = validate_platform_state(
-            clusters,
-            subscription_id=args.expected_subscription_id,
-            run_id=args.run_id,
-            expected_pool_count=args.expected_pool_count,
-            fleet_name=args.fleet_name,
-            profile_name=args.profile_name,
-            runner=capture.run_command,
-        )
-        live_before = capture_live(
-            clusters,
-            state_root=args.state_root,
-            run_id=args.run_id,
-            expected_cluster_count=args.expected_cluster_count,
-            expected_mock_count=args.expected_mock_count,
-            max_concurrent=args.max_concurrent,
-            command_timeout_seconds=args.command_timeout_seconds,
-            resource_ids=platform_before["resource_ids"],
-            expected_cilium_names=expected_cilium_names,
-            runner=capture.run_command,
-            capture_attempts=args.capture_attempts,
-            capture_retry_seconds=args.capture_retry_seconds,
-        )
-        pre_boundary = compare_pre_boundary(baseline_by_role, live_before)
-        write_json_atomic(
-            os.path.join(args.artifact_dir, "live-pre.json"),
-            {
-                "captured_at": utc_now(),
-                "platform": platform_before,
-                "clusters": live_before,
-            },
-        )
-        print(
-            "Cross-run boundary preserved all "
-            f"{pre_boundary['kwok_uids_preserved']} KWOK and "
-            f"{pre_boundary['agent_uids_preserved']} agent UIDs.",
-            flush=True,
-        )
-
-        stage = "injecting_bounded_loss"
-        fault_plan = build_fault_plan(
-            args.fault_roles,
-            expected_cluster_count=args.expected_cluster_count,
-            expected_mock_count=args.expected_mock_count,
-            fault_count=args.fault_count,
-            agent_start=args.fault_agent_start,
-            node_start=args.fault_node_start,
-        )
-        write_json_atomic(
-            os.path.join(args.artifact_dir, "fault-plan.json"),
-            fault_plan,
-        )
-        fault_results = inject_faults(
-            clusters,
-            fault_plan,
-            max_concurrent=args.max_concurrent,
-            command_timeout_seconds=args.command_timeout_seconds,
-            runner=capture.run_command,
-        )
-        write_json_atomic(
-            os.path.join(args.artifact_dir, "fault-results.json"),
-            {"injected_at": utc_now(), "results": fault_results},
-        )
-
-        stage = "reconciling_mock_layer"
-        reconcile_summary = run_reconciler(
-            args.reconciler,
-            clusters_path=args.clusters,
-            state_root=args.state_root,
-            run_id=args.run_id,
-            expected_mock_count=args.expected_mock_count,
-            artifact_dir=args.artifact_dir,
-            max_concurrent=args.reconcile_concurrent,
-            timeout_seconds=args.reconcile_timeout_seconds,
-        )
-        failed_fault_roles = [
-            result["role"] for result in fault_results if not result["success"]
-        ]
-        if failed_fault_roles:
-            raise VerificationError(
-                "fault injection failed on roles after bounded reconciliation: "
-                + " ".join(failed_fault_roles)
+        if args.resume_dir:
+            stage = "loading_resumed_verification"
+            resumed = load_resume_evidence(
+                args.resume_dir,
+                baseline_by_role,
+                run_id=args.run_id,
+                baseline_build_id=args.baseline_build_id,
+                expected_cluster_count=args.expected_cluster_count,
+                expected_pool_count=args.expected_pool_count,
+                expected_fault_plan=fault_plan,
             )
+            platform_before = resumed["platform_before"]
+            pre_boundary = resumed["pre_boundary"]
+            fault_results = resumed["fault_results"]
+            reconcile_summary = resumed["reconcile"]
+            write_json_atomic(
+                os.path.join(args.artifact_dir, "live-pre.json"),
+                resumed["live_pre"],
+            )
+            write_json_atomic(
+                os.path.join(args.artifact_dir, "fault-plan.json"),
+                fault_plan,
+            )
+            write_json_atomic(
+                os.path.join(args.artifact_dir, "fault-results.json"),
+                resumed["fault_results_payload"],
+            )
+            write_json_atomic(
+                os.path.join(
+                    args.artifact_dir,
+                    "mock-reconcile-summary.json",
+                ),
+                reconcile_summary,
+            )
+            print(
+                "Validated incomplete verification evidence from build "
+                f"{args.resume_build_id}; capturing exact post-recovery state.",
+                flush=True,
+            )
+        else:
+            stage = "capturing_pre_boundary"
+            platform_before = validate_platform_state(
+                clusters,
+                subscription_id=args.expected_subscription_id,
+                run_id=args.run_id,
+                expected_pool_count=args.expected_pool_count,
+                fleet_name=args.fleet_name,
+                profile_name=args.profile_name,
+                runner=capture.run_command,
+            )
+            live_before = capture_live(
+                clusters,
+                state_root=args.state_root,
+                run_id=args.run_id,
+                expected_cluster_count=args.expected_cluster_count,
+                expected_mock_count=args.expected_mock_count,
+                max_concurrent=args.max_concurrent,
+                command_timeout_seconds=args.command_timeout_seconds,
+                resource_ids=platform_before["resource_ids"],
+                expected_cilium_names=expected_cilium_names,
+                runner=capture.run_command,
+                capture_attempts=args.capture_attempts,
+                capture_retry_seconds=args.capture_retry_seconds,
+            )
+            pre_boundary = compare_pre_boundary(
+                baseline_by_role,
+                live_before,
+            )
+            write_json_atomic(
+                os.path.join(args.artifact_dir, "live-pre.json"),
+                {
+                    "captured_at": utc_now(),
+                    "platform": platform_before,
+                    "clusters": live_before,
+                },
+            )
+            print(
+                "Cross-run boundary preserved all "
+                f"{pre_boundary['kwok_uids_preserved']} KWOK and "
+                f"{pre_boundary['agent_uids_preserved']} agent UIDs.",
+                flush=True,
+            )
+
+            stage = "injecting_bounded_loss"
+            write_json_atomic(
+                os.path.join(args.artifact_dir, "fault-plan.json"),
+                fault_plan,
+            )
+            fault_results = inject_faults(
+                clusters,
+                fault_plan,
+                max_concurrent=args.max_concurrent,
+                command_timeout_seconds=args.command_timeout_seconds,
+                runner=capture.run_command,
+            )
+            write_json_atomic(
+                os.path.join(args.artifact_dir, "fault-results.json"),
+                {"injected_at": utc_now(), "results": fault_results},
+            )
+
+            stage = "reconciling_mock_layer"
+            reconcile_summary = run_reconciler(
+                args.reconciler,
+                clusters_path=args.clusters,
+                state_root=args.state_root,
+                run_id=args.run_id,
+                expected_mock_count=args.expected_mock_count,
+                artifact_dir=args.artifact_dir,
+                max_concurrent=args.reconcile_concurrent,
+                timeout_seconds=args.reconcile_timeout_seconds,
+            )
+            failed_fault_roles = [
+                result["role"]
+                for result in fault_results
+                if not result["success"]
+            ]
+            if failed_fault_roles:
+                raise VerificationError(
+                    "fault injection failed on roles after bounded "
+                    "reconciliation: "
+                    + " ".join(failed_fault_roles)
+                )
 
         stage = "capturing_post_recovery"
         platform_after = validate_platform_state(
@@ -1052,7 +1348,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "post_recovery": post_recovery,
             "platform_before": platform_before,
             "platform_after": platform_after,
-        }
+        } | (
+            {
+                "resumed_from_verification_build_id": args.resume_build_id,
+            }
+            if args.resume_build_id > 0
+            else {}
+        )
         write_json_atomic(
             os.path.join(args.artifact_dir, "verification.json"),
             verification,
@@ -1073,6 +1375,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "post_recovery": post_recovery,
             }
         )
+        if args.resume_build_id > 0:
+            summary["resumed_from_verification_build_id"] = (
+                args.resume_build_id
+            )
         write_json_atomic(summary_path, summary)
         print(
             "Preserved mock verification passed identity and exact recovery gates; "
