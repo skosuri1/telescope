@@ -215,21 +215,60 @@ steps:
       pip3 install -r $(Pipeline.Workspace)/s/modules/python/requirements.txt
 
       echo "Install Ubuntu packages"
+      missing_ubuntu_packages=()
+      command -v bc >/dev/null 2>&1 || missing_ubuntu_packages+=(bc)
+      command -v nc >/dev/null 2>&1 || missing_ubuntu_packages+=(netcat)
+      if [ "${#missing_ubuntu_packages[@]}" -eq 0 ]; then
+        echo "Ubuntu dependencies already installed; skipping apt/dpkg."
+        exit 0
+      fi
+
       # Hosted/shared agents can have an automatic package operation in flight.
-      # Wait on dpkg's lock instead of failing an otherwise healthy long run.
-      configured=false
-      for attempt in $(seq 1 60); do
-        if sudo dpkg --configure -a; then
-          configured=true
-          break
-        fi
-        echo "dpkg is busy (attempt $attempt/60); retrying in 5s..."
-        sleep 5
-      done
-      if [ "$configured" != "true" ]; then
-        echo "Timed out waiting for dpkg configuration lock." >&2
+      # Wait on the actual lock holder without deleting lock files. Five
+      # minutes was too short when unattended-upgrades held the lock.
+      dpkg_lock_wait_seconds="${DPKG_LOCK_WAIT_SECONDS:-900}"
+      dpkg_lock_poll_seconds="${DPKG_LOCK_POLL_SECONDS:-10}"
+      if ! [[ "$dpkg_lock_wait_seconds" =~ ^[1-9][0-9]*$ ]] ||
+         ! [[ "$dpkg_lock_poll_seconds" =~ ^[1-9][0-9]*$ ]]; then
+        echo "DPKG lock wait settings must be positive integers." >&2
         exit 1
       fi
+      dpkg_deadline=$(( $(date +%s) + dpkg_lock_wait_seconds ))
+      while true; do
+        dpkg_rc=0
+        dpkg_output=$(sudo dpkg --configure -a 2>&1) || dpkg_rc=$?
+        if [ "$dpkg_rc" -eq 0 ]; then
+          [ -z "$dpkg_output" ] || printf '%s\n' "$dpkg_output"
+          break
+        fi
+        printf '%s\n' "$dpkg_output" >&2
+        if ! grep -Eqi \
+            'locked by another process|could not get lock|unable to acquire the dpkg frontend lock|unable to lock.*another process|resource temporarily unavailable.*(dpkg|lock)|(dpkg|lock).*resource temporarily unavailable' \
+            <<<"$dpkg_output"; then
+          echo "dpkg configuration failed with a non-lock error." >&2
+          exit "$dpkg_rc"
+        fi
+        now=$(date +%s)
+        if [ "$now" -ge "$dpkg_deadline" ]; then
+          echo "Timed out after ${dpkg_lock_wait_seconds}s waiting for the dpkg configuration lock." >&2
+          exit 1
+        fi
+        lock_holders=$(
+          sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+            2>/dev/null | tr -s '[:space:]' ' ' | sed -E 's/^ //; s/ $//' ||
+            true
+        )
+        echo "dpkg is busy${lock_holders:+ (holder PID(s): $lock_holders)}; retrying in ${dpkg_lock_poll_seconds}s..."
+        if [ -n "$lock_holders" ]; then
+          ps -o pid=,etime=,cmd= -p "${lock_holders// /,}" || true
+        fi
+        remaining=$((dpkg_deadline - now))
+        sleep_seconds="$dpkg_lock_poll_seconds"
+        if [ "$sleep_seconds" -gt "$remaining" ]; then
+          sleep_seconds="$remaining"
+        fi
+        sleep "$sleep_seconds"
+      done
 
       apt_retry() {
         local description="$1"
@@ -250,7 +289,8 @@ steps:
       apt_retry "apt-get update" \
         apt-get -o DPkg::Lock::Timeout=300 update
       apt_retry "apt-get install" \
-        apt-get -o DPkg::Lock::Timeout=300 -y install bc netcat
+        apt-get -o DPkg::Lock::Timeout=300 -y install \
+          "${missing_ubuntu_packages[@]}"
     displayName: "Install Dependencies"
 
   - template: /steps/cloud/${{ parameters.cloud }}/login.yml

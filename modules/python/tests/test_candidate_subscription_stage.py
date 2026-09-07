@@ -189,6 +189,16 @@ def test_setup_retries_apt_list_and_package_locks():
     assert 'apt_retry "apt-get update"' in setup
     assert 'apt_retry "apt-get install"' in setup
     assert "failed or is locked (attempt $attempt/60)" in setup
+    assert "DPKG_LOCK_WAIT_SECONDS:-900" in setup
+    assert "DPKG_LOCK_POLL_SECONDS:-10" in setup
+    assert "locked by another process|could not get lock" in setup
+    assert "unable to acquire the dpkg frontend lock" in setup
+    assert "dpkg.*lock" not in setup
+    assert "dpkg configuration failed with a non-lock error" in setup
+    assert "sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock" in setup
+    assert "rm -f /var/lib/dpkg/lock" not in setup
+    assert "Ubuntu dependencies already installed; skipping apt/dpkg." in setup
+    assert '"${missing_ubuntu_packages[@]}"' in setup
 
 
 def test_candidate_n100_stage_inherits_n2_findings():
