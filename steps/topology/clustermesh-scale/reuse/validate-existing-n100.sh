@@ -8,6 +8,8 @@ expected_region="${CLUSTERMESH_DEBUG_EXPECTED_REGION:-eastus2}"
 expected_count="${CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT:-100}"
 expected_tfvars_sha="${CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256:?CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256 is required}"
 extend_lease_hours="${CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS:-0}"
+lease_renewal_threshold_hours="${CLUSTERMESH_DEBUG_LEASE_RENEWAL_THRESHOLD_HOURS:-$extend_lease_hours}"
+lease_update_concurrency="${CLUSTERMESH_DEBUG_LEASE_UPDATE_CONCURRENCY:-4}"
 manifest_path="${CLUSTERMESH_DEBUG_MANIFEST_PATH:-$(pwd)/scale-reuse-validation.json}"
 require_overlay_reset="${CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET:-false}"
 validation_tmp_dir=$(mktemp -d)
@@ -16,11 +18,7 @@ subscription_groups_file="$validation_tmp_dir/subscription-groups.json"
 node_resource_group_manifest_file="$validation_tmp_dir/node-resource-group-manifest.json"
 
 cleanup_validation_tmp_dir() {
-  rm -f \
-    "$node_resource_groups_file" \
-    "$subscription_groups_file" \
-    "$node_resource_group_manifest_file"
-  rmdir "$validation_tmp_dir" 2>/dev/null || true
+  rm -rf -- "$validation_tmp_dir"
 }
 trap cleanup_validation_tmp_dir EXIT
 
@@ -34,6 +32,20 @@ if ! [[ "$expected_count" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if ! [[ "$extend_lease_hours" =~ ^[0-9]+$ ]]; then
   echo "CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS must be a non-negative integer." >&2
+  exit 1
+fi
+if ! [[ "$lease_renewal_threshold_hours" =~ ^[0-9]+$ ]]; then
+  echo "CLUSTERMESH_DEBUG_LEASE_RENEWAL_THRESHOLD_HOURS must be a non-negative integer." >&2
+  exit 1
+fi
+if ! [[ "$lease_update_concurrency" =~ ^[1-9][0-9]*$ ]] ||
+   [ "$lease_update_concurrency" -gt 16 ]; then
+  echo "CLUSTERMESH_DEBUG_LEASE_UPDATE_CONCURRENCY must be an integer from 1 through 16." >&2
+  exit 1
+fi
+if [ "$extend_lease_hours" -gt 0 ] &&
+   [ "$lease_renewal_threshold_hours" -gt "$extend_lease_hours" ]; then
+  echo "CLUSTERMESH_DEBUG_LEASE_RENEWAL_THRESHOLD_HOURS cannot exceed CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS." >&2
   exit 1
 fi
 
@@ -212,14 +224,23 @@ fi
 
 existing_deletion_due_time=$(jq -r '.tags.deletion_due_time // empty' <<< "$rg_json")
 node_resource_groups_extended=0
+parent_lease_extended=false
+lease_refresh_performed=false
+requested_deletion_due_time=""
 if [ "$extend_lease_hours" -gt 0 ]; then
+  current_epoch=$(date +%s)
   requested_deletion_due_time=$(date -u -d "+${extend_lease_hours} hours" +%Y-%m-%dT%H:%M:%SZ)
   requested_deletion_due_epoch=$(date -u -d "$requested_deletion_due_time" +%s)
+  renewal_threshold_epoch=$((current_epoch + lease_renewal_threshold_hours * 3600))
   existing_deletion_due_epoch=""
   if [ -n "$existing_deletion_due_time" ]; then
     existing_deletion_due_epoch=$(date -u -d "$existing_deletion_due_time" +%s 2>/dev/null || true)
   fi
   if [[ "$existing_deletion_due_epoch" =~ ^[0-9]+$ ]] &&
+    [ "$existing_deletion_due_epoch" -ge "$renewal_threshold_epoch" ]; then
+    deletion_due_time="$existing_deletion_due_time"
+    echo "Existing parent lease $deletion_due_time exceeds the ${lease_renewal_threshold_hours}h renewal threshold; validating all managed RG leases without rewriting them."
+  elif [[ "$existing_deletion_due_epoch" =~ ^[0-9]+$ ]] &&
     [ "$existing_deletion_due_epoch" -gt "$requested_deletion_due_epoch" ]; then
     deletion_due_time="$existing_deletion_due_time"
     echo "Preserving later existing lease $deletion_due_time instead of shortening it to $requested_deletion_due_time."
@@ -228,6 +249,8 @@ if [ "$extend_lease_hours" -gt 0 ]; then
   fi
   deletion_due_epoch=$(date -u -d "$deletion_due_time" +%s)
 
+  stale_node_resource_groups_file="$validation_tmp_dir/stale-node-resource-groups.jsonl"
+  : > "$stale_node_resource_groups_file"
   while IFS= read -r node_rg_row; do
     node_rg=$(jq -r '.name' <<< "$node_rg_row")
     existing_node_deletion_due_time=$(jq -r '.deletion_due_time // empty' <<< "$node_rg_row")
@@ -240,17 +263,79 @@ if [ "$extend_lease_hours" -gt 0 ]; then
       echo "Preserving later existing node RG lease $existing_node_deletion_due_time on $node_rg."
       continue
     fi
-    az group update --name "$node_rg" \
+    printf '%s\n' "$node_rg_row" >> "$stale_node_resource_groups_file"
+  done < <(jq -c '.[]' <<< "$node_resource_group_inventory")
+
+  lease_update_state_dir="$validation_tmp_dir/lease-updates"
+  mkdir -p "$lease_update_state_dir"
+  lease_update_pids=()
+  lease_update_roles=()
+  lease_update_names=()
+  wait_lease_update_batch() {
+    local index role name batch_failed=false
+    for index in "${!lease_update_pids[@]}"; do
+      role="${lease_update_roles[$index]}"
+      name="${lease_update_names[$index]}"
+      if ! wait "${lease_update_pids[$index]}"; then
+        cat "$lease_update_state_dir/${role}.log" >&2 2>/dev/null || true
+        echo "Managed resource-group lease update failed for $role ($name)." >&2
+        batch_failed=true
+      fi
+    done
+    lease_update_pids=()
+    lease_update_roles=()
+    lease_update_names=()
+    [ "$batch_failed" = "false" ]
+  }
+
+  while IFS= read -r node_rg_row; do
+    [ -n "$node_rg_row" ] || continue
+    node_rg=$(jq -r '.name' <<< "$node_rg_row")
+    role=$(jq -r '.role' <<< "$node_rg_row")
+    (
+      az group update --name "$node_rg" \
+        --set tags.deletion_due_time="$deletion_due_time" \
+              tags.clustermesh_debug_last_validation_build="${BUILD_BUILDID:-manual}" \
+        --only-show-errors >/dev/null
+    ) >"$lease_update_state_dir/${role}.log" 2>&1 &
+    lease_update_pids+=("$!")
+    lease_update_roles+=("$role")
+    lease_update_names+=("$node_rg")
+    node_resource_groups_extended=$((node_resource_groups_extended + 1))
+    if [ "${#lease_update_pids[@]}" -ge "$lease_update_concurrency" ]; then
+      wait_lease_update_batch
+    fi
+  done < "$stale_node_resource_groups_file"
+  if [ "${#lease_update_pids[@]}" -gt 0 ]; then
+    wait_lease_update_batch
+  fi
+  if [ "$node_resource_groups_extended" -gt 0 ]; then
+    lease_refresh_performed=true
+  fi
+
+  if ! [[ "$existing_deletion_due_epoch" =~ ^[0-9]+$ ]] ||
+     [ "$existing_deletion_due_epoch" -lt "$deletion_due_epoch" ]; then
+    az group update --name "$target_run_id" \
       --set tags.deletion_due_time="$deletion_due_time" \
             tags.clustermesh_debug_last_validation_build="${BUILD_BUILDID:-manual}" \
       --only-show-errors >/dev/null
-    node_resource_groups_extended=$((node_resource_groups_extended + 1))
-  done < <(jq -c '.[]' <<< "$node_resource_group_inventory")
+    parent_lease_extended=true
+    lease_refresh_performed=true
+  fi
 
-  az group update --name "$target_run_id" \
-    --set tags.deletion_due_time="$deletion_due_time" \
-          tags.clustermesh_debug_last_validation_build="${BUILD_BUILDID:-manual}" \
-    --only-show-errors >/dev/null
+  refreshed_parent_json=$(az group show --name "$target_run_id" -o json)
+  observed_parent_deletion_due_time=$(jq -r \
+    '.tags.deletion_due_time // empty' <<<"$refreshed_parent_json")
+  observed_parent_deletion_due_epoch=""
+  if [ -n "$observed_parent_deletion_due_time" ]; then
+    observed_parent_deletion_due_epoch=$(date -u \
+      -d "$observed_parent_deletion_due_time" +%s 2>/dev/null || true)
+  fi
+  if ! [[ "$observed_parent_deletion_due_epoch" =~ ^[0-9]+$ ]] ||
+     [ "$observed_parent_deletion_due_epoch" -lt "$deletion_due_epoch" ]; then
+    echo "Parent resource-group lease refresh did not converge: observed=${observed_parent_deletion_due_time:-missing} required=$deletion_due_time" >&2
+    exit 1
+  fi
 
   az group list \
     --query '[].{name:name,location:location,managedBy:managedBy,deletion_due_time:tags.deletion_due_time}' \
@@ -334,6 +419,12 @@ jq -n \
   --arg subscription_id "$actual_subscription" \
   --arg region "$location" \
   --arg deletion_due_time "$deletion_due_time" \
+  --arg requested_deletion_due_time "$requested_deletion_due_time" \
+  --argjson lease_extension_hours "$extend_lease_hours" \
+  --argjson lease_renewal_threshold_hours "$lease_renewal_threshold_hours" \
+  --argjson lease_update_concurrency "$lease_update_concurrency" \
+  --argjson lease_refresh_performed "$lease_refresh_performed" \
+  --argjson parent_lease_extended "$parent_lease_extended" \
   --argjson cluster_count "$cluster_count" \
   --argjson fleet_count "$fleet_count" \
   --argjson clusters "$clusters" \
@@ -345,6 +436,17 @@ jq -n \
     subscription_id: $subscription_id,
     region: $region,
     deletion_due_time: $deletion_due_time,
+    requested_deletion_due_time: (
+      if ($requested_deletion_due_time | length) > 0
+      then $requested_deletion_due_time
+      else null
+      end
+    ),
+    lease_extension_hours: $lease_extension_hours,
+    lease_renewal_threshold_hours: $lease_renewal_threshold_hours,
+    lease_update_concurrency: $lease_update_concurrency,
+    lease_refresh_performed: $lease_refresh_performed,
+    parent_lease_extended: $parent_lease_extended,
     cluster_count: $cluster_count,
     fleet_count: $fleet_count,
     clusters: $clusters,

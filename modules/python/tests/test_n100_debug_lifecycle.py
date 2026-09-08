@@ -110,7 +110,14 @@ AZURE_TERRAFORM_MAIN = (
 )
 
 
-def _write_validation_fixture(tmp_path, *, include_second_node_group):
+def _write_validation_fixture(
+    tmp_path,
+    *,
+    include_second_node_group,
+    parent_lease="2000-01-01T00:00:00Z",
+    first_node_lease="2000-01-01T00:00:00Z",
+    second_node_lease="2099-01-01T00:00:00Z",
+):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     az_log = tmp_path / "az.log"
@@ -152,7 +159,7 @@ def _write_validation_fixture(tmp_path, *, include_second_node_group):
             "name": f"MC_{parent_rg}_clustermesh-1_eastus2euap",
             "location": "eastus2euap",
             "managedBy": cluster_ids["mesh-1"],
-            "deletion_due_time": "2000-01-01T00:00:00Z",
+            "deletion_due_time": first_node_lease,
         }
     ]
     if include_second_node_group:
@@ -161,7 +168,7 @@ def _write_validation_fixture(tmp_path, *, include_second_node_group):
                 "name": f"MC_{parent_rg}_clustermesh-2_eastus2euap",
                 "location": "eastus2euap",
                 "managedBy": cluster_ids["mesh-2"],
-                "deletion_due_time": "2099-01-01T00:00:00Z",
+                "deletion_due_time": second_node_lease,
             }
         )
     fixture_path.write_text(
@@ -175,7 +182,7 @@ def _write_validation_fixture(tmp_path, *, include_second_node_group):
                         "scenario": "perf-eval-clustermesh-scale",
                         "clustermesh_debug_expected_clusters": "2",
                         "clustermesh_debug_tfvars_sha256": "test-sha",
-                        "deletion_due_time": "2000-01-01T00:00:00Z",
+                        "deletion_due_time": parent_lease,
                     },
                 },
                 "clusters": clusters,
@@ -245,6 +252,8 @@ def _write_validation_fixture(tmp_path, *, include_second_node_group):
             "CLUSTERMESH_DEBUG_EXPECTED_FLEET_COUNT": "1",
             "CLUSTERMESH_DEBUG_EXPECTED_TFVARS_SHA256": "test-sha",
             "CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS": "24",
+            "CLUSTERMESH_DEBUG_LEASE_RENEWAL_THRESHOLD_HOURS": "12",
+            "CLUSTERMESH_DEBUG_LEASE_UPDATE_CONCURRENCY": "1",
             "CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET": "false",
             "CLUSTERMESH_DEBUG_MANIFEST_PATH": str(tmp_path / "manifest.json"),
         }
@@ -484,6 +493,9 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "- name: scaleDebugTopology" in pipeline
     assert "- name: scaleDebugRequiredFamilyVcpus" in pipeline
     assert "- name: scaleDebugRunWorkload" in pipeline
+    assert "- name: scaleDebugLeaseExtensionHours" in pipeline
+    assert "- name: scaleDebugLeaseRenewalThresholdHours" in pipeline
+    assert "- name: scaleDebugLeaseUpdateConcurrency" in pipeline
     assert "- name: scaleDebugWorkloadScenarios" in pipeline
     assert (
         "default: propagation-probe,event-throughput,policy-scale,"
@@ -543,7 +555,9 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "parameters.lifecycleSubscriptionId" in reset
     assert "parameters.scaleDebugTfvarsPath" in reset
     assert "parameters.scaleDebugClusterCount" in reset
-    assert 'CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"' in reset
+    assert "parameters.scaleDebugLeaseExtensionHours" in reset
+    assert "parameters.scaleDebugLeaseRenewalThresholdHours" in reset
+    assert "parameters.scaleDebugLeaseUpdateConcurrency" in reset
 
     assert "CLUSTERMESH_DEBUG_MODE'], 'resume'" in resume
     assert "CLUSTERMESH_DEBUG_MODE'], 'resume-existing'" in resume
@@ -559,6 +573,9 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "parameters.scaleDebugClusterCount" in resume
     assert "parameters.scaleDebugTopology" in resume
     assert "parameters.scaleDebugRunWorkload" in resume
+    assert "parameters.scaleDebugLeaseExtensionHours" in resume
+    assert "parameters.scaleDebugLeaseRenewalThresholdHours" in resume
+    assert "parameters.scaleDebugLeaseUpdateConcurrency" in resume
     assert (
         "share_infra_scenarios: "
         "${{ parameters.scaleDebugWorkloadScenarios }}"
@@ -574,7 +591,11 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert 'AKS_AMW_PREFLIGHT_MAX_UTILIZATION_PERCENT: "90"' in resume
     assert 'AKS_AMW_REGIONAL_WORKSPACE_LIMIT: "100"' in resume
     assert 'AKS_MANAGED_PROMETHEUS_REBALANCE_EXISTING: "true"' in resume
-    assert 'AKS_AMW_REBALANCE_SETTLE_SECONDS: "600"' in resume
+    assert 'AKS_AMW_REBALANCE_SETTLE_SECONDS: "0"' in resume
+    assert 'AKS_MANAGED_PROMETHEUS_EXACT_STATE_FAST_PATH: "true"' in resume
+    assert 'AKS_CONTROL_PLANE_METRICS_CONCURRENCY: "8"' in resume
+    assert 'AKS_AMW_CAPACITY_QUERY_CONCURRENCY: "10"' in resume
+    assert 'AKS_AMW_METRICS_QUERY_TIMEOUT_SECONDS: "90"' in resume
     assert 'AKS_AMW_MAX_ACTIVE_TIME_SERIES: "1000000"' in resume
     assert 'AKS_AMW_MAX_EVENTS_PER_MINUTE: "1000000"' in resume
     assert 'CLUSTERMESH_PRESERVED_WORKER_RECOVERY_ENABLED: "true"' in resume
@@ -708,7 +729,13 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     assert "--fault-role mesh-1" in resume
     assert "--fault-role mesh-100" in resume
     assert "cross-cluster-smoke.sh" in resume
-    assert 'CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"' in resume
+    assert (
+        'CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: '
+        '"${{ parameters.lease_extension_hours }}"'
+        in resume
+    )
+    assert "CLUSTERMESH_DEBUG_LEASE_RENEWAL_THRESHOLD_HOURS" in resume
+    assert "CLUSTERMESH_DEBUG_LEASE_UPDATE_CONCURRENCY" in resume
     assert (
         "${{ if and(parameters.run_workload, parameters.publish_results, "
         "eq(parameters.mock_preservation_mode, 'none')) }}:"
@@ -1216,7 +1243,52 @@ def test_preserved_validation_extends_child_leases_before_parent(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["node_resource_group_count"] == 2
     assert manifest["node_resource_groups_extended"] == 1
+    assert manifest["lease_refresh_performed"] is True
+    assert manifest["parent_lease_extended"] is True
+    assert manifest["lease_extension_hours"] == 24
+    assert manifest["lease_renewal_threshold_hours"] == 12
     assert len(manifest["node_resource_groups"]) == 2
+
+
+def test_preserved_validation_skips_lease_writes_above_threshold(tmp_path):
+    far_future = "2099-01-01T00:00:00Z"
+    env, az_log, manifest_path = _write_validation_fixture(
+        tmp_path,
+        include_second_node_group=True,
+        parent_lease=far_future,
+        first_node_lease=far_future,
+        second_node_lease=far_future,
+    )
+
+    result = subprocess.run(
+        ["bash", str(VALIDATE_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "group update" not in az_log.read_text(encoding="utf-8")
+    assert (
+        "validating all managed RG leases without rewriting them"
+        in result.stdout
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["deletion_due_time"] == far_future
+    assert manifest["node_resource_groups_extended"] == 0
+    assert manifest["lease_refresh_performed"] is False
+    assert manifest["parent_lease_extended"] is False
+
+
+def test_preserved_validation_drains_parallel_lease_updates_before_failure():
+    script = VALIDATE_SCRIPT.read_text(encoding="utf-8")
+
+    assert "batch_failed=false" in script
+    assert 'wait "${lease_update_pids[$index]}"' in script
+    assert "batch_failed=true" in script
+    assert '[ "$batch_failed" = "false" ]' in script
 
 
 def test_preserved_resume_recovery_runs_before_authoritative_validation():
@@ -1558,7 +1630,13 @@ def test_resume_manifest_template_preserves_legacy_defaults():
     assert "Refresh preserved n100 managed RG leases" in template
     assert "timeoutInMinutes: 15" in template
     assert "timeoutInMinutes: 45" in template
-    assert 'CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"' in template
+    assert (
+        'CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: '
+        '"${{ parameters.lease_extension_hours }}"'
+        in template
+    )
+    assert "lease_renewal_threshold_hours" in template
+    assert "lease_update_concurrency" in template
     assert 'CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET: "false"' in template
     assert "validate-existing-n100.sh" in template
     assert template.count("condition: always()") == 3

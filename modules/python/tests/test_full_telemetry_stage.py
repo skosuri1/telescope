@@ -732,6 +732,9 @@ def test_n100_resume_bounds_pre_telemetry_reconcile_concurrency():
 
     assert 'CL2_MOCK_WORKER_RECONCILE_CONCURRENCY: "12"' in stage
     assert 'CL2_MOCK_WORKER_RECONCILE_LOCK_WAIT_SECONDS: "900"' in stage
+    assert 'AKS_CONTROL_PLANE_METRICS_CONCURRENCY: "8"' in stage
+    assert 'AKS_AMW_CAPACITY_QUERY_CONCURRENCY: "10"' in stage
+    assert 'AKS_AMW_METRICS_QUERY_TIMEOUT_SECONDS: "90"' in stage
     assert (
         "share_infra_scenarios: "
         "${{ parameters.scaleDebugWorkloadScenarios }}"

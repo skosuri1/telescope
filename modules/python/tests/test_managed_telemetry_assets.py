@@ -1903,6 +1903,15 @@ def test_scripts_use_current_aks_profile_and_full_export():
     assert "--request-timeout-seconds" in audit
     assert "--command-timeout-seconds" in audit
     assert "--total-timeout-seconds" in audit
+    assert "AKS_AMW_CAPACITY_QUERY_CONCURRENCY" in configure
+    assert "workspace_preflight_state" in configure
+    assert "mapfile -t workspace_preflight_rows" in configure
+    assert "rebalance_capacity_state" in configure
+    assert "mapfile -t rebalance_workspace_rows" in configure
+    assert "single-pass" in configure
+    assert "skipping the fixed" in configure
+    assert "AKS_AMW_METRICS_QUERY_TIMEOUT_SECONDS" in common
+    assert "timeout --foreground --signal=TERM --kill-after=10s" in common
     assert "Reconstruct managed Prometheus TSDB" not in collect_template
     assert "--arg end " not in common
     assert "--arg window_end " in common
@@ -2260,7 +2269,7 @@ def test_wait_manifest_assembly_is_scale_safe(tmp_path):
             "RUN_ID": "test-run",
             "SHARE_INFRA_META": str(scenario_meta),
             "AKS_PLATFORM_METRICS_TIMEOUT_SECONDS": "0",
-            "AKS_MANAGED_PROMETHEUS_TIMEOUT_SECONDS": "5",
+            "AKS_MANAGED_PROMETHEUS_TIMEOUT_SECONDS": "30",
             "AKS_MANAGED_PROMETHEUS_POLL_SECONDS": "0",
             "AKS_AMW_METRICS_QUERY_ATTEMPTS": "1",
             "AKS_AMW_METRICS_QUERY_RETRY_SECONDS": "0",
@@ -2664,6 +2673,23 @@ def _write_rotation_fake_kubectl(fake_bin: Path) -> None:
               printf '%s\\n' 'apiVersion: v1' 'kind: Namespace' 'metadata:' '  name: monitoring'
             elif [ "${1:-} ${2:-} ${3:-}" = "apply -f -" ]; then
               cat >/dev/null
+              if [ "${FAKE_KUBECTL_APPLY_CHANGED:-false}" = "true" ]; then
+                echo "namespace/monitoring configured"
+              else
+                echo "namespace/monitoring unchanged"
+              fi
+            elif [ "${1:-}" = "apply" ]; then
+              if [ "${FAKE_KUBECTL_APPLY_FAIL_ONCE:-false}" = "true" ] &&
+                 [ ! -f "$KUBECTL_APPLY_STATE_FILE" ]; then
+                touch "$KUBECTL_APPLY_STATE_FILE"
+                echo "ServiceUnavailable: simulated partial apply" >&2
+                exit 1
+              fi
+              if [ "${FAKE_KUBECTL_APPLY_CHANGED:-false}" = "true" ]; then
+                echo "configmap/ama-metrics-settings configured"
+              else
+                echo "configmap/ama-metrics-settings unchanged"
+              fi
             elif [[ " $* " == *" -n kube-system get configmap cilium-config -o jsonpath="* ]]; then
               if [ -n "${FAKE_CILIUM_POLICY_READ_SLEEP_SECONDS:-}" ]; then
                 sleep "$FAKE_CILIUM_POLICY_READ_SLEEP_SECONDS"
@@ -2808,6 +2834,7 @@ def _run_rotation_configure(
             "AKS_UPDATE_STATE_FILE": str(tmp_path / "aks-update-accepted"),
             "AKS_PROFILE_STATE_FILE": str(tmp_path / "aks-profile-count"),
             "EXTENSION_STATE_FILE": str(tmp_path / "extension-state-count"),
+            "KUBECTL_APPLY_STATE_FILE": str(tmp_path / "kubectl-apply-count"),
             "HOME": str(tmp_path),
             "PATH": f"{fake_bin}:{environment['PATH']}",
         }
@@ -2863,6 +2890,59 @@ def test_managed_monitoring_accepts_documented_cilium_policy_gap(tmp_path):
             },
         }
     ]
+
+
+def test_managed_monitoring_exact_state_skips_new_quiet_window(tmp_path):
+    result, manifest, _, az_log = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        existing_workspaces=["test-amw-shard-001"],
+        capacity={"test-amw-shard-001": 10},
+        env_overrides={
+            "AKS_AMW_FORCE_SHARD_NAMING": "true",
+            "AKS_MANAGED_PROMETHEUS_REBALANCE_EXISTING": "true",
+            "AKS_MANAGED_PROMETHEUS_EXACT_STATE_FAST_PATH": "true",
+            "AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED": "true",
+            "AKS_MANAGED_MONITORING_CILIUM_QUIET_SECONDS": "60",
+            "FAKE_EXISTING_DCR": "true",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest is not None
+    convergence = manifest["control_plane"]["managed_monitoring_convergence"]
+    assert convergence[0]["fast_path"] is True
+    assert "skipping the new quiet-window wait" in result.stdout
+    commands = az_log.read_text(encoding="utf-8")
+    assert "aks update" not in commands
+    assert "rest --method put" not in commands
+
+
+def test_managed_monitoring_apply_retry_disables_exact_state_fast_path(
+    tmp_path,
+):
+    result, manifest, _, _ = _run_rotation_configure(
+        tmp_path,
+        roles=["mesh-1"],
+        existing_workspaces=["test-amw-shard-001"],
+        capacity={"test-amw-shard-001": 10},
+        env_overrides={
+            "AKS_AMW_FORCE_SHARD_NAMING": "true",
+            "AKS_MANAGED_PROMETHEUS_EXACT_STATE_FAST_PATH": "true",
+            "AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED": "true",
+            "AKS_MANAGED_MONITORING_CILIUM_QUIET_SECONDS": "0",
+            "AKS_MANAGED_MONITORING_POLL_SECONDS": "0",
+            "AKS_MANAGED_PROMETHEUS_APPLY_RETRY_SECONDS": "0",
+            "FAKE_EXISTING_DCR": "true",
+            "FAKE_KUBECTL_APPLY_FAIL_ONCE": "true",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest is not None
+    convergence = manifest["control_plane"]["managed_monitoring_convergence"]
+    assert "fast_path" not in convergence[0]
+    assert "telemetry manifest apply recovered" in result.stdout
 
 
 def test_managed_monitoring_rejects_cilium_policy_gap_without_opt_in(tmp_path):

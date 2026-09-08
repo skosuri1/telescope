@@ -122,6 +122,7 @@ amw_rebalance_verify_retry_seconds="${AKS_AMW_REBALANCE_VERIFY_RETRY_SECONDS:-60
 amw_rebalance_assignment_timeout_seconds="${AKS_AMW_REBALANCE_ASSIGNMENT_TIMEOUT_SECONDS:-3600}"
 amw_rebalance_assignment_poll_seconds="${AKS_AMW_REBALANCE_ASSIGNMENT_POLL_SECONDS:-60}"
 amw_rebalance_assignment_request_timeout_seconds="${AKS_AMW_REBALANCE_ASSIGNMENT_REQUEST_TIMEOUT_SECONDS:-15}"
+amw_capacity_query_concurrency="${AKS_AMW_CAPACITY_QUERY_CONCURRENCY:-5}"
 amw_default_max_active_time_series=1000000
 amw_default_max_events_per_minute=1000000
 amw_max_active_time_series="${AKS_AMW_MAX_ACTIVE_TIME_SERIES:-$amw_default_max_active_time_series}"
@@ -135,6 +136,7 @@ managed_route_command_timeout_seconds="${AKS_MANAGED_ROUTE_COMMAND_TIMEOUT_SECON
 managed_update_timeout_seconds="${AKS_MANAGED_UPDATE_TIMEOUT_SECONDS:-3600}"
 managed_update_poll_seconds="${AKS_MANAGED_UPDATE_POLL_SECONDS:-30}"
 accept_cilium_policy_gap="${CL2_ACCEPT_CILIUM_POLICY_GAP:-false}"
+exact_state_fast_path="${AKS_MANAGED_PROMETHEUS_EXACT_STATE_FAST_PATH:-false}"
 # Shared across the metricsContainers deployment below and its ARM-level
 # verification, so both always target the same child-resource API version.
 amw_metrics_container_api_version="2025-05-03-preview"
@@ -156,6 +158,7 @@ fi
 for name_value in \
   "AKS_AMW_FORCE_SHARD_NAMING=$amw_force_shard_naming" \
   "AKS_MANAGED_PROMETHEUS_REBALANCE_EXISTING=$amw_rebalance_existing" \
+  "AKS_MANAGED_PROMETHEUS_EXACT_STATE_FAST_PATH=$exact_state_fast_path" \
   "CL2_ACCEPT_CILIUM_POLICY_GAP=$accept_cilium_policy_gap"; do
   name="${name_value%%=*}"
   value="${name_value#*=}"
@@ -208,6 +211,11 @@ if ! [[ "$amw_max_events_per_minute" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if ! [[ "$amw_regional_workspace_limit" =~ ^[1-9][0-9]*$ ]]; then
   echo "AKS_AMW_REGIONAL_WORKSPACE_LIMIT must be a positive integer." >&2
+  exit 1
+fi
+if ! [[ "$amw_capacity_query_concurrency" =~ ^[1-9][0-9]*$ ]] ||
+   [ "$amw_capacity_query_concurrency" -gt 16 ]; then
+  echo "AKS_AMW_CAPACITY_QUERY_CONCURRENCY must be an integer from 1 through 16." >&2
   exit 1
 fi
 if ! [[ "$manifest_apply_attempts" =~ ^[1-9][0-9]*$ ]]; then
@@ -689,17 +697,42 @@ fi
 # rather than resampled, so the post-create check is evaluated against the
 # same headroom snapshot that made this generation eligible.
 workspace_preflight_jsonl=$(mktemp)
-while IFS= read -r workspace; do
+workspace_preflight_state=$(mktemp -d)
+capacity_batch=0
+mapfile -t workspace_preflight_rows < <(
+  echo "$workspace_catalog" | jq -c '.[]'
+)
+for workspace in "${workspace_preflight_rows[@]}"; do
   workspace_slot=$(echo "$workspace" | jq -r '.slot')
   workspace_id=$(echo "$workspace" | jq -r '.id')
   preflight_raw="$(dirname "$MANIFEST_PATH")/amw-capacity-preflight-${workspace_slot}.json"
   preflight_summary="$(dirname "$MANIFEST_PATH")/amw-capacity-preflight-${workspace_slot}-summary.json"
-  if ! capture_amw_capacity \
-      "$workspace_id" \
-      "$preflight_start" \
-      "$preflight_end" \
-      "$preflight_raw" \
-      "$preflight_summary"; then
+  (
+    if capture_amw_capacity \
+        "$workspace_id" \
+        "$preflight_start" \
+        "$preflight_end" \
+        "$preflight_raw" \
+        "$preflight_summary"; then
+      echo ok > "$workspace_preflight_state/${workspace_slot}.status"
+    else
+      echo fail > "$workspace_preflight_state/${workspace_slot}.status"
+    fi
+  ) >"$workspace_preflight_state/${workspace_slot}.log" 2>&1 &
+  capacity_batch=$((capacity_batch + 1))
+  if [ "$capacity_batch" -ge "$amw_capacity_query_concurrency" ]; then
+    wait
+    capacity_batch=0
+  fi
+done
+wait
+
+for workspace in "${workspace_preflight_rows[@]}"; do
+  workspace_slot=$(echo "$workspace" | jq -r '.slot')
+  preflight_summary="$(dirname "$MANIFEST_PATH")/amw-capacity-preflight-${workspace_slot}-summary.json"
+  cat "$workspace_preflight_state/${workspace_slot}.log" 2>/dev/null || true
+  if [ "$(cat "$workspace_preflight_state/${workspace_slot}.status" 2>/dev/null || echo fail)" != "ok" ]; then
+    rm -rf -- "$workspace_preflight_state"
     echo "Unable to verify capacity for Azure Monitor workspace slot $workspace_slot." >&2
     exit 1
   fi
@@ -726,7 +759,8 @@ while IFS= read -r workspace; do
         preflight: $preflight
       }
     }' >> "$workspace_preflight_jsonl"
-done < <(echo "$workspace_catalog" | jq -c '.[]')
+done
+rm -rf -- "$workspace_preflight_state"
 workspace_catalog=$(jq -s '.' "$workspace_preflight_jsonl")
 rm -f "$workspace_preflight_jsonl"
 
@@ -1052,6 +1086,105 @@ wait_for_managed_monitoring_convergence() {
   return 1
 }
 
+validate_managed_monitoring_current_state() {
+  local role="$1" cluster_id="$2" kubeconfig="$3" policy_before="$4"
+  local extension_api_version="${AKS_MANAGED_MONITORING_EXTENSION_API_VERSION:-2025-03-01}"
+  local extension_id="${cluster_id}/providers/Microsoft.KubernetesConfiguration/extensions/aks-managed-azure-monitor-metrics"
+  local state cm_json ds_json policy_after desired ready updated
+  local observed generation accepted_policy_gap=false
+  local convergence_file convergence_tmp
+  convergence_file="$(dirname "$MANIFEST_PATH")/managed-monitoring-convergence-${role}.json"
+  convergence_tmp="${convergence_file}.tmp.$$"
+
+  state=$(read_managed_monitoring_extension_state \
+    "$extension_id" "$extension_api_version" \
+    "$managed_route_command_timeout_seconds" || true)
+  if [ "$state" != "Succeeded" ]; then
+    echo "[$role] exact-state fast path declined: managed-monitoring extension state=${state:-unavailable}." >&2
+    return 1
+  fi
+  cm_json=$(timeout --signal=TERM --kill-after=10s \
+    "${managed_route_command_timeout_seconds}s" \
+    env KUBECONFIG="$kubeconfig" \
+    kubectl --request-timeout="${managed_route_command_timeout_seconds}s" \
+      -n kube-system get configmap cilium-config -o json 2>/dev/null || true)
+  ds_json=$(timeout --signal=TERM --kill-after=10s \
+    "${managed_route_command_timeout_seconds}s" \
+    env KUBECONFIG="$kubeconfig" \
+    kubectl --request-timeout="${managed_route_command_timeout_seconds}s" \
+      -n kube-system get daemonset cilium -o json 2>/dev/null || true)
+  if [ -z "$cm_json" ] || [ -z "$ds_json" ]; then
+    echo "[$role] exact-state fast path declined: Cilium state could not be read." >&2
+    return 1
+  fi
+
+  policy_after=$(jq -r '.data["enable-policy"] // ""' <<<"$cm_json")
+  if [ "$policy_after" = "never" ]; then
+    if [ "${accept_cilium_policy_gap,,}" != "true" ]; then
+      echo "[$role] exact-state fast path declined: enable-policy=never is not accepted." >&2
+      return 1
+    fi
+    accepted_policy_gap=true
+  elif [ -n "$policy_before" ] && [ "$policy_after" != "$policy_before" ]; then
+    echo "[$role] exact-state fast path declined: Cilium policy changed from $policy_before to ${policy_after:-missing}." >&2
+    return 1
+  fi
+
+  desired=$(jq -r '.status.desiredNumberScheduled // 0' <<<"$ds_json")
+  ready=$(jq -r '.status.numberReady // 0' <<<"$ds_json")
+  updated=$(jq -r '.status.updatedNumberScheduled // 0' <<<"$ds_json")
+  observed=$(jq -r '.status.observedGeneration // 0' <<<"$ds_json")
+  generation=$(jq -r '.metadata.generation // 0' <<<"$ds_json")
+  if [ "$desired" -le 0 ] ||
+     [ "$ready" -ne "$desired" ] ||
+     [ "$updated" -ne "$desired" ] ||
+     [ "$observed" -ne "$generation" ]; then
+    echo "[$role] exact-state fast path declined: Cilium desired/ready/updated/generation=${desired}/${ready}/${updated}/${observed}:${generation}." >&2
+    return 1
+  fi
+
+  state=$(read_managed_monitoring_extension_state \
+    "$extension_id" "$extension_api_version" \
+    "$managed_route_command_timeout_seconds" || true)
+  if [ "$state" != "Succeeded" ]; then
+    echo "[$role] exact-state fast path declined: managed-monitoring extension left Succeeded state (${state:-unavailable})." >&2
+    return 1
+  fi
+
+  if ! jq -n \
+      --arg role "$role" \
+      --arg policy_before "$policy_before" \
+      --arg policy_after "$policy_after" \
+      --argjson accepted_policy_gap "$accepted_policy_gap" \
+      --argjson desired "$desired" \
+      --argjson ready "$ready" \
+      --argjson updated "$updated" \
+      --argjson observed_generation "$observed" \
+      --argjson generation "$generation" \
+      '{
+        role: $role,
+        enabled: true,
+        fast_path: true,
+        extension_state: "Succeeded",
+        policy_before: $policy_before,
+        policy_after: $policy_after,
+        accepted_policy_gap: $accepted_policy_gap,
+        cilium: {
+          desired: $desired,
+          ready: $ready,
+          updated: $updated,
+          observed_generation: $observed_generation,
+          generation: $generation
+        }
+      }' >"$convergence_tmp" ||
+     ! mv "$convergence_tmp" "$convergence_file"; then
+    rm -f "$convergence_tmp"
+    echo "[$role] unable to write exact-state managed-monitoring evidence." >&2
+    return 1
+  fi
+  echo "[$role] exact managed-monitoring/Cilium state is already current; skipping the new quiet-window wait."
+}
+
 kubectl_apply_with_retry() {
   local role="$1"
   local kubeconfig="$2"
@@ -1062,12 +1195,17 @@ kubectl_apply_with_retry() {
     rc=0
     output=$(KUBECONFIG="$kubeconfig" kubectl apply "$@" 2>&1) || rc=$?
     if [ "$rc" -eq 0 ]; then
+      if [ -z "$output" ] ||
+         grep -Evq ' unchanged$' <<<"$output"; then
+        managed_kubernetes_mutated=true
+      fi
       if [ "$attempt" -gt 1 ]; then
         echo "[$role] telemetry manifest apply recovered on attempt $attempt/$manifest_apply_attempts."
       fi
       return 0
     fi
 
+    managed_kubernetes_mutated=true
     if ! echo "$output" | grep -Eqi \
         'server is currently unable to handle the request|ServiceUnavailable|InternalError|TooManyRequests|timeout|timed out|connection reset|client connection lost|TLS handshake timeout|i/o timeout|unexpected EOF'; then
       echo "[$role] telemetry manifest apply failed with a non-transient error: $output" >&2
@@ -1401,7 +1539,8 @@ configure_managed_prometheus_route() {
   local workspace_id="$6"
   local workspace_account_id="$7"
   local associations association_count dcr_id dcr_url
-  local dcr_file dcr_body current_workspace_id verified_workspace_id
+  local dcr_file dcr_body current_workspace_id current_workspace_account_id
+  local verified_workspace_id verified_workspace_account_id
 
   if ! associations=$(managed_route_command \
       "[$role] managed-Prometheus association query" \
@@ -1435,6 +1574,7 @@ configure_managed_prometheus_route() {
   fi
   if [ "$association_count" -eq 0 ]; then
     echo "[$role] enabling managed Prometheus -> $workspace_name"
+    managed_route_mutated=true
     if ! enable_managed_prometheus_route \
         "$role" "$resource_group" "$name" "$workspace_id"; then
       return 1
@@ -1489,9 +1629,15 @@ configure_managed_prometheus_route() {
   current_workspace_id=$(jq -r \
     '.properties.destinations.monitoringAccounts[0].accountResourceId // empty' \
     "$dcr_file")
+  current_workspace_account_id=$(jq -r \
+    '.properties.destinations.monitoringAccounts[0].accountId // empty' \
+    "$dcr_file")
   if [ "$(normalize_resource_id "$current_workspace_id")" != \
-       "$(normalize_resource_id "$workspace_id")" ]; then
-    echo "[$role] migrating managed Prometheus DCR destination: ${current_workspace_id:-missing} -> $workspace_id"
+       "$(normalize_resource_id "$workspace_id")" ] ||
+     [ "$(normalize_resource_id "$current_workspace_account_id")" != \
+       "$(normalize_resource_id "$workspace_account_id")" ]; then
+    echo "[$role] migrating managed Prometheus DCR destination: ${current_workspace_id:-missing}/${current_workspace_account_id:-missing} -> $workspace_id/$workspace_account_id"
+    managed_route_mutated=true
     if ! jq \
         --arg workspace_id "$workspace_id" \
         --arg workspace_account_id "$workspace_account_id" \
@@ -1531,16 +1677,22 @@ configure_managed_prometheus_route() {
   verified_workspace_id=$(jq -r \
     '.properties.destinations.monitoringAccounts[0].accountResourceId // empty' \
     "$dcr_file")
+  verified_workspace_account_id=$(jq -r \
+    '.properties.destinations.monitoringAccounts[0].accountId // empty' \
+    "$dcr_file")
   rm -f "$dcr_file" "$dcr_body"
   if [ "$(normalize_resource_id "$verified_workspace_id")" != \
-       "$(normalize_resource_id "$workspace_id")" ]; then
-    echo "[$role] DCR destination verification failed: expected=$workspace_id actual=${verified_workspace_id:-missing}" >&2
+       "$(normalize_resource_id "$workspace_id")" ] ||
+     [ "$(normalize_resource_id "$verified_workspace_account_id")" != \
+       "$(normalize_resource_id "$workspace_account_id")" ]; then
+    echo "[$role] DCR destination verification failed: expected=$workspace_id/$workspace_account_id actual=${verified_workspace_id:-missing}/${verified_workspace_account_id:-missing}" >&2
     return 1
   fi
 }
 
 verify_rebalanced_workspace_assignments() {
   local summary_path="$1"
+  local mode="${2:-wait}"
   local expected_count="${#cluster_rows[@]}"
   local deadline token results_jsonl role cluster_alias cluster_id
   local workspace_name query_endpoint query response ready ready_count
@@ -1633,6 +1785,10 @@ verify_rebalanced_workspace_assignments() {
       echo "One-to-one Azure Monitor workspace routing verified for all $expected_count cluster aliases."
       return 0
     fi
+    if [ "$mode" = "single-pass" ]; then
+      echo "One-to-one Azure Monitor workspace routing is not immediately ready ($ready_count/$expected_count cluster aliases ready)."
+      return 1
+    fi
     echo "Waiting for one-to-one Azure Monitor workspace routing ($ready_count/$expected_count cluster aliases ready)..."
     remaining=$((deadline - $(date +%s)))
     if [ "$remaining" -le 0 ]; then
@@ -1659,6 +1815,9 @@ configure_one() {
   local cluster_alias rendered_config cluster_id categories_file logs_file metrics_file
   local workspace_name workspace_id workspace_account_id
   local cilium_policy_before namespace_manifest
+  local exact_state_validated=false
+  managed_kubernetes_mutated=false
+  managed_route_mutated=false
   role=$(echo "$row" | jq -r '.role')
   name=$(echo "$row" | jq -r '.name')
   resource_group=$(echo "$row" | jq -r '.rg')
@@ -1744,9 +1903,19 @@ configure_one() {
     fi
     return 1
   fi
-  if ! wait_for_managed_monitoring_convergence \
-      "$role" "$cluster_id" "$kubeconfig" "$cilium_policy_before"; then
-    return 1
+  if [ "${AKS_MANAGED_MONITORING_CONVERGENCE_ENABLED:-false}" = "true" ] &&
+     [ "${exact_state_fast_path,,}" = "true" ] &&
+     [ "$managed_kubernetes_mutated" != "true" ] &&
+     [ "$managed_route_mutated" != "true" ] &&
+     validate_managed_monitoring_current_state \
+       "$role" "$cluster_id" "$kubeconfig" "$cilium_policy_before"; then
+    exact_state_validated=true
+  fi
+  if [ "$exact_state_validated" != "true" ]; then
+    if ! wait_for_managed_monitoring_convergence \
+        "$role" "$cluster_id" "$kubeconfig" "$cilium_policy_before"; then
+      return 1
+    fi
   fi
 
   categories_file=$(mktemp)
@@ -1855,14 +2024,19 @@ fi
 
 rebalance_assignment_summary="$(dirname "$MANIFEST_PATH")/amw-rebalance-assignment.json"
 if [ "${amw_rebalance_existing,,}" = "true" ]; then
-  if [ "$amw_rebalance_settle_seconds" -gt 0 ]; then
-    echo "Waiting ${amw_rebalance_settle_seconds}s for one-to-one Azure Monitor workspace rebalance to settle."
-    sleep "$amw_rebalance_settle_seconds"
-  fi
-  if ! verify_rebalanced_workspace_assignments \
-      "$rebalance_assignment_summary"; then
-    echo "##vso[task.logissue type=error;] One-to-one Azure Monitor workspace routing did not converge." >&2
-    exit 1
+  if verify_rebalanced_workspace_assignments \
+      "$rebalance_assignment_summary" single-pass; then
+    echo "Azure Monitor workspace routing is already exact; skipping the fixed ${amw_rebalance_settle_seconds}s settle."
+  else
+    if [ "$amw_rebalance_settle_seconds" -gt 0 ]; then
+      echo "Waiting ${amw_rebalance_settle_seconds}s for one-to-one Azure Monitor workspace rebalance to settle."
+      sleep "$amw_rebalance_settle_seconds"
+    fi
+    if ! verify_rebalanced_workspace_assignments \
+        "$rebalance_assignment_summary"; then
+      echo "##vso[task.logissue type=error;] One-to-one Azure Monitor workspace routing did not converge." >&2
+      exit 1
+    fi
   fi
   rebalance_capacity_verified=false
   for attempt in $(seq 1 "$amw_rebalance_verify_attempts"); do
@@ -1871,21 +2045,46 @@ if [ "${amw_rebalance_existing,,}" = "true" ]; then
       -d "$amw_rebalance_window_minutes minutes ago" \
       +%Y-%m-%dT%H:%M:%SZ)
     rebalance_failed_slots=()
-    while IFS= read -r workspace; do
+    rebalance_capacity_state=$(mktemp -d)
+    capacity_batch=0
+    mapfile -t rebalance_workspace_rows < <(
+      echo "$workspace_catalog" | jq -c '.[]'
+    )
+    for workspace in "${rebalance_workspace_rows[@]}"; do
       workspace_slot=$(echo "$workspace" | jq -r '.slot')
       workspace_id=$(echo "$workspace" | jq -r '.id')
       rebalance_raw="$(dirname "$MANIFEST_PATH")/amw-capacity-rebalance-${workspace_slot}-attempt-${attempt}.json"
       rebalance_summary="$(dirname "$MANIFEST_PATH")/amw-capacity-rebalance-${workspace_slot}-attempt-${attempt}-summary.json"
-      if ! capture_amw_capacity \
-          "$workspace_id" \
-          "$rebalance_start" \
-          "$rebalance_end" \
-          "$rebalance_raw" \
-          "$rebalance_summary" ||
-         ! amw_capacity_rebalance_ok "$rebalance_summary" "$preflight_threshold"; then
+      (
+        if capture_amw_capacity \
+            "$workspace_id" \
+            "$rebalance_start" \
+            "$rebalance_end" \
+            "$rebalance_raw" \
+            "$rebalance_summary" &&
+           amw_capacity_rebalance_ok \
+            "$rebalance_summary" "$preflight_threshold"; then
+          echo ok > "$rebalance_capacity_state/${workspace_slot}.status"
+        else
+          echo fail > "$rebalance_capacity_state/${workspace_slot}.status"
+        fi
+      ) >"$rebalance_capacity_state/${workspace_slot}.log" 2>&1 &
+      capacity_batch=$((capacity_batch + 1))
+      if [ "$capacity_batch" -ge "$amw_capacity_query_concurrency" ]; then
+        wait
+        capacity_batch=0
+      fi
+    done
+    wait
+
+    for workspace in "${rebalance_workspace_rows[@]}"; do
+      workspace_slot=$(echo "$workspace" | jq -r '.slot')
+      cat "$rebalance_capacity_state/${workspace_slot}.log" 2>/dev/null || true
+      if [ "$(cat "$rebalance_capacity_state/${workspace_slot}.status" 2>/dev/null || echo fail)" != "ok" ]; then
         rebalance_failed_slots+=("$workspace_slot")
       fi
-    done < <(echo "$workspace_catalog" | jq -c '.[]')
+    done
+    rm -rf -- "$rebalance_capacity_state"
 
     if [ "${#rebalance_failed_slots[@]}" -eq 0 ]; then
       rebalance_capacity_verified=true

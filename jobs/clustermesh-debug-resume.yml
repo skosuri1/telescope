@@ -34,6 +34,15 @@ parameters:
 - name: expected_pool_count
   type: number
   default: 201
+- name: lease_extension_hours
+  type: number
+  default: 168
+- name: lease_renewal_threshold_hours
+  type: number
+  default: 96
+- name: lease_update_concurrency
+  type: number
+  default: 8
 - name: run_workload
   type: boolean
   default: true
@@ -244,7 +253,9 @@ jobs:
       CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID: ${{ parameters.expected_subscription_id }}
       CLUSTERMESH_DEBUG_EXPECTED_REGION: ${{ parameters.region }}
       CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
-      CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"
+      CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "${{ parameters.lease_extension_hours }}"
+      CLUSTERMESH_DEBUG_LEASE_RENEWAL_THRESHOLD_HOURS: "${{ parameters.lease_renewal_threshold_hours }}"
+      CLUSTERMESH_DEBUG_LEASE_UPDATE_CONCURRENCY: "${{ parameters.lease_update_concurrency }}"
       CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET: ${{ eq(parameters.overlay_mode, 'resume') }}
       CLUSTERMESH_DEBUG_MAX_REPAIR_MEMBERS: "20"
       CLUSTERMESH_DEBUG_MANIFEST_PATH: $(Build.ArtifactStagingDirectory)/${{ parameters.manifest_subdir }}/validation.json
@@ -478,3 +489,6 @@ jobs:
       expected_subscription_id: ${{ parameters.expected_subscription_id }}
       expected_cluster_count: ${{ parameters.expected_cluster_count }}
       expected_fleet_count: 1
+      lease_extension_hours: ${{ parameters.lease_extension_hours }}
+      lease_renewal_threshold_hours: ${{ parameters.lease_renewal_threshold_hours }}
+      lease_update_concurrency: ${{ parameters.lease_update_concurrency }}

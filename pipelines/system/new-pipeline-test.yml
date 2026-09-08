@@ -52,6 +52,15 @@ parameters:
   - name: scaleDebugRunWorkload
     type: boolean
     default: true
+  - name: scaleDebugLeaseExtensionHours
+    type: number
+    default: 168
+  - name: scaleDebugLeaseRenewalThresholdHours
+    type: number
+    default: 96
+  - name: scaleDebugLeaseUpdateConcurrency
+    type: number
+    default: 8
   - name: scaleDebugWorkloadScenarios
     type: string
     default: propagation-probe,event-throughput,policy-scale,pod-churn-combined,apiserver-failure,isolation,node-churn-combined,upper-bound
@@ -2712,6 +2721,7 @@ stages:
       AKS_PLATFORM_METRICS_TIMEOUT_SECONDS: "0"
       AKS_CONTROL_PLANE_AMW_RESOURCE_GROUP: clustermesh-scale-prom-snapshots
       AKS_CONTROL_PLANE_AMW_NAME_PREFIX: cmsh-scale-eastus2euap-n100-amw
+      AKS_MANAGED_PROMETHEUS_EXACT_STATE_FAST_PATH: "true"
       AKS_AMW_ARM_BATCH_SIZE: "10"
       AKS_AMW_CLUSTERS_PER_WORKSPACE: "1"
       AKS_AMW_FORCE_SHARD_NAMING: "true"
@@ -2727,7 +2737,9 @@ stages:
       AKS_PLATFORM_EXPORT_TOTAL_TIMEOUT_SECONDS: "2700"
       AKS_PLATFORM_EXPORT_CLUSTER_TIMEOUT_SECONDS: "180"
       AKS_PLATFORM_AZ_COMMAND_TIMEOUT_SECONDS: "60"
-      AKS_CONTROL_PLANE_METRICS_CONCURRENCY: "5"
+      AKS_CONTROL_PLANE_METRICS_CONCURRENCY: "8"
+      AKS_AMW_CAPACITY_QUERY_CONCURRENCY: "10"
+      AKS_AMW_METRICS_QUERY_TIMEOUT_SECONDS: "90"
       AKS_CONTROL_PLANE_LAW_NAME: cmsh-scale-controlplane-law
       AKS_CONTROL_PLANE_LAW_LOCATION: eastus2
       AKS_CONTROL_PLANE_LOG_RETENTION_DAYS: "30"
@@ -2879,7 +2891,9 @@ stages:
               CLUSTERMESH_DEBUG_EXPECTED_SUBSCRIPTION_ID: $(CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID)
               CLUSTERMESH_DEBUG_EXPECTED_REGION: ${{ parameters.scaleDebugRegion }}
               CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT: "${{ parameters.scaleDebugClusterCount }}"
-              CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "168"
+              CLUSTERMESH_DEBUG_EXTEND_LEASE_HOURS: "${{ parameters.scaleDebugLeaseExtensionHours }}"
+              CLUSTERMESH_DEBUG_LEASE_RENEWAL_THRESHOLD_HOURS: "${{ parameters.scaleDebugLeaseRenewalThresholdHours }}"
+              CLUSTERMESH_DEBUG_LEASE_UPDATE_CONCURRENCY: "${{ parameters.scaleDebugLeaseUpdateConcurrency }}"
               CLUSTERMESH_DEBUG_REQUIRE_OVERLAY_RESET: "false"
               CLUSTERMESH_DEBUG_MANIFEST_PATH: $(Build.ArtifactStagingDirectory)/scale-resume/reset-validation.json
           - template: /steps/topology/clustermesh-scale/reuse/write-resume-manifest.yml
@@ -2890,6 +2904,9 @@ stages:
               expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
               expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
               expected_fleet_count: 0
+              lease_extension_hours: ${{ parameters.scaleDebugLeaseExtensionHours }}
+              lease_renewal_threshold_hours: ${{ parameters.scaleDebugLeaseRenewalThresholdHours }}
+              lease_update_concurrency: ${{ parameters.scaleDebugLeaseUpdateConcurrency }}
 
   - stage: azure_eastus2euap_n100_debug_resume_37deca
     dependsOn: []
@@ -2933,13 +2950,14 @@ stages:
       AKS_PLATFORM_METRICS_TIMEOUT_SECONDS: "0"
       AKS_CONTROL_PLANE_AMW_RESOURCE_GROUP: clustermesh-scale-prom-snapshots
       AKS_CONTROL_PLANE_AMW_NAME_PREFIX: cmsh-scale-eastus2euap-n100-amw
+      AKS_MANAGED_PROMETHEUS_EXACT_STATE_FAST_PATH: "true"
       AKS_AMW_ARM_BATCH_SIZE: "10"
       AKS_AMW_CLUSTERS_PER_WORKSPACE: "1"
       AKS_AMW_FORCE_SHARD_NAMING: "true"
       AKS_AMW_PREFLIGHT_MAX_UTILIZATION_PERCENT: "90"
       AKS_AMW_REGIONAL_WORKSPACE_LIMIT: "100"
       AKS_MANAGED_PROMETHEUS_REBALANCE_EXISTING: "true"
-      AKS_AMW_REBALANCE_SETTLE_SECONDS: "600"
+      AKS_AMW_REBALANCE_SETTLE_SECONDS: "0"
       AKS_AMW_REBALANCE_WINDOW_MINUTES: "5"
       AKS_AMW_REBALANCE_VERIFY_ATTEMPTS: "6"
       AKS_AMW_REBALANCE_VERIFY_RETRY_SECONDS: "60"
@@ -2953,7 +2971,9 @@ stages:
       AKS_PLATFORM_EXPORT_TOTAL_TIMEOUT_SECONDS: "2700"
       AKS_PLATFORM_EXPORT_CLUSTER_TIMEOUT_SECONDS: "180"
       AKS_PLATFORM_AZ_COMMAND_TIMEOUT_SECONDS: "60"
-      AKS_CONTROL_PLANE_METRICS_CONCURRENCY: "5"
+      AKS_CONTROL_PLANE_METRICS_CONCURRENCY: "8"
+      AKS_AMW_CAPACITY_QUERY_CONCURRENCY: "10"
+      AKS_AMW_METRICS_QUERY_TIMEOUT_SECONDS: "90"
       AKS_CONTROL_PLANE_LAW_NAME: cmsh-scale-controlplane-law
       AKS_CONTROL_PLANE_LAW_LOCATION: eastus2
       AKS_CONTROL_PLANE_LOG_RETENTION_DAYS: "30"
@@ -3044,6 +3064,9 @@ stages:
           tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
           expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
           expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
+          lease_extension_hours: ${{ parameters.scaleDebugLeaseExtensionHours }}
+          lease_renewal_threshold_hours: ${{ parameters.scaleDebugLeaseRenewalThresholdHours }}
+          lease_update_concurrency: ${{ parameters.scaleDebugLeaseUpdateConcurrency }}
           run_workload: ${{ parameters.scaleDebugRunWorkload }}
           publish_results: ${{ parameters.scaleDebugRunWorkload }}
           mock_preservation_mode: ${{ parameters.scaleDebugKwokPreservationMode }}

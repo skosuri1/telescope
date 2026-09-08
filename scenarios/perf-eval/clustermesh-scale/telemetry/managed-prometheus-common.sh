@@ -13,6 +13,7 @@ capture_amw_capacity() {
   local summary_output="${5:?AMW capacity summary output path is required}"
   local attempts="${AKS_AMW_METRICS_QUERY_ATTEMPTS:-3}"
   local retry_seconds="${AKS_AMW_METRICS_QUERY_RETRY_SECONDS:-5}"
+  local query_timeout_seconds="${AKS_AMW_METRICS_QUERY_TIMEOUT_SECONDS:-120}"
   local attempt capacity_file drops_file raw_tmp summary_tmp
 
   if ! [[ "$attempts" =~ ^[1-9][0-9]*$ ]]; then
@@ -23,6 +24,10 @@ capture_amw_capacity() {
     echo "AKS_AMW_METRICS_QUERY_RETRY_SECONDS must be a non-negative integer." >&2
     return 1
   fi
+  if ! [[ "$query_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "AKS_AMW_METRICS_QUERY_TIMEOUT_SECONDS must be a positive integer." >&2
+    return 1
+  fi
 
   mkdir -p "$(dirname "$raw_output")" "$(dirname "$summary_output")"
   capacity_file=$(mktemp)
@@ -31,7 +36,9 @@ capture_amw_capacity() {
   summary_tmp="${summary_output}.tmp"
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if az monitor metrics list \
+    if timeout --foreground --signal=TERM --kill-after=10s \
+        "${query_timeout_seconds}s" \
+        az monitor metrics list \
         --resource "$resource_id" \
         --metrics \
           ActiveTimeSeries \
@@ -45,7 +52,9 @@ capture_amw_capacity() {
         --start-time "$start_time" \
         --end-time "$end_time" \
         -o json > "$capacity_file" &&
-       az monitor metrics list \
+       timeout --foreground --signal=TERM --kill-after=10s \
+        "${query_timeout_seconds}s" \
+        az monitor metrics list \
         --resource "$resource_id" \
         --metrics TimeSeriesSamplesDropped EventsDropped \
         --filter "Reason eq '*'" \
