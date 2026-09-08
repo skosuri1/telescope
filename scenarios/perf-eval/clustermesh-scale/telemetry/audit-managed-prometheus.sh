@@ -80,15 +80,6 @@ if [ "${AKS_MANAGED_TELEMETRY_AUDIT_PHASE_CHILD:-false}" != "true" ]; then
     "$OUTPUT_DIR/aks-platform-export-summary.json" \
     "$OUTPUT_DIR"/aks-platform-*.json \
     "$OUTPUT_DIR"/aks-platform-*.openmetrics
-  for workspace_dir in "$OUTPUT_DIR"/workspace-*; do
-    [ -d "$workspace_dir" ] || continue
-    rm -f \
-      "$workspace_dir/amw-capacity.json" \
-      "$workspace_dir/amw-capacity.json.tmp" \
-      "$workspace_dir/amw-capacity-summary.json" \
-      "$workspace_dir/amw-capacity-summary.json.tmp" \
-      "$workspace_dir/amw-capacity-summary.md"
-  done
   phase_timeout_marker="$OUTPUT_DIR/.telemetry-audit-phase-timeout"
   rm -f "$phase_timeout_marker"
   phase_started_at=$(date +%s)
@@ -252,6 +243,12 @@ capture_workspace_capacity() {
   mkdir -p "$workspace_dir"
   capacity_raw="$workspace_dir/amw-capacity.json"
   capacity_summary="$workspace_dir/amw-capacity-summary.json"
+  rm -f \
+    "$capacity_raw" \
+    "${capacity_raw}.tmp" \
+    "$capacity_summary" \
+    "${capacity_summary}.tmp" \
+    "$workspace_dir/amw-capacity-summary.md"
   if ! capture_amw_capacity \
       "$workspace_id" \
       "$capacity_window_start" \
@@ -273,35 +270,98 @@ capture_workspace_capacity() {
   return 0
 }
 
-capacity_batch=0
-while IFS= read -r workspace; do
-  workspace_slot=$(echo "$workspace" | jq -r '.slot // .name')
-  workspace_key=$(printf '%s' "$workspace_slot" | sed -E 's/[^a-zA-Z0-9_.-]+/_/g')
-  (
-    if capture_workspace_capacity "$workspace" \
-        > "$audit_work_state/capacity-${workspace_key}.log" 2>&1; then
-      echo ok > "$audit_work_state/capacity-${workspace_key}.status"
-    else
-      echo fail > "$audit_work_state/capacity-${workspace_key}.status"
-    fi
-  ) &
-  capacity_batch=$((capacity_batch + 1))
-  if [ "$capacity_batch" -ge "$collection_concurrency" ]; then
-    wait
-    capacity_batch=0
-  fi
-done < <(echo "$workspaces_json" | jq -c '.[]')
-wait
+workspace_slots_file="$audit_work_state/workspace-slots.json"
+collected_capacity_file="$audit_work_state/collected-capacity-audits.json"
+printf '%s' "$workspaces_json" |
+  jq '
+    [.[] | {
+      slot: (.slot // .name),
+      resource_id: .id
+    }]
+    | sort_by(.slot)
+  ' > "$workspace_slots_file"
+jq '(.capacity_audits // [])' \
+  "$collection_manifest" > "$collected_capacity_file"
+reuse_collected_capacity=false
+if jq -e \
+    --slurpfile expected_workspaces "$workspace_slots_file" \
+    '
+      type == "array" and
+      ([.[] | {
+        slot: .slot,
+        resource_id: .summary.resource_id
+      }] | sort_by(.slot)) == $expected_workspaces[0] and
+      all(.[];
+        (.status | type == "number") and
+        (.summary | type == "object") and
+        .summary.query_succeeded == true and
+        .summary.capacity_samples_complete == true)
+    ' "$collected_capacity_file" >/dev/null; then
+  reuse_collected_capacity=true
+fi
 
-while IFS= read -r workspace; do
-  workspace_slot=$(echo "$workspace" | jq -r '.slot // .name')
-  workspace_key=$(printf '%s' "$workspace_slot" | sed -E 's/[^a-zA-Z0-9_.-]+/_/g')
-  cat "$audit_work_state/capacity-${workspace_key}.log" 2>/dev/null || true
-  if [ "$(cat "$audit_work_state/capacity-${workspace_key}.status" 2>/dev/null || echo fail)" != "ok" ]; then
-    capacity_audit_ok=false
-    echo "##vso[task.logissue type=error;] AMW capacity audit failed for workspace slot $workspace_slot."
-  fi
-done < <(echo "$workspaces_json" | jq -c '.[]')
+if [ "$reuse_collected_capacity" = "true" ]; then
+  collected_capacity_count=$(jq 'length' "$collected_capacity_file")
+  echo "Reusing $collected_capacity_count complete post-workload AMW capacity audit(s) from the collection manifest."
+  while IFS= read -r capacity_audit; do
+    workspace_slot=$(echo "$capacity_audit" | jq -r '.slot')
+    workspace_dir="$OUTPUT_DIR/workspace-${workspace_slot}"
+    capacity_summary="$workspace_dir/amw-capacity-summary.json"
+    mkdir -p "$workspace_dir"
+    echo "$capacity_audit" |
+      jq '.summary' > "${capacity_summary}.tmp"
+    mv -f "${capacity_summary}.tmp" "$capacity_summary"
+    write_amw_capacity_markdown \
+      "$capacity_summary" \
+      "$workspace_dir/amw-capacity-summary.md"
+    capacity_status=0
+    amw_capacity_runtime_ok "$capacity_summary" || capacity_status=$?
+    if [ "$capacity_status" -ne 0 ]; then
+      capacity_audit_ok=false
+      echo "##vso[task.logissue type=error;] Collected AMW capacity audit failed for workspace slot $workspace_slot (status=$capacity_status)."
+    fi
+  done < <(jq -c '.[]' "$collected_capacity_file")
+else
+  echo "Collected AMW capacity proof is incomplete; recapturing live workspace capacity."
+  for workspace_dir in "$OUTPUT_DIR"/workspace-*; do
+    [ -d "$workspace_dir" ] || continue
+    rm -f \
+      "$workspace_dir/amw-capacity.json" \
+      "$workspace_dir/amw-capacity.json.tmp" \
+      "$workspace_dir/amw-capacity-summary.json" \
+      "$workspace_dir/amw-capacity-summary.json.tmp" \
+      "$workspace_dir/amw-capacity-summary.md"
+  done
+  capacity_batch=0
+  while IFS= read -r workspace; do
+    workspace_slot=$(echo "$workspace" | jq -r '.slot // .name')
+    workspace_key=$(printf '%s' "$workspace_slot" | sed -E 's/[^a-zA-Z0-9_.-]+/_/g')
+    (
+      if capture_workspace_capacity "$workspace" \
+          > "$audit_work_state/capacity-${workspace_key}.log" 2>&1; then
+        echo ok > "$audit_work_state/capacity-${workspace_key}.status"
+      else
+        echo fail > "$audit_work_state/capacity-${workspace_key}.status"
+      fi
+    ) &
+    capacity_batch=$((capacity_batch + 1))
+    if [ "$capacity_batch" -ge "$collection_concurrency" ]; then
+      wait
+      capacity_batch=0
+    fi
+  done < <(echo "$workspaces_json" | jq -c '.[]')
+  wait
+
+  while IFS= read -r workspace; do
+    workspace_slot=$(echo "$workspace" | jq -r '.slot // .name')
+    workspace_key=$(printf '%s' "$workspace_slot" | sed -E 's/[^a-zA-Z0-9_.-]+/_/g')
+    cat "$audit_work_state/capacity-${workspace_key}.log" 2>/dev/null || true
+    if [ "$(cat "$audit_work_state/capacity-${workspace_key}.status" 2>/dev/null || echo fail)" != "ok" ]; then
+      capacity_audit_ok=false
+      echo "##vso[task.logissue type=error;] AMW capacity audit failed for workspace slot $workspace_slot."
+    fi
+  done < <(echo "$workspaces_json" | jq -c '.[]')
+fi
 echo "##vso[task.setvariable variable=AKS_AMW_CAPACITY_AUDITED]$capacity_audit_ok"
 
 token=$(az account get-access-token \

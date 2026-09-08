@@ -1886,6 +1886,11 @@ def test_scripts_use_current_aks_profile_and_full_export():
     assert "AKS_AMW_CAPACITY_AUDITED]$capacity_audit_ok" in audit
     assert "AKS_CONTROL_PLANE_METRICS_CONCURRENCY" in audit
     assert "capture_workspace_capacity" in audit
+    assert ".summary.resource_id" in audit
+    assert "expected_workspaces" in audit
+    assert "amw_capacity_runtime_ok" in audit
+    assert "Reusing $collected_capacity_count complete post-workload" in audit
+    assert "recapturing live workspace capacity" in audit
     assert "export_platform_cluster" in audit
     assert "platform_export_ok" in audit
     assert "AKS_MANAGED_PROMETHEUS_AUDIT_TIMEOUT_SECONDS" in audit
@@ -2154,6 +2159,7 @@ def test_split_collection_scripts_handoff_and_preserve_outputs(tmp_path):
     uploads = az_log.read_text(encoding="utf-8")
     assert "storage blob upload" in uploads
     assert "workspace-mesh-1/amw-capacity-summary.json" in uploads
+    assert uploads.count("monitor metrics list") == 2
 
 
 def test_wait_manifest_assembly_is_scale_safe(tmp_path):

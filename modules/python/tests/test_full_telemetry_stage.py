@@ -711,6 +711,38 @@ def test_acns_probe_runs_before_snapshot_and_is_collected_before_teardown():
     assert "accept_cilium_policy_gap=false" in worker
     assert "exit 10" in worker
     assert "workload passed but required telemetry is incomplete" in worker
+    assert 'CL2_MOCK_WORKER_RECONCILE_CONCURRENCY:-12' in worker
+    assert 'CL2_MOCK_WORKER_RECONCILE_LOCK_WAIT_SECONDS:-900' in worker
+    assert 'lane-${mock_worker_reconcile_lane}.lock' in worker
+    assert 'flock -x -n -E 200 "$mock_worker_reconcile_lock_file"' in worker
+    assert "mock_worker_reconcile_start_lane" in worker
+    assert "mock_worker_reconcile_offset" in worker
+    assert "break 2" in worker
+
+
+def test_n100_resume_bounds_pre_telemetry_reconcile_concurrency():
+    pipeline = PIPELINE_PATH.read_text(encoding="utf-8")
+    stage_start = pipeline.index(
+        "- stage: azure_eastus2euap_n100_debug_resume_37deca"
+    )
+    stage_end = pipeline.find("\n  - stage:", stage_start + 1)
+    if stage_end < 0:
+        stage_end = len(pipeline)
+    stage = pipeline[stage_start:stage_end]
+
+    assert 'CL2_MOCK_WORKER_RECONCILE_CONCURRENCY: "12"' in stage
+    assert 'CL2_MOCK_WORKER_RECONCILE_LOCK_WAIT_SECONDS: "900"' in stage
+    assert (
+        "share_infra_scenarios: "
+        "${{ parameters.scaleDebugWorkloadScenarios }}"
+        in stage
+    )
+    assert (
+        "default: propagation-probe,event-throughput,policy-scale,"
+        "pod-churn-combined,apiserver-failure,isolation,"
+        "node-churn-combined,upper-bound"
+        in pipeline
+    )
 
 
 def test_cilium_policy_guard_runs_before_each_scenario():

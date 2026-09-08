@@ -684,7 +684,13 @@ lifecycle_find_names=(
   -o -name 'ApiserverFailureTimings_*.json'
   -o -name 'IsolationChurnTimings_*.json'
 )
+lifecycle_find_depth=()
 if [ "${lifecycle_only,,}" = "true" ]; then
+  # Final refreshes must only revisit scenario-level decision files. The
+  # recursive normal pass already preserved per-role worker/reconcile files;
+  # re-uploading those hundreds of files can exhaust the deliberately small
+  # final-lifecycle budget before scenario-policy.json becomes durable.
+  lifecycle_find_depth=(-maxdepth 1)
   lifecycle_find_names=(
     -name 'scenario-policy.json'
     -o -name 'scenario-evidence.json'
@@ -705,6 +711,7 @@ if [ "$azure_ready" = "true" ]; then
     upload_and_verify "$lifecycle_file" "$blob_name" lifecycle || true
   done < <(
     find "$SCENARIO_REPORT_DIR" \
+      "${lifecycle_find_depth[@]}" \
       -type f \
       \( "${lifecycle_find_names[@]}" \) \
       -print0 | sort -z
@@ -713,16 +720,20 @@ if [ "$azure_ready" = "true" ]; then
   # Pre-repair evidence is nested by role/attempt and commonly repeats
   # basenames (repair-state.json, current.log, previous.log). Preserve the
   # relative path instead of flattening it so no cluster or attempt collides.
-  while IFS= read -r -d '' mock_diagnostic_file; do
-    relative_path="${mock_diagnostic_file#"$SCENARIO_REPORT_DIR/"}"
-    blob_name="${BUILD_BRANCH}/lifecycle/${SCENARIO_NAME}/${RUN_ID}/${relative_path}"
-    upload_and_verify "$mock_diagnostic_file" "$blob_name" lifecycle || true
-  done < <(
-    find "$SCENARIO_REPORT_DIR" \
-      -type f \
-      -path '*/mock-layer-diagnostics*/*' \
-      -print0 | sort -z
-  )
+  # The normal pass already made these durable; final lifecycle mode must stay
+  # restricted to the small top-level decision set above.
+  if [ "${lifecycle_only,,}" != "true" ]; then
+    while IFS= read -r -d '' mock_diagnostic_file; do
+      relative_path="${mock_diagnostic_file#"$SCENARIO_REPORT_DIR/"}"
+      blob_name="${BUILD_BRANCH}/lifecycle/${SCENARIO_NAME}/${RUN_ID}/${relative_path}"
+      upload_and_verify "$mock_diagnostic_file" "$blob_name" lifecycle || true
+    done < <(
+      find "$SCENARIO_REPORT_DIR" \
+        -type f \
+        -path '*/mock-layer-diagnostics*/*' \
+        -print0 | sort -z
+    )
+  fi
 
   # Audit/ACNS telemetry are independent of the lifecycle-only durable-state
   # set. Per-role scenario evidence is likewise already durable from the

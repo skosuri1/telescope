@@ -484,6 +484,13 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "- name: scaleDebugTopology" in pipeline
     assert "- name: scaleDebugRequiredFamilyVcpus" in pipeline
     assert "- name: scaleDebugRunWorkload" in pipeline
+    assert "- name: scaleDebugWorkloadScenarios" in pipeline
+    assert (
+        "default: propagation-probe,event-throughput,policy-scale,"
+        "pod-churn-combined,apiserver-failure,isolation,"
+        "node-churn-combined,upper-bound"
+        in pipeline
+    )
     assert "- name: scaleDebugKwokPreservationMode" in pipeline
     assert "- name: scaleDebugKwokBaselineBuildId" in pipeline
     assert "default: 78812" in pipeline
@@ -512,6 +519,11 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "parameters.scaleDebugRequiredFamilyVcpus" in fresh
     assert "parameters.scaleDebugTopology" in fresh
     assert "parameters.scaleDebugRunWorkload" in fresh
+    assert (
+        "share_infra_scenarios: "
+        "${{ parameters.scaleDebugWorkloadScenarios }}"
+        in fresh
+    )
     assert "suite_total_budget_seconds: 7200" in fresh
     assert "timeout_in_minutes: 600" in fresh
     assert 'cl2_prom_snapshot_storage_account: "cmshscaleprom"' in fresh
@@ -547,6 +559,11 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "parameters.scaleDebugClusterCount" in resume
     assert "parameters.scaleDebugTopology" in resume
     assert "parameters.scaleDebugRunWorkload" in resume
+    assert (
+        "share_infra_scenarios: "
+        "${{ parameters.scaleDebugWorkloadScenarios }}"
+        in resume
+    )
     assert "parameters.scaleDebugKwokPreservationMode" in resume
     assert "parameters.scaleDebugKwokBaselineBuildId" in resume
     assert "parameters.scaleDebugKwokVerificationBuildId" in resume

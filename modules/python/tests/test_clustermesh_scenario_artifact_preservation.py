@@ -774,6 +774,21 @@ def test_lifecycle_only_mode_success(tmp_path):
     (scenario_dir / "artifact-preservation-summary.json").write_text(
         '{"success": true}\n', encoding="utf-8"
     )
+    role_dir = scenario_dir / "mesh-1"
+    role_dir.mkdir()
+    (role_dir / "worker-status-mesh-1.json").write_text(
+        '{"telemetry_valid": false}\n', encoding="utf-8"
+    )
+    (role_dir / "mock-layer-reconcile-worker-mesh-1.json").write_text(
+        '{"success": false}\n', encoding="utf-8"
+    )
+    diagnostics_dir = (
+        role_dir / "mock-layer-diagnostics-worker" / "mesh-1" / "attempt-1"
+    )
+    diagnostics_dir.mkdir(parents=True)
+    (diagnostics_dir / "repair-state.json").write_text(
+        '{"phase": "pre-telemetry"}\n', encoding="utf-8"
+    )
 
     result = _run_helper(
         tmp_path, scenario_dir, worker_summary, lifecycle_only=True
@@ -798,6 +813,7 @@ def test_lifecycle_only_mode_success(tmp_path):
     assert summary["infrastructure_failure"] is False
     assert summary["scenario_incomplete"] is False
     assert summary["uploaded_snapshot_count"] == 0
+    assert summary["uploaded_lifecycle_count"] == 6
 
     assert not (tmp_path / "relabel-log.json").exists()
     calls = _az_calls(tmp_path / "az-log.jsonl")
@@ -820,6 +836,11 @@ def test_lifecycle_only_mode_success(tmp_path):
     # worker-summary.json is already durable from the earlier (non-lifecycle
     # -only) pass -- must NOT be re-uploaded here.
     assert not any(name.endswith("worker-summary.json") for name in uploaded_names)
+    assert not any("worker-status-" in name for name in uploaded_names)
+    assert not any(
+        "mock-layer-reconcile-worker-" in name for name in uploaded_names
+    )
+    assert not any("mock-layer-diagnostics" in name for name in uploaded_names)
 
 
 def test_lifecycle_only_mode_infrastructure_failure(tmp_path):

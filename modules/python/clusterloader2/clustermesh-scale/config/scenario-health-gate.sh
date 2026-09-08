@@ -136,6 +136,8 @@ mkdir -p "$(dirname "$summary_file")"
 state_dir="${summary_file}.state.$$"
 mkdir -p "$state_dir"
 trap 'rm -rf "$state_dir"' EXIT
+last_observations_file="$state_dir/last-observations.json"
+printf '[]\n' > "$last_observations_file"
 
 K_OUT=""
 K_ERROR=""
@@ -756,7 +758,6 @@ started_epoch=$(date +%s)
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 deadline=$((started_epoch + timeout_seconds))
 stable_since=""
-last_observations='[]'
 
 write_summary() {
   local success="$1"
@@ -782,7 +783,7 @@ write_summary() {
     --argjson expected_mock_count "$expected_mock_count" \
     --argjson expected_remote_count "$expected_remote_count" \
     --argjson stable_seconds "$stable_seconds" \
-    --argjson clusters "$last_observations" \
+    --slurpfile observation_documents "$last_observations_file" \
     '{
       schema_version: 1,
       success: $success,
@@ -800,7 +801,7 @@ write_summary() {
       expected_remote_count: $expected_remote_count,
       quiet_window_basis: "continuous-health",
       stable_seconds: $stable_seconds,
-      clusters: $clusters
+      clusters: ($observation_documents[0] // [])
     }' > "$partial" &&
     mv "$partial" "$summary_file"
 }
@@ -809,7 +810,7 @@ echo "Waiting for post-${scenario} ClusterMesh health across ${cluster_count} cl
 while true; do
   now=$(date +%s)
   if [ "$now" -ge "$deadline" ]; then
-    write_summary false
+    write_summary false || true
     echo "ClusterMesh scenario health gate timed out after ${timeout_seconds}s before starting another observation cycle; summary: $summary_file" >&2
     exit 1
   fi
@@ -819,11 +820,30 @@ while true; do
     cycle_budget="$remaining"
   fi
   active_cycle_deadline=$((now + cycle_budget))
-  observations=$(collect_observations)
-  last_observations="$observations"
+  observations_partial="${last_observations_file}.partial"
+  if ! collect_observations > "$observations_partial"; then
+    rm -f "$observations_partial"
+    write_summary false || true
+    echo "ClusterMesh scenario health observation collection failed; summary: $summary_file" >&2
+    exit 1
+  fi
+  if ! jq -e --argjson expected "$cluster_count" '
+      type == "array" and length == $expected
+    ' "$observations_partial" >/dev/null 2>&1; then
+    rm -f "$observations_partial"
+    write_summary false || true
+    echo "ClusterMesh scenario health observation set is incomplete or malformed; summary: $summary_file" >&2
+    exit 1
+  fi
+  if ! mv -f "$observations_partial" "$last_observations_file"; then
+    rm -f "$observations_partial"
+    write_summary false || true
+    echo "ClusterMesh scenario health observations could not be checkpointed; summary: $summary_file" >&2
+    exit 1
+  fi
 
   unhealthy_count=$(jq '[.[] | select(.healthy | not)] | length' \
-    <<<"$observations")
+    "$last_observations_file")
 
   if [ "$unhealthy_count" -eq 0 ]; then
     # CEP and CiliumIdentity totals naturally converge and garbage-collect
@@ -837,7 +857,10 @@ while true; do
     fi
     stable_seconds=$((now - stable_since))
     if [ "$stable_seconds" -ge "$quiet_window_seconds" ]; then
-      write_summary true
+      if ! write_summary true; then
+        echo "ClusterMesh scenario health passed but its summary could not be written: $summary_file" >&2
+        exit 1
+      fi
       echo "ClusterMesh scenario health gate passed after ${stable_seconds}s continuously healthy: $summary_file"
       exit 0
     fi
@@ -847,12 +870,12 @@ while true; do
     jq -r '
       .[] | select(.healthy | not)
       | "\(.role) (\(.name)): \(.failures | join("; "))"
-    ' <<<"$observations" >&2
+    ' "$last_observations_file" >&2
   fi
 
   now=$(date +%s)
   if [ "$now" -ge "$deadline" ]; then
-    write_summary false
+    write_summary false || true
     echo "ClusterMesh scenario health gate timed out after ${timeout_seconds}s; summary: $summary_file" >&2
     exit 1
   fi

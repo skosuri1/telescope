@@ -365,6 +365,17 @@ def test_health_gate_removes_prior_cilium_agent_summary_before_probe():
     assert script.index(cleanup) < script.index(probe)
 
 
+def test_health_gate_checkpoints_large_observations_outside_argv():
+    script = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert 'last_observations_file="$state_dir/last-observations.json"' in script
+    assert '--slurpfile observation_documents "$last_observations_file"' in script
+    assert '--argjson clusters "$last_observations"' not in script
+    assert 'collect_observations > "$observations_partial"' in script
+    assert 'length == $expected' in script
+    assert "if ! write_summary true; then" in script
+
+
 def _healthy_nodes_json() -> str:
     return json.dumps(
         {

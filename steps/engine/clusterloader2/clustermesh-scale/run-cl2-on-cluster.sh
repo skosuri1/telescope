@@ -57,6 +57,8 @@ acns_gap_accepted=false
 telemetry_coverage_failed=0
 required_self_hosted_telemetry="${CL2_REQUIRED_SELF_HOSTED_TELEMETRY:-${CL2_ACNS_TELEMETRY_ENABLED:-false}}"
 accept_cilium_policy_gap="${CL2_ACCEPT_CILIUM_POLICY_GAP:-false}"
+mock_worker_reconcile_concurrency="${CL2_MOCK_WORKER_RECONCILE_CONCURRENCY:-12}"
+mock_worker_reconcile_lock_wait_seconds="${CL2_MOCK_WORKER_RECONCILE_LOCK_WAIT_SECONDS:-900}"
 if [ "$cl2_config_file" = "policy-scale.yaml" ]; then
   accept_cilium_policy_gap=false
 fi
@@ -618,20 +620,76 @@ if [ "${CL2_MOCK_MODE:-false}" = "true" ] &&
       '[{role: $role, kubeconfig: $kubeconfig}]' \
       > "$mock_worker_inventory"
     mock_worker_reconcile_rc=0
-    timeout --signal=TERM --kill-after=30s \
-      "${CL2_MOCK_WORKER_RECONCILE_TIMEOUT_SECONDS:-600}s" \
-      python3 "$mock_reconciler" \
-        --clusters "$mock_worker_inventory" \
-        --state-root "$mock_state_root" \
-        --run-id "$CLUSTERMESH_RUN_ID" \
-        --expected-mock-count "${CL2_MOCK_NODE_COUNT:-0}" \
-        --max-concurrent 1 \
-        --attempts "${CL2_MOCK_WORKER_RECONCILE_ATTEMPTS:-5}" \
-        --settle-seconds "${CL2_MOCK_WORKER_RECONCILE_SETTLE_SECONDS:-15}" \
-        --request-timeout-seconds 30 \
-        --diagnostics-dir "$report_dir/mock-layer-diagnostics-worker" \
-        --summary-file "$mock_worker_summary" ||
-      mock_worker_reconcile_rc=$?
+    if ! [[ "$mock_worker_reconcile_concurrency" =~ ^[1-9][0-9]*$ ]] ||
+       [ "$mock_worker_reconcile_concurrency" -gt 100 ]; then
+      echo "##vso[task.logissue type=error;] $role: CL2_MOCK_WORKER_RECONCILE_CONCURRENCY must be an integer from 1 through 100"
+      mock_worker_reconcile_rc=2
+    elif ! [[ "$mock_worker_reconcile_lock_wait_seconds" =~ ^[1-9][0-9]*$ ]]; then
+      echo "##vso[task.logissue type=error;] $role: CL2_MOCK_WORKER_RECONCILE_LOCK_WAIT_SECONDS must be a positive integer"
+      mock_worker_reconcile_rc=2
+    elif ! [[ "$role" =~ ^mesh-([1-9][0-9]*)$ ]]; then
+      echo "##vso[task.logissue type=error;] $role: cannot assign a bounded mock-reconcile lane to an unexpected role name"
+      mock_worker_reconcile_rc=2
+    elif ! command -v flock >/dev/null 2>&1; then
+      echo "##vso[task.logissue type=error;] $role: flock is required to bound concurrent pre-telemetry mock reconciliation"
+      mock_worker_reconcile_rc=127
+    else
+      mock_worker_reconcile_ordinal="${BASH_REMATCH[1]}"
+      mock_worker_reconcile_start_lane=$((
+        (mock_worker_reconcile_ordinal - 1) %
+          mock_worker_reconcile_concurrency
+      ))
+      mock_worker_reconcile_lock_dir="${CL2_MOCK_WORKER_RECONCILE_LOCK_DIR:-$HOME/.kube/mock-layer-worker-reconcile/${CLUSTERMESH_RUN_ID}}"
+      if ! mkdir -p "$mock_worker_reconcile_lock_dir"; then
+        echo "##vso[task.logissue type=error;] $role: failed to create mock-reconcile lock directory $mock_worker_reconcile_lock_dir"
+        mock_worker_reconcile_rc=1
+      else
+        mock_worker_reconcile_deadline=$((
+          $(date +%s) + mock_worker_reconcile_lock_wait_seconds
+        ))
+        mock_worker_reconcile_acquired=false
+        echo "$role: waiting up to ${mock_worker_reconcile_lock_wait_seconds}s for any of ${mock_worker_reconcile_concurrency} pre-telemetry mock-reconcile slots"
+        while [ "$(date +%s)" -lt "$mock_worker_reconcile_deadline" ]; do
+          for ((mock_worker_reconcile_offset = 0;
+                mock_worker_reconcile_offset < mock_worker_reconcile_concurrency;
+                mock_worker_reconcile_offset++)); do
+            mock_worker_reconcile_lane=$((
+              (mock_worker_reconcile_start_lane +
+                mock_worker_reconcile_offset) %
+                mock_worker_reconcile_concurrency
+            ))
+            mock_worker_reconcile_lock_file="${mock_worker_reconcile_lock_dir}/lane-${mock_worker_reconcile_lane}.lock"
+            flock -x -n -E 200 "$mock_worker_reconcile_lock_file" \
+              timeout --signal=TERM --kill-after=30s \
+                "${CL2_MOCK_WORKER_RECONCILE_TIMEOUT_SECONDS:-600}s" \
+                python3 "$mock_reconciler" \
+                  --clusters "$mock_worker_inventory" \
+                  --state-root "$mock_state_root" \
+                  --run-id "$CLUSTERMESH_RUN_ID" \
+                  --expected-mock-count "${CL2_MOCK_NODE_COUNT:-0}" \
+                  --max-concurrent 1 \
+                  --attempts "${CL2_MOCK_WORKER_RECONCILE_ATTEMPTS:-5}" \
+                  --settle-seconds "${CL2_MOCK_WORKER_RECONCILE_SETTLE_SECONDS:-15}" \
+                  --request-timeout-seconds 30 \
+                  --diagnostics-dir "$report_dir/mock-layer-diagnostics-worker" \
+                  --summary-file "$mock_worker_summary"
+            mock_worker_reconcile_candidate_rc=$?
+            if [ "$mock_worker_reconcile_candidate_rc" -eq 200 ]; then
+              continue
+            fi
+            mock_worker_reconcile_acquired=true
+            mock_worker_reconcile_rc="$mock_worker_reconcile_candidate_rc"
+            echo "$role: used pre-telemetry mock-reconcile slot $((mock_worker_reconcile_lane + 1))/${mock_worker_reconcile_concurrency}"
+            break 2
+          done
+          sleep 2
+        done
+        if [ "$mock_worker_reconcile_acquired" != "true" ]; then
+          echo "##vso[task.logissue type=error;] $role: timed out waiting for an available pre-telemetry mock-reconcile slot"
+          mock_worker_reconcile_rc=75
+        fi
+      fi
+    fi
     if [ "$mock_worker_reconcile_rc" -ne 0 ]; then
       echo "##vso[task.logissue type=error;] $role: pre-telemetry mock-layer reconcile failed rc=${mock_worker_reconcile_rc}; audit will run but required telemetry is invalid"
       telemetry_coverage_failed=1
