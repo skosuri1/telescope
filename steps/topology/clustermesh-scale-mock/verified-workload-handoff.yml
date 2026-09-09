@@ -22,6 +22,23 @@ steps:
       set -euo pipefail
       artifact_dir="$(Build.ArtifactStagingDirectory)/n100-workload-handoff"
       mkdir -p "$artifact_dir"
+      capacity_repair_args=()
+      if [ "${MOCK_HANDOFF_CNI_CAPACITY_REPAIR_ENABLED:-false}" = "true" ]; then
+        capacity_repair_args=(
+          --capacity-repair-enabled
+          --subscription-id "${{ parameters.expected_subscription_id }}"
+          --capacity-repair-pool "${MOCK_HANDOFF_CNI_CAPACITY_REPAIR_POOL:-default}"
+          --capacity-repair-max-pool-count "${MOCK_HANDOFF_CNI_CAPACITY_REPAIR_MAX_POOL_COUNT:-3}"
+          --capacity-repair-timeout-seconds "${MOCK_HANDOFF_CNI_CAPACITY_REPAIR_TIMEOUT_SECONDS:-1800}"
+          --capacity-repair-poll-seconds "${MOCK_HANDOFF_CNI_CAPACITY_REPAIR_POLL_SECONDS:-15}"
+          --capacity-cpu-reserve-millicores "${MOCK_HANDOFF_CNI_CAPACITY_CPU_RESERVE_MILLICORES:-250}"
+          --capacity-memory-reserve-mib "${MOCK_HANDOFF_CNI_CAPACITY_MEMORY_RESERVE_MIB:-512}"
+          --capacity-pod-reserve "${MOCK_HANDOFF_CNI_CAPACITY_POD_RESERVE:-5}"
+          --cilium-health-script "$CILIUM_AGENT_HEALTH_PROBE"
+          --cilium-identity-inventory "$HOME/.kube/cilium-cluster-identities.json"
+          --expected-cilium-remote-count "$(( ${{ parameters.expected_cluster_count }} - 1 ))"
+        )
+      fi
       python3 "$MOCK_CNI_RECOVERY" \
         --clusters "$HOME/.kube/clustermesh-clusters.json" \
         --roles "${MOCK_HANDOFF_CNI_RECOVERY_ROLES:-}" \
@@ -30,10 +47,12 @@ steps:
         --max-affected-pods "${MOCK_HANDOFF_CNI_MAX_PODS:-25}" \
         --recovery-timeout-seconds "${MOCK_HANDOFF_CNI_RECOVERY_TIMEOUT_SECONDS:-300}" \
         --poll-seconds "${MOCK_HANDOFF_CNI_POLL_SECONDS:-5}" \
-        --request-timeout-seconds "${MOCK_HANDOFF_CNI_REQUEST_TIMEOUT_SECONDS:-30}"
+        --request-timeout-seconds "${MOCK_HANDOFF_CNI_REQUEST_TIMEOUT_SECONDS:-30}" \
+        "${capacity_repair_args[@]}"
     displayName: "Recover Azure-CNI-blocked mock agents"
     env:
       MOCK_CNI_RECOVERY: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/mock_cni_recovery.py
+      CILIUM_AGENT_HEALTH_PROBE: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/cilium_agent_health.py
 
   - script: |
       set -euo pipefail

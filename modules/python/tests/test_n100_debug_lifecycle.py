@@ -1389,6 +1389,11 @@ def test_n100_workload_handoff_requires_verified_artifacts_before_execute():
     )
     assert "mock_cni_recovery.py" in handoff_template
     assert "MOCK_HANDOFF_CNI_RECOVERY_ROLES" in handoff_template
+    assert "MOCK_HANDOFF_CNI_CAPACITY_REPAIR_ENABLED" in handoff_template
+    assert "--capacity-repair-enabled" in handoff_template
+    assert "--capacity-repair-max-pool-count" in handoff_template
+    assert "--cilium-health-script" in handoff_template
+    assert "--cilium-identity-inventory" in handoff_template
     assert "MOCK_HANDOFF_RECONCILE_ATTEMPTS:-15" in handoff_template
     assert "MOCK_HANDOFF_RECONCILE_SETTLE_SECONDS:-45" in handoff_template
     assert "Validate post-telemetry n100 workload data path" in handoff_template

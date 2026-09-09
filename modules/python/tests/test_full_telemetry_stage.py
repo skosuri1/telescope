@@ -741,6 +741,9 @@ def test_n100_resume_bounds_pre_telemetry_reconcile_concurrency():
         "${{ parameters.scaleDebugMockCniRecoveryRoles }}"
         in stage
     )
+    assert 'MOCK_HANDOFF_CNI_CAPACITY_REPAIR_ENABLED: "true"' in stage
+    assert 'MOCK_HANDOFF_CNI_CAPACITY_REPAIR_POOL: "default"' in stage
+    assert 'MOCK_HANDOFF_CNI_CAPACITY_REPAIR_MAX_POOL_COUNT: "3"' in stage
     assert "- name: scaleDebugManagedTelemetryEnabled" in pipeline
     assert "- name: scaleDebugMockCniRecoveryRoles" in pipeline
     assert "parameters.scaleDebugManagedTelemetryEnabled" in stage
