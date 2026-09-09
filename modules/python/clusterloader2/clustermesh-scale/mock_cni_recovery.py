@@ -169,9 +169,15 @@ def load_clusters(path: str, roles: Sequence[str]) -> List[Cluster]:
         if not isinstance(row, dict):
             raise RecoveryError("cluster inventory contains a non-object row")
         role = row.get("role")
-        kubeconfig = row.get("kubeconfig")
-        if not isinstance(role, str) or not isinstance(kubeconfig, str):
-            raise RecoveryError("cluster inventory row is missing role or kubeconfig")
+        if not isinstance(role, str) or not role:
+            raise RecoveryError("cluster inventory row is missing role")
+        kubeconfig = row.get("kubeconfig") or os.path.join(
+            os.path.expanduser("~"),
+            ".kube",
+            f"{role}.config",
+        )
+        if not isinstance(kubeconfig, str) or not kubeconfig:
+            raise RecoveryError(f"{role}: invalid kubeconfig path")
         if role in by_role:
             raise RecoveryError(f"cluster inventory contains duplicate role {role}")
         by_role[role] = Cluster(

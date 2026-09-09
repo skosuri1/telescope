@@ -528,6 +528,36 @@ def test_empty_role_selection_is_a_noop(tmp_path):
     assert summary["requested_roles"] == []
 
 
+def test_cluster_inventory_defaults_to_standard_role_kubeconfig(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    inventory = tmp_path / "clusters.json"
+    inventory.write_text(
+        json.dumps(
+            [
+                {
+                    "role": "mesh-100",
+                    "name": "clustermesh-100",
+                    "rg": "78751-f36f3d5a",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    clusters = recovery.load_clusters(str(inventory), ["mesh-100"])
+
+    assert clusters == [
+        recovery.Cluster(
+            role="mesh-100",
+            kubeconfig=str(tmp_path / ".kube" / "mesh-100.config"),
+            context="clustermesh-100",
+        )
+    ]
+
+
 def test_delete_uses_server_side_uid_precondition(monkeypatch):
     class FakeApiClient:
         closed = False
