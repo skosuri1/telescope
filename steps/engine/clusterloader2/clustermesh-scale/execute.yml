@@ -94,7 +94,7 @@ steps:
       export CL2_AGENT_MEMORY_MIN_FREE_GI="${AGENT_MEMORY_MIN_FREE_GI:-0}"
       export CL2_SUITE_TOTAL_BUDGET_SECONDS="${SUITE_TOTAL_BUDGET_SECONDS:-0}"
       export CL2_SUITE_FINALIZATION_RESERVE_SECONDS="${SUITE_FINALIZATION_RESERVE_SECONDS:-0}"
-      export CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS="${HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-1800}"
+      export CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS="${CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-${HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-1800}}"
       # Phase 4b — Scenario #6 (Upper Bound / Saturation) knobs.
       # upper-bound.yaml consumes these via CL2's DefaultParam template
       # func; non-saturation scenarios ignore them. Defaults mirror
@@ -549,8 +549,8 @@ steps:
         _budget=$(scenario_mock_reconcile_budget_seconds)
         local _attempts _settle_seconds
         if [ "$cluster_count" -ge 50 ]; then
-          _attempts="${CL2_MOCK_RECONCILE_ATTEMPTS:-10}"
-          _settle_seconds="${CL2_MOCK_RECONCILE_SETTLE_SECONDS:-30}"
+          _attempts="${CL2_MOCK_RECONCILE_ATTEMPTS:-15}"
+          _settle_seconds="${CL2_MOCK_RECONCILE_SETTLE_SECONDS:-45}"
         else
           _attempts="${CL2_MOCK_RECONCILE_ATTEMPTS:-5}"
           _settle_seconds="${CL2_MOCK_RECONCILE_SETTLE_SECONDS:-15}"

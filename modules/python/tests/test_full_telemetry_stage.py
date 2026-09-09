@@ -732,6 +732,15 @@ def test_n100_resume_bounds_pre_telemetry_reconcile_concurrency():
 
     assert 'CL2_MOCK_WORKER_RECONCILE_CONCURRENCY: "12"' in stage
     assert 'CL2_MOCK_WORKER_RECONCILE_LOCK_WAIT_SECONDS: "900"' in stage
+    assert 'CL2_HEALTH_GATE_CYCLE_TIMEOUT_SECONDS: "1200"' in stage
+    assert 'CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS: "3000"' in stage
+    assert 'HEALTH_GATE_CILIUM_PROBE_ATTEMPTS: "2"' in stage
+    assert 'HEALTH_GATE_CILIUM_PROBE_RETRY_SECONDS: "2"' in stage
+    assert (
+        'CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-'
+        '${HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-1800}'
+        in EXECUTE_TEMPLATE_PATH.read_text(encoding="utf-8")
+    )
     assert 'AKS_CONTROL_PLANE_METRICS_CONCURRENCY: "8"' in stage
     assert 'AKS_AMW_CAPACITY_QUERY_CONCURRENCY: "10"' in stage
     assert 'AKS_AMW_METRICS_QUERY_TIMEOUT_SECONDS: "90"' in stage

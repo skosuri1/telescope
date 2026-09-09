@@ -29,6 +29,8 @@ quiet_window_seconds="${HEALTH_GATE_QUIET_WINDOW_SECONDS:-60}"
 poll_interval_seconds="${HEALTH_GATE_POLL_INTERVAL_SECONDS:-10}"
 concurrency="${HEALTH_GATE_CONCURRENCY:-8}"
 kubectl_request_timeout_seconds="${HEALTH_GATE_KUBECTL_REQUEST_TIMEOUT_SECONDS:-15}"
+cilium_probe_attempts="${HEALTH_GATE_CILIUM_PROBE_ATTEMPTS:-2}"
+cilium_probe_retry_seconds="${HEALTH_GATE_CILIUM_PROBE_RETRY_SECONDS:-2}"
 summary_file="${HEALTH_GATE_SUMMARY_FILE:-}"
 cilium_agent_health_probe="${CILIUM_AGENT_HEALTH_PROBE:-}"
 cilium_identity_inventory="${CILIUM_IDENTITY_INVENTORY:-$HOME/.kube/cilium-cluster-identities.json}"
@@ -99,7 +101,8 @@ fi
 for value_name in \
   expected_mock_count expected_remote_count timeout_seconds cycle_timeout_seconds \
   quiet_window_seconds poll_interval_seconds concurrency \
-  kubectl_request_timeout_seconds; do
+  kubectl_request_timeout_seconds cilium_probe_attempts \
+  cilium_probe_retry_seconds; do
   value="${!value_name}"
   if ! [[ "$value" =~ ^[0-9]+$ ]]; then
     echo "$value_name must be a nonnegative integer, got '$value'." >&2
@@ -110,8 +113,9 @@ if [ "$timeout_seconds" -eq 0 ] ||
    [ "$cycle_timeout_seconds" -eq 0 ] ||
    [ "$poll_interval_seconds" -eq 0 ] ||
    [ "$concurrency" -eq 0 ] ||
-   [ "$kubectl_request_timeout_seconds" -eq 0 ]; then
-  echo "timeout_seconds, cycle_timeout_seconds, poll_interval_seconds, concurrency, and kubectl_request_timeout_seconds must be greater than zero." >&2
+   [ "$kubectl_request_timeout_seconds" -eq 0 ] ||
+   [ "$cilium_probe_attempts" -eq 0 ]; then
+  echo "timeout_seconds, cycle_timeout_seconds, poll_interval_seconds, concurrency, kubectl_request_timeout_seconds, and cilium_probe_attempts must be greater than zero." >&2
   exit 2
 fi
 if ! command -v timeout >/dev/null 2>&1; then
@@ -535,8 +539,8 @@ observe_cluster() {
         --kubeconfig "$kubeconfig" \
         --expected-remote-count "$expected_remote_count" \
         --identity-inventory "$cilium_identity_inventory" \
-        --attempts 1 \
-        --retry-seconds 0 \
+        --attempts "$cilium_probe_attempts" \
+        --retry-seconds "$cilium_probe_retry_seconds" \
         --command-timeout-seconds "$kubectl_request_timeout_seconds" \
         --summary-file "$cilium_agent_summary" \
         >"$cilium_agent_log" 2>&1 ||
@@ -720,8 +724,8 @@ write_failed_observation() {
 }
 
 collect_observations() {
-  local index=0 cluster output_file pid
-  local -a pids=()
+  local index=0 cluster output_file pid completed_pid wait_rc
+  local -a pids=() remaining_pids=()
   rm -f "$state_dir"/observation-*.json
 
   while IFS= read -r cluster; do
@@ -742,8 +746,20 @@ collect_observations() {
     index=$((index + 1))
 
     if [ "${#pids[@]}" -ge "$concurrency" ]; then
-      wait "${pids[0]}" || true
-      pids=("${pids[@]:1}")
+      completed_pid=""
+      wait_rc=0
+      wait -n -p completed_pid "${pids[@]}" || wait_rc=$?
+      if [ -z "$completed_pid" ]; then
+        echo "Unable to identify a completed health-observation worker (wait rc=$wait_rc)." >&2
+        return 1
+      fi
+      remaining_pids=()
+      for pid in "${pids[@]}"; do
+        if [ "$pid" != "$completed_pid" ]; then
+          remaining_pids+=("$pid")
+        fi
+      done
+      pids=("${remaining_pids[@]}")
     fi
   done < <(jq -c '.[]' "$clusters_json")
 

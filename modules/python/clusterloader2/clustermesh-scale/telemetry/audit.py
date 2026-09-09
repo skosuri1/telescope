@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -668,21 +668,59 @@ def run_managed(args):
                 request_timeout_seconds,
             )
 
-        # executor.map() preserves input order in its result iterator
-        # (results are yielded in the order tasks were submitted, not the
-        # order they complete), so wrapping it in list() below yields
-        # deterministic, manifest-ordered results regardless of which
-        # worker finishes first. Iterating the iterator also re-raises any
-        # exception from a worker thread at that position, so a failure in
-        # any single cluster query still fails the whole audit instead of
-        # being swallowed.
+        reports = [None] * len(clusters)
+        query_failures = {}
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            reports = list(executor.map(_query_cluster, clusters))
+            futures = {
+                executor.submit(_query_cluster, cluster): index
+                for index, cluster in enumerate(clusters)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    reports[index] = future.result()
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                    subprocess.SubprocessError,
+                ) as error:
+                    query_failures[index] = {
+                        "error_type": type(error).__name__,
+                        "error": str(error)[:2000],
+                    }
 
         cluster_reports = []
         combined_checks = []
-        for cluster, report in zip(clusters, reports):
+        failed_clusters = []
+        for index, (cluster, report) in enumerate(zip(clusters, reports)):
             role = cluster["role"]
+            if index in query_failures:
+                failure = query_failures[index]
+                cluster_report = {
+                    "role": role,
+                    "name": cluster.get("name"),
+                    "resource_id": cluster.get("id"),
+                    "workspace": cluster["workspace"],
+                    "complete": False,
+                    "status": "query-failed",
+                    "error_type": failure["error_type"],
+                    "error": failure["error"],
+                    "checks": [],
+                }
+                cluster_reports.append(cluster_report)
+                failed_clusters.append(
+                    {
+                        "role": role,
+                        "name": cluster.get("name"),
+                        "resource_id": cluster.get("id"),
+                        "workspace": cluster["workspace"],
+                        "error_type": failure["error_type"],
+                        "error": failure["error"],
+                    }
+                )
+                continue
             cluster_reports.append(
                 {
                     "role": role,
@@ -701,12 +739,14 @@ def run_managed(args):
             "source": "azure-monitor-managed-prometheus",
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "complete": all(report["complete"] for report in cluster_reports),
+            "partial": bool(failed_clusters),
             "workspace": manifest.get("workspace", {}),
             "workspaces": manifest.get("workspaces", []),
             "query_window_start": args.start,
             "query_window_end": args.end,
             "checks": combined_checks,
             "cluster_reports": cluster_reports,
+            "failed_clusters": failed_clusters,
         }
 
     if not args.endpoint:

@@ -376,6 +376,17 @@ def test_health_gate_checkpoints_large_observations_outside_argv():
     assert "if ! write_summary true; then" in script
 
 
+def test_health_gate_reaps_any_completed_worker_and_retries_cilium():
+    script = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert 'wait -n -p completed_pid "${pids[@]}"' in script
+    assert 'if [ "$pid" != "$completed_pid" ]; then' in script
+    assert "HEALTH_GATE_CILIUM_PROBE_ATTEMPTS:-2" in script
+    assert "HEALTH_GATE_CILIUM_PROBE_RETRY_SECONDS:-2" in script
+    assert '--attempts "$cilium_probe_attempts"' in script
+    assert '--retry-seconds "$cilium_probe_retry_seconds"' in script
+
+
 def _healthy_nodes_json() -> str:
     return json.dumps(
         {

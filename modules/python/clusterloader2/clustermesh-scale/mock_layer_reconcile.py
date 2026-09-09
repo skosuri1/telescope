@@ -1385,6 +1385,45 @@ def _repair_batches(names: List[str]):
         yield names[start:start + REPAIR_BATCH_SIZE]
 
 
+def controller_agents_still_starting(
+    desired: DesiredState,
+    plan: ReconcilePlan,
+    agent_pods: Dict[str, dict],
+    real_nodes: Dict[str, dict],
+    recreated_agents: set,
+) -> List[str]:
+    """Return already-recreated controller Pods that only need more settle time.
+
+    A StatefulSet Pod can remain Pending/ContainerCreating while Azure CNI
+    obtains another IP configuration. Deleting the same exact desired Pod on
+    every reconcile attempt restarts that allocation and can prevent recovery.
+    Once this reconcile has already recreated a controller-owned Pod, leave it
+    in place while its only remaining problems are transient startup state.
+    Any identity, ownership, placement, or spec drift still requires repair.
+    """
+    if desired.agent_controller_manifests is None:
+        return []
+    paired_with_node_repairs = {
+        desired.agent_for_node[node_name]
+        for node_name in plan.nodes_to_recreate
+    }
+    transient_problems = {"phase=Pending", "container not Ready"}
+    settling = []
+    for name in plan.agents_to_recreate:
+        if (
+            name not in recreated_agents
+            or name in paired_with_node_repairs
+            or name not in agent_pods
+        ):
+            continue
+        _healthy, problems = desired_agent_is_healthy(
+            desired, name, agent_pods[name], real_nodes
+        )
+        if problems and set(problems).issubset(transient_problems):
+            settling.append(name)
+    return sorted(settling)
+
+
 def capture_agent_repair_diagnostics(
     kubeconfig: str,
     desired: DesiredState,
@@ -1942,6 +1981,34 @@ def reconcile_cluster(
                 continue
             break
 
+        settling_agents = controller_agents_still_starting(
+            desired,
+            plan,
+            agent_pods,
+            real_nodes,
+            recreated_agents,
+        )
+        repair_plan = plan
+        if settling_agents:
+            settling_set = set(settling_agents)
+            repair_plan = ReconcilePlan(
+                nodes_to_recreate=plan.nodes_to_recreate,
+                agents_to_recreate=[
+                    name
+                    for name in plan.agents_to_recreate
+                    if name not in settling_set
+                ],
+                extra_nodes=plan.extra_nodes,
+                extra_agents=plan.extra_agents,
+            )
+            _progress(
+                role,
+                "settling",
+                f"attempt {attempt}/{attempts}: preserving "
+                f"{len(settling_agents)} already-recreated Pending "
+                "controller Pod(s) for CNI/container startup",
+            )
+
         if not plan.nodes_to_recreate and not plan.agents_to_recreate:
             errors = validate_converged(desired, kwok_nodes, agent_pods, real_nodes)
             converged = not errors
@@ -1951,12 +2018,26 @@ def reconcile_cluster(
             )
             break
 
+        if (
+            settling_agents
+            and not repair_plan.nodes_to_recreate
+            and not repair_plan.agents_to_recreate
+        ):
+            errors = [
+                f"{len(settling_agents)} already-recreated controller Pod(s) "
+                "remain Pending and are still settling"
+            ]
+            if attempt < attempts:
+                time.sleep(settle_seconds)
+                continue
+            break
+
         diagnostic_files, diagnostic_errors = capture_agent_repair_diagnostics(
             kubeconfig,
             desired,
             role,
             attempt,
-            plan.agents_to_recreate,
+            repair_plan.agents_to_recreate,
             agent_pods,
             request_timeout_seconds,
             diagnostics_root,
@@ -1976,7 +2057,7 @@ def reconcile_cluster(
             apply_repairs(
                 kubeconfig,
                 desired,
-                plan,
+                repair_plan,
                 kwok_nodes,
                 agent_pods,
                 request_timeout_seconds,
@@ -1989,8 +2070,8 @@ def reconcile_cluster(
                 continue
             break
 
-        recreated_nodes.update(plan.nodes_to_recreate)
-        recreated_agents.update(plan.agents_to_recreate)
+        recreated_nodes.update(repair_plan.nodes_to_recreate)
+        recreated_agents.update(repair_plan.agents_to_recreate)
         time.sleep(settle_seconds)
     else:
         # Attempts exhausted without an early "nothing left to repair" break --

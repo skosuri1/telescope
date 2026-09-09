@@ -768,6 +768,76 @@ def test_controller_recreates_deleted_agent_ordinal(tmp_path, monkeypatch):
     assert owner["name"] == "kwok-node"
 
 
+def test_controller_pending_agent_settles_without_repeated_delete(
+    tmp_path, monkeypatch,
+):
+    role = "mesh-1"
+    node_docs, _agent_docs, controller_docs = write_controller_state_dir(
+        tmp_path, role, node_count=1
+    )
+    cluster = FakeKubeCluster()
+    for node_doc in node_docs:
+        cluster._apply(node_doc)  # pylint: disable=protected-access
+    for controller_doc in controller_docs:
+        cluster._apply(controller_doc)  # pylint: disable=protected-access
+    key = (NAMESPACE, "kwok-node-0")
+    cluster.pods[key]["status"] = {
+        "phase": "Failed",
+        "containerStatuses": [{"ready": False}],
+    }
+
+    original_apply_repairs = reconciler.apply_repairs
+    repair_calls = 0
+
+    def apply_then_wait_for_cni(*args, **kwargs):
+        nonlocal repair_calls
+        original_apply_repairs(*args, **kwargs)
+        repair_calls += 1
+        cluster.pods[key]["status"] = {
+            "phase": "Pending",
+            "containerStatuses": [
+                {
+                    "ready": False,
+                    "state": {"waiting": {"reason": "ContainerCreating"}},
+                }
+            ],
+        }
+
+    original_inspect_cluster = reconciler.inspect_cluster
+    pending_observations = 0
+
+    def inspect_then_eventually_start(*args, **kwargs):
+        nonlocal pending_observations
+        if repair_calls > 0:
+            pending_observations += 1
+            if pending_observations >= 3:
+                cluster.pods[key]["status"] = {
+                    "phase": "Running",
+                    "containerStatuses": [{"ready": True}],
+                }
+        return original_inspect_cluster(*args, **kwargs)
+
+    monkeypatch.setattr(reconciler, "apply_repairs", apply_then_wait_for_cni)
+    monkeypatch.setattr(
+        reconciler,
+        "inspect_cluster",
+        inspect_then_eventually_start,
+    )
+
+    result = _reconcile(
+        monkeypatch,
+        cluster,
+        role,
+        tmp_path,
+        attempts=5,
+    )
+
+    assert result["status"] == "ok"
+    assert repair_calls == 1
+    assert cluster.delete_calls.count(("pod", "kwok-node-0")) == 1
+    assert "kwok-node-0" in result["recreated_agents"]
+
+
 def test_self_heal_probe_evidence_moves_into_report_diagnostics(
     tmp_path, monkeypatch,
 ):
@@ -2280,5 +2350,5 @@ def test_run_mock_layer_reconcile_timeout_fallback_is_syntactically_wired():
     assert ".timed_out = true" in function_src or "timed_out: true" in function_src
     assert "phase" in function_src
     assert "mock-layer-reconcile[<role>] phase:" in function_src
-    assert 'CL2_MOCK_RECONCILE_ATTEMPTS:-10' in function_src
-    assert 'CL2_MOCK_RECONCILE_SETTLE_SECONDS:-30' in function_src
+    assert 'CL2_MOCK_RECONCILE_ATTEMPTS:-15' in function_src
+    assert 'CL2_MOCK_RECONCILE_SETTLE_SECONDS:-45' in function_src

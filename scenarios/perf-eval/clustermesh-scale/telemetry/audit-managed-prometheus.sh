@@ -333,7 +333,10 @@ else
       "$workspace_dir/amw-capacity-summary.md"
   done
   capacity_batch=0
-  while IFS= read -r workspace; do
+  mapfile -t capacity_workspace_rows < <(
+    echo "$workspaces_json" | jq -c '.[]'
+  )
+  for workspace in "${capacity_workspace_rows[@]}"; do
     workspace_slot=$(echo "$workspace" | jq -r '.slot // .name')
     workspace_key=$(printf '%s' "$workspace_slot" | sed -E 's/[^a-zA-Z0-9_.-]+/_/g')
     (
@@ -349,10 +352,10 @@ else
       wait
       capacity_batch=0
     fi
-  done < <(echo "$workspaces_json" | jq -c '.[]')
+  done
   wait
 
-  while IFS= read -r workspace; do
+  for workspace in "${capacity_workspace_rows[@]}"; do
     workspace_slot=$(echo "$workspace" | jq -r '.slot // .name')
     workspace_key=$(printf '%s' "$workspace_slot" | sed -E 's/[^a-zA-Z0-9_.-]+/_/g')
     cat "$audit_work_state/capacity-${workspace_key}.log" 2>/dev/null || true
@@ -360,7 +363,7 @@ else
       capacity_audit_ok=false
       echo "##vso[task.logissue type=error;] AMW capacity audit failed for workspace slot $workspace_slot."
     fi
-  done < <(echo "$workspaces_json" | jq -c '.[]')
+  done
 fi
 echo "##vso[task.setvariable variable=AKS_AMW_CAPACITY_AUDITED]$capacity_audit_ok"
 
@@ -468,6 +471,13 @@ jq -n \
 if [ "$audit_rc" -ne 0 ] || [ "$managed_report_valid" != "true" ]; then
   echo "##vso[task.logissue type=warning;] Managed Prometheus telemetry audit returned $audit_rc with report_valid=$managed_report_valid; inspect the published audit."
 fi
+managed_audit_incomplete=false
+if [ "$audit_rc" -ne 0 ] ||
+   [ "$managed_report_valid" != "true" ] ||
+   ! jq -e '.complete == true' \
+      "$OUTPUT_DIR/telemetry-audit-managed.json" >/dev/null 2>&1; then
+  managed_audit_incomplete=true
+fi
 
 platform_export_state="$audit_work_state/platform"
 mkdir -p "$platform_export_state"
@@ -475,6 +485,11 @@ jq -c '.clusters[]' "$MANIFEST_PATH" > "$platform_export_state/clusters.jsonl"
 platform_cluster_count=$(wc -l < "$platform_export_state/clusters.jsonl")
 scenario_window_count=$(jq '(.scenario_windows // []) | length' "$collection_manifest")
 platform_metrics_required="${AKS_PLATFORM_METRICS_REQUIRED:-false}"
+if [ "${platform_metrics_required,,}" != "true" ] &&
+   [ "${platform_metrics_required,,}" != "false" ]; then
+  echo "AKS_PLATFORM_METRICS_REQUIRED must be true or false." >&2
+  exit 1
+fi
 platform_export_skipped=false
 if [ "${skip_platform_without_scenarios,,}" = "true" ] &&
    [ "${platform_metrics_required,,}" != "true" ] &&
@@ -551,6 +566,7 @@ fi
 platform_export_ok=true
 platform_export_success_count=0
 platform_export_failed_count=0
+platform_export_failed_roles=()
 while IFS= read -r cluster; do
   [ -n "$cluster" ] || continue
   role=$(echo "$cluster" | jq -r '.role')
@@ -562,17 +578,27 @@ while IFS= read -r cluster; do
     platform_export_success_count=$((platform_export_success_count + 1))
   else
     platform_export_failed_count=$((platform_export_failed_count + 1))
+    platform_export_failed_roles+=("$role")
     platform_export_ok=false
-    echo "##vso[task.logissue type=error;] Platform metric export failed for ${role} (status=$status); log tail:"
+    platform_issue_type=warning
+    if [ "${platform_metrics_required,,}" = "true" ]; then
+      platform_issue_type=error
+    fi
+    echo "##vso[task.logissue type=${platform_issue_type};] Platform metric export failed for ${role} (status=$status); log tail:"
     tail -50 "$platform_export_state/${role}.log" 2>/dev/null || true
   fi
 done < "$platform_export_state/clusters.jsonl"
+platform_export_failed_roles_json=$(
+  printf '%s\n' "${platform_export_failed_roles[@]}" |
+    jq -Rsc 'split("\n") | map(select(length > 0))'
+)
 jq -n \
   --argjson skipped "$platform_export_skipped" \
   --argjson scenario_window_count "$scenario_window_count" \
   --argjson expected_count "$platform_cluster_count" \
   --argjson success_count "$platform_export_success_count" \
   --argjson failed_count "$platform_export_failed_count" \
+  --argjson failed_roles "$platform_export_failed_roles_json" \
   --argjson total_timeout_seconds "$platform_export_total_timeout_seconds" \
   --argjson cluster_timeout_seconds "$platform_export_cluster_timeout_seconds" \
   --argjson command_timeout_seconds "$platform_az_command_timeout_seconds" \
@@ -582,13 +608,23 @@ jq -n \
     expected_count: $expected_count,
     success_count: $success_count,
     failed_count: $failed_count,
+    failed_roles: $failed_roles,
+    complete: ($skipped or $failed_count == 0),
+    partial: (($skipped | not) and $success_count > 0 and $failed_count > 0),
     total_timeout_seconds: $total_timeout_seconds,
     cluster_timeout_seconds: $cluster_timeout_seconds,
     command_timeout_seconds: $command_timeout_seconds
   }' > "$OUTPUT_DIR/aks-platform-export-summary.json"
 
 echo "Managed telemetry audit and live-coupled platform metrics written to $OUTPUT_DIR"
-if [ "$capacity_audit_ok" != "true" ] ||
+if [ "$capacity_audit_ok" != "true" ]; then
+  exit 1
+fi
+if [ "${platform_metrics_required,,}" = "true" ] &&
    [ "$platform_export_ok" != "true" ]; then
   exit 1
+fi
+if [ "$managed_audit_incomplete" = "true" ] ||
+   [ "$platform_export_ok" != "true" ]; then
+  echo "##vso[task.complete result=SucceededWithIssues;]Managed telemetry preserved with optional gaps; inspect the published audit and platform export summary."
 fi

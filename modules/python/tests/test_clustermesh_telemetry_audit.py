@@ -679,11 +679,22 @@ def test_run_managed_single_worker_does_not_overlap(tmp_path, monkeypatch):
 
     monkeypatch.setattr(audit_module, "_run_managed_query", fake_run_managed_query)
 
-    # With workers=1, clusters run strictly one-at-a-time, so the second
-    # cluster's call never arrives at the barrier while the first is
-    # waiting on it: the barrier times out and raises.
-    with pytest.raises(threading.BrokenBarrierError):
-        audit_module.run_managed(_managed_args(manifest_path, workers=1))
+    # With workers=1, clusters run strictly one-at-a-time, so each barrier
+    # wait fails independently and is preserved as per-cluster audit evidence.
+    report = audit_module.run_managed(
+        _managed_args(manifest_path, workers=1)
+    )
+
+    assert report["complete"] is False
+    assert report["partial"] is True
+    assert [item["role"] for item in report["failed_clusters"]] == [
+        "mesh-0",
+        "mesh-1",
+    ]
+    assert all(
+        item["error_type"] == "BrokenBarrierError"
+        for item in report["failed_clusters"]
+    )
     del manifest
 
 
@@ -737,7 +748,9 @@ def test_run_managed_preserves_manifest_cluster_order(tmp_path, monkeypatch):
     del manifest
 
 
-def test_run_managed_propagates_worker_exception(tmp_path, monkeypatch):
+def test_run_managed_preserves_successes_after_worker_exception(
+    tmp_path, monkeypatch,
+):
     manifest, manifest_path = _schema_v2_manifest(
         tmp_path,
         [
@@ -760,10 +773,32 @@ def test_run_managed_propagates_worker_exception(tmp_path, monkeypatch):
 
     monkeypatch.setattr(audit_module, "_run_managed_query", fake_run_managed_query)
 
-    with pytest.raises(
-        RuntimeError, match="simulated managed Prometheus query failure"
-    ):
-        audit_module.run_managed(_managed_args(manifest_path, workers=2))
+    report = audit_module.run_managed(
+        _managed_args(manifest_path, workers=2)
+    )
+
+    assert report["complete"] is False
+    assert report["partial"] is True
+    assert [item["role"] for item in report["cluster_reports"]] == [
+        "mesh-1",
+        "mesh-2",
+    ]
+    assert report["cluster_reports"][0]["complete"] is True
+    assert report["cluster_reports"][1]["status"] == "query-failed"
+    assert report["failed_clusters"] == [
+        {
+            "role": "mesh-2",
+            "name": "clustermesh-mesh-2",
+            "resource_id": "cluster-2",
+            "workspace": {
+                "name": "amw-mesh-2",
+                "id": "amw-id-mesh-2",
+                "prometheus_query_endpoint": "https://amw-2.example",
+            },
+            "error_type": "RuntimeError",
+            "error": "simulated managed Prometheus query failure",
+        }
+    ]
     del manifest
 
 

@@ -1365,6 +1365,183 @@ def test_audit_phase_supervisor_bounds_capacity_collection(tmp_path):
     assert graceful_phase["timed_out"] is True
 
 
+def test_optional_platform_export_failure_completes_with_issues(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    manifest_path = tmp_path / "run-manifest.json"
+    workspace = {
+        "slot": "mesh-1",
+        "name": "test-amw-mesh-1",
+        "id": "test-amw",
+        "prometheus_query_endpoint": "https://example",
+        "capacity_guard": {
+            "monitoring_window_start": "2026-09-04T00:00:00Z"
+        },
+    }
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "run_id": "test-run",
+                "configured_at": "2026-09-04T00:00:00Z",
+                "workspace": {"mode": "per-cluster"},
+                "workspaces": [workspace],
+                "query": {
+                    "resource_endpoint": "https://example",
+                    "resource_scope": "/subscriptions/test",
+                },
+                "clusters": [
+                    {
+                        "role": "mesh-1",
+                        "name": "clustermesh-1",
+                        "id": "cluster-id",
+                        "prometheus_cluster_alias": "test_run_mesh_1",
+                        "workspace": workspace,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    capacity_summary = {
+        "query_succeeded": True,
+        "resource_id": "test-amw",
+        "capacity_samples_complete": True,
+        "capacity_ok": True,
+        "within_nominal_limits": True,
+        "active_series": {
+            "maximum": 1,
+            "limit": 1000000,
+            "maximum_percent": 0.0001,
+        },
+        "events_per_minute": {
+            "maximum_received": 1,
+            "limit": 1000000,
+            "maximum_percent": 0.0001,
+        },
+        "limit_throttling": {
+            "events_dropped": 0,
+            "time_series_samples_dropped": 0,
+        },
+        "drops_by_reason": [],
+        "window": {
+            "start": "2026-09-04T00:00:00Z",
+            "end": "2026-09-04T00:10:00Z",
+        },
+    }
+    (output_dir / "run-manifest.json").write_text(
+        json.dumps(
+            {
+                "collected_at": "2026-09-04T00:10:00Z",
+                "audit_window": {
+                    "start": "2026-09-04T00:00:00Z",
+                    "end": "2026-09-04T00:10:00Z",
+                },
+                "logs_window": {"end": None},
+                "scenario_windows": [{"scenario": "event-throughput"}],
+                "capacity_audits": [
+                    {
+                        "slot": "mesh-1",
+                        "status": 0,
+                        "summary": capacity_summary,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_az = fake_bin / "az"
+    fake_az.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"${1:-} ${2:-}\" = \"account get-access-token\" ]; then\n"
+        "  echo fake-token\n"
+        "  exit 0\n"
+        "fi\n"
+        "echo \"Unexpected az command: $*\" >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_az.chmod(fake_az.stat().st_mode | stat.S_IXUSR)
+    audit_script = tmp_path / "audit.py"
+    audit_script.write_text(
+        "import json, pathlib, sys\n"
+        "prefix = pathlib.Path(sys.argv[sys.argv.index('--output-prefix') + 1])\n"
+        "prefix.with_suffix('.json').write_text(json.dumps({'complete': False, 'checks': []}))\n"
+        "prefix.with_suffix('.md').write_text('# partial audit\\n')\n"
+        "raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    platform_script = tmp_path / "platform.py"
+    platform_script.write_text(
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[sys.argv.index('--manifest') + 1]).write_text('{\"partial\":true}\\n')\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "AKS_CONTROL_PLANE_METRICS_ENABLED": "true",
+            "AKS_CONTROL_PLANE_METRICS_CONCURRENCY": "1",
+            "AKS_PLATFORM_METRICS_REQUIRED": "false",
+            "AKS_PLATFORM_EXPORT_TOTAL_TIMEOUT_SECONDS": "10",
+            "AKS_PLATFORM_EXPORT_CLUSTER_TIMEOUT_SECONDS": "5",
+            "AKS_PLATFORM_AZ_COMMAND_TIMEOUT_SECONDS": "1",
+            "MANIFEST_PATH": str(manifest_path),
+            "OUTPUT_DIR": str(output_dir),
+            "RUN_ID": "test-run",
+            "AUDIT_SCRIPT": str(audit_script),
+            "PLATFORM_EXPORT_SCRIPT": str(platform_script),
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(TELEMETRY_DIR / "audit-managed-prometheus.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "task.complete result=SucceededWithIssues" in result.stdout
+    assert "task.logissue type=warning" in result.stdout
+    assert "task.logissue type=error" not in result.stdout
+    summary = json.loads(
+        (output_dir / "aks-platform-export-summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["complete"] is False
+    assert summary["partial"] is False
+    assert summary["failed_count"] == 1
+    assert summary["failed_roles"] == ["mesh-1"]
+
+    environment["AKS_PLATFORM_METRICS_REQUIRED"] = "true"
+    required_output = tmp_path / "required-output"
+    required_output.mkdir()
+    (required_output / "run-manifest.json").write_text(
+        (output_dir / "run-manifest.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    environment["OUTPUT_DIR"] = str(required_output)
+    required = subprocess.run(
+        ["bash", str(TELEMETRY_DIR / "audit-managed-prometheus.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=20,
+    )
+
+    assert required.returncode != 0
+    assert "task.logissue type=error" in required.stdout
+
+
 def test_platform_exporter_bounds_azure_cli_calls(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1898,6 +2075,9 @@ def test_scripts_use_current_aks_profile_and_full_export():
     assert "AKS_PLATFORM_EXPORT_TOTAL_TIMEOUT_SECONDS" in audit
     assert "AKS_PLATFORM_EXPORT_CLUSTER_TIMEOUT_SECONDS" in audit
     assert "AKS_PLATFORM_EXPORT_SKIP_WITHOUT_SCENARIOS" in audit
+    assert "AKS_PLATFORM_METRICS_REQUIRED must be true or false" in audit
+    assert "task.complete result=SucceededWithIssues" in audit
+    assert "platform_export_failed_roles" in audit
     assert "AKS_MANAGED_TELEMETRY_AUDIT_PHASE_CHILD" in audit
     assert "telemetry-audit-phase-execution.json" in audit
     assert "--request-timeout-seconds" in audit
