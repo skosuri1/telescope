@@ -34,9 +34,11 @@ import argparse
 import concurrent.futures
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -56,6 +58,10 @@ CONTROLLER_OWNED_NODE_ANNOTATIONS = {
     # never trigger Node recreation.
     "node.alpha.kubernetes.io/ttl",
 }
+
+_LIVE_KUBECTL_PROCESSES = set()
+_LIVE_KUBECTL_PROCESSES_LOCK = threading.Lock()
+_RECONCILE_CANCELLED = threading.Event()
 
 # The four clustermesh client secrets provision-kwok-layer.sh copies from
 # kube-system into the agent namespace when CONSUME_CLUSTERMESH is active (see
@@ -357,15 +363,187 @@ def _base_cmd(kubeconfig: str, timeout_seconds: float, namespace: Optional[str] 
     return cmd
 
 
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        proc_entries = os.listdir("/proc")
+    except OSError:
+        return True
+    found_member = False
+    for entry in proc_entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(
+                f"/proc/{entry}/stat",
+                "r",
+                encoding="utf-8",
+            ) as stat_file:
+                stat = stat_file.read()
+            fields = stat[stat.rfind(")") + 2:].split()
+            state = fields[0]
+            process_group = int(fields[2])
+        except (OSError, ValueError, IndexError):
+            continue
+        if process_group != pgid:
+            continue
+        found_member = True
+        if state != "Z":
+            return True
+    if found_member:
+        return False
+    return True
+
+
+def _signal_process_group(pgid: int, sig: signal.Signals) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise ReconcileError(
+            f"unable to signal kubectl process group pid={pgid}: {exc}"
+        ) from exc
+
+
+def _terminate_process_groups(
+    processes: List[subprocess.Popen],
+    grace_seconds: float = 5,
+) -> None:
+    def active_groups(candidates):
+        active = {}
+        for pgid, proc in candidates.items():
+            proc.poll()
+            if _process_group_exists(pgid):
+                active[pgid] = proc
+        return active
+
+    groups = active_groups({proc.pid: proc for proc in processes})
+    for pgid in groups:
+        _signal_process_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + grace_seconds
+    while groups and time.monotonic() < deadline:
+        groups = active_groups(groups)
+        if groups:
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    groups = active_groups(groups)
+    for pgid in groups:
+        _signal_process_group(pgid, signal.SIGKILL)
+    kill_deadline = time.monotonic() + 1
+    while groups and time.monotonic() < kill_deadline:
+        groups = active_groups(groups)
+        if groups:
+            time.sleep(
+                min(0.05, max(0, kill_deadline - time.monotonic()))
+            )
+    groups = active_groups(groups)
+    if groups:
+        raise ReconcileError(
+            "unable to terminate kubectl process group(s): "
+            + ", ".join(str(pgid) for pgid in sorted(groups))
+        )
+
+
+def _terminate_process_group(
+    proc: subprocess.Popen,
+    grace_seconds: float = 5,
+) -> None:
+    _terminate_process_groups([proc], grace_seconds=grace_seconds)
+
+
+def _terminate_all_kubectl_process_groups() -> None:
+    with _LIVE_KUBECTL_PROCESSES_LOCK:
+        processes = list(_LIVE_KUBECTL_PROCESSES)
+    _terminate_process_groups(processes)
+
+
+def _finalize_process_cleanup(active_exception: Optional[BaseException]) -> None:
+    try:
+        _terminate_all_kubectl_process_groups()
+    except ReconcileError as exc:
+        if active_exception is None:
+            raise
+        print(
+            f"mock-layer-reconcile: final process cleanup failed: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _raise_if_cancelled() -> None:
+    if _RECONCILE_CANCELLED.is_set():
+        raise ReconcileError("reconciliation cancelled")
+
+
+def _cancelable_sleep(seconds: float) -> None:
+    if seconds <= 0:
+        _raise_if_cancelled()
+        return
+    if _RECONCILE_CANCELLED.wait(seconds):
+        raise ReconcileError("reconciliation cancelled")
+
+
+def _invoke_kubectl(
+    cmd: List[str],
+    timeout_seconds: float,
+    input_text: Optional[str],
+) -> subprocess.CompletedProcess:
+    _raise_if_cancelled()
+    proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        cmd,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    with _LIVE_KUBECTL_PROCESSES_LOCK:
+        _LIVE_KUBECTL_PROCESSES.add(proc)
+    try:
+        if _RECONCILE_CANCELLED.is_set():
+            _terminate_process_group(proc)
+            raise ReconcileError("reconciliation cancelled")
+        try:
+            stdout, stderr = proc.communicate(
+                input=input_text,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            _terminate_process_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired as communicate_error:
+                raise ReconcileError(
+                    f"kubectl process pipes did not close for pid={proc.pid}"
+                ) from communicate_error
+            raise subprocess.TimeoutExpired(
+                cmd,
+                timeout_seconds,
+                output=stdout,
+                stderr=stderr,
+            ) from exc
+        return subprocess.CompletedProcess(
+            cmd,
+            proc.returncode,
+            stdout,
+            stderr,
+        )
+    finally:
+        with _LIVE_KUBECTL_PROCESSES_LOCK:
+            _LIVE_KUBECTL_PROCESSES.discard(proc)
+
+
 def _run_kubectl(cmd: List[str], timeout_seconds: float, input_text: Optional[str] = None) -> str:
     try:
-        result = subprocess.run(
+        result = _invoke_kubectl(
             cmd,
-            input=input_text,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
+            timeout_seconds,
+            input_text,
         )
     except subprocess.TimeoutExpired as exc:
         raise ReconcileError(
@@ -1037,11 +1215,12 @@ def reconcile_support_infra(
 
     repaired_reasons: List[str] = []
     for attempt in range(1, attempts + 1):
+        _raise_if_cancelled()
         try:
             healthy, problems = support_infra_is_healthy(kubeconfig, desired, request_timeout_seconds)
         except ReconcileError as exc:
             if attempt < attempts:
-                time.sleep(settle_seconds)
+                _cancelable_sleep(settle_seconds)
                 continue
             return repaired_reasons, [str(exc)]
 
@@ -1053,12 +1232,12 @@ def reconcile_support_infra(
             apply_support_manifests(kubeconfig, desired, request_timeout_seconds)
         except ReconcileError as exc:
             if attempt < attempts:
-                time.sleep(settle_seconds)
+                _cancelable_sleep(settle_seconds)
                 continue
             return repaired_reasons, [str(exc)]
 
         if attempt < attempts:
-            time.sleep(settle_seconds)
+            _cancelable_sleep(settle_seconds)
 
     # Bounded repair/rollout-wait budget exhausted -- one last judgment.
     try:
@@ -1169,6 +1348,7 @@ def reconcile_agent_controller(
 
     repaired_reasons: List[str] = []
     for attempt in range(1, attempts + 1):
+        _raise_if_cancelled()
         healthy, problems = agent_controller_is_healthy(
             kubeconfig, desired, request_timeout_seconds
         )
@@ -1184,7 +1364,7 @@ def reconcile_agent_controller(
             if attempt >= attempts:
                 return repaired_reasons, [str(exc)]
         if attempt < attempts:
-            time.sleep(settle_seconds)
+            _cancelable_sleep(settle_seconds)
 
     healthy, problems = agent_controller_is_healthy(
         kubeconfig, desired, request_timeout_seconds
@@ -1705,6 +1885,7 @@ def reconcile_cluster(
     run_id: Optional[str] = None,
     diagnostics_root: Optional[str] = None,
 ) -> dict:
+    _raise_if_cancelled()
     result = {
         "role": role,
         "status": "failed",
@@ -1835,6 +2016,7 @@ def reconcile_cluster(
         _progress(role, "secrets", "checking clustermesh consume secrets")
         secrets_errors: List[str] = []
         for attempt in range(1, attempts + 1):
+            _raise_if_cancelled()
             try:
                 result["repaired_secrets"] = reconcile_clustermesh_secrets(
                     kubeconfig, desired.namespace, request_timeout_seconds
@@ -1848,7 +2030,7 @@ def reconcile_cluster(
             except ReconcileError as exc:
                 secrets_errors = [str(exc)]
                 if attempt < attempts:
-                    time.sleep(settle_seconds)
+                    _cancelable_sleep(settle_seconds)
         if secrets_errors:
             result["errors"] = secrets_errors
             _progress(role, "secrets", f"FAILED: {'; '.join(secrets_errors)}")
@@ -1894,6 +2076,7 @@ def reconcile_cluster(
     attempt = 0
 
     for attempt in range(1, attempts + 1):
+        _raise_if_cancelled()
         try:
             kwok_nodes, agent_pods, real_nodes = inspect_cluster(
                 kubeconfig, desired, request_timeout_seconds
@@ -1902,7 +2085,7 @@ def reconcile_cluster(
             errors = [str(exc)]
             _progress(role, "inventory", f"attempt {attempt}/{attempts}: FAILED: {exc}")
             if attempt < attempts:
-                time.sleep(settle_seconds)
+                _cancelable_sleep(settle_seconds)
                 continue
             break
 
@@ -1954,7 +2137,7 @@ def reconcile_cluster(
                 f"attempt {attempt}/{attempts}: {errors[0]}",
             )
             if attempt < attempts:
-                time.sleep(settle_seconds)
+                _cancelable_sleep(settle_seconds)
                 continue
             break
 
@@ -1977,7 +2160,7 @@ def reconcile_cluster(
                 f"attempt {attempt}/{attempts}: {errors[0]}",
             )
             if attempt < attempts:
-                time.sleep(settle_seconds)
+                _cancelable_sleep(settle_seconds)
                 continue
             break
 
@@ -2028,7 +2211,7 @@ def reconcile_cluster(
                 "remain Pending and are still settling"
             ]
             if attempt < attempts:
-                time.sleep(settle_seconds)
+                _cancelable_sleep(settle_seconds)
                 continue
             break
 
@@ -2066,13 +2249,13 @@ def reconcile_cluster(
             errors = [str(exc)]
             _progress(role, "plan", f"attempt {attempt}/{attempts}: repair apply FAILED: {exc}")
             if attempt < attempts:
-                time.sleep(settle_seconds)
+                _cancelable_sleep(settle_seconds)
                 continue
             break
 
         recreated_nodes.update(repair_plan.nodes_to_recreate)
         recreated_agents.update(repair_plan.agents_to_recreate)
-        time.sleep(settle_seconds)
+        _cancelable_sleep(settle_seconds)
     else:
         # Attempts exhausted without an early "nothing left to repair" break --
         # give the last repair one more settle window, then judge convergence.
@@ -2141,9 +2324,13 @@ def reconcile_all(
     """
     results: List[dict] = []
     all_roles = [cluster["role"] for cluster in clusters]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-        futures = {}
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_concurrent
+    )
+    futures = {}
+    try:
         for cluster in clusters:
+            _raise_if_cancelled()
             role = cluster["role"]
             kubeconfig = resolve_kubeconfig(cluster)
             future = executor.submit(
@@ -2160,12 +2347,20 @@ def reconcile_all(
             )
             futures[future] = role
         for future in concurrent.futures.as_completed(futures):
+            _raise_if_cancelled()
             result = future.result()
             results.append(result)
             if on_result is not None:
                 done_roles = {r["role"] for r in results}
                 pending_roles = sorted(role for role in all_roles if role not in done_roles)
                 on_result(result, list(results), pending_roles)
+    finally:
+        if _RECONCILE_CANCELLED.is_set():
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
     return results
 
 
@@ -2272,6 +2467,7 @@ def _build_summary(args, results: List[dict], pending_roles: Optional[List[str]]
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    _RECONCILE_CANCELLED.clear()
 
     try:
         with open(args.clusters, "r", encoding="utf-8") as handle:
@@ -2301,18 +2497,49 @@ def main(argv=None) -> int:
     def _write_incremental_summary(_result, results_so_far, pending_roles) -> None:
         write_summary(args.summary_file, _build_summary(args, results_so_far, pending_roles))
 
-    results = reconcile_all(
-        clusters,
-        state_root=args.state_root,
-        expected_count=args.expected_mock_count,
-        max_concurrent=args.max_concurrent,
-        attempts=args.attempts,
-        settle_seconds=args.settle_seconds,
-        request_timeout_seconds=args.request_timeout_seconds,
-        run_id=args.run_id,
-        diagnostics_root=args.diagnostics_dir,
-        on_result=_write_incremental_summary,
-    )
+    previous_handlers = {}
+
+    def _handle_termination(signum, _frame):
+        _RECONCILE_CANCELLED.set()
+        print(
+            f"mock-layer-reconcile: received signal {signum}; "
+            "terminating active kubectl process groups",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            _terminate_all_kubectl_process_groups()
+        except ReconcileError as exc:
+            print(
+                f"mock-layer-reconcile: process cleanup failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(
+            signum,
+            _handle_termination,
+        )
+    try:
+        results = reconcile_all(
+            clusters,
+            state_root=args.state_root,
+            expected_count=args.expected_mock_count,
+            max_concurrent=args.max_concurrent,
+            attempts=args.attempts,
+            settle_seconds=args.settle_seconds,
+            request_timeout_seconds=args.request_timeout_seconds,
+            run_id=args.run_id,
+            diagnostics_root=args.diagnostics_dir,
+            on_result=_write_incremental_summary,
+        )
+    finally:
+        active_exception = sys.exc_info()[1]
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        _finalize_process_cleanup(active_exception)
 
     summary = _build_summary(args, results, pending_roles=[])
     write_summary(args.summary_file, summary)

@@ -7,8 +7,10 @@ telemetry-audit tests fake their HTTP layer (see test_clustermesh_telemetry_audi
 # pylint: disable=too-many-lines
 
 import importlib.util
+import io
 import json
 import re
+import signal
 import subprocess
 import types
 from pathlib import Path
@@ -336,6 +338,254 @@ def _completed(stdout):
 
 def _failed(stderr):
     return types.SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+
+
+def _patch_kubectl_runner(monkeypatch, runner):
+    def invoke(cmd, timeout_seconds, input_text):
+        return runner(
+            cmd,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+
+    monkeypatch.setattr(reconciler, "_invoke_kubectl", invoke)
+
+
+def test_run_kubectl_wraps_entire_process_tree(monkeypatch):
+    calls = {}
+
+    class FakePopen:
+        pid = 123
+        returncode = 0
+
+        def __init__(self, cmd, **kwargs):
+            calls["cmd"] = cmd
+            calls["kwargs"] = kwargs
+
+        def communicate(self, input=None, timeout=None):  # pylint: disable=redefined-builtin
+            calls["input"] = input
+            calls["timeout"] = timeout
+            return "{}", ""
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(reconciler.subprocess, "Popen", FakePopen)
+
+    result = reconciler._invoke_kubectl(  # pylint: disable=protected-access
+        ["kubectl", "get", "nodes", "-o", "json"],
+        timeout_seconds=30,
+        input_text=None,
+    )
+
+    assert calls["cmd"] == ["kubectl", "get", "nodes", "-o", "json"]
+    assert calls["kwargs"]["start_new_session"] is True
+    assert calls["timeout"] == 30
+    assert result.stdout == "{}"
+    assert not reconciler._LIVE_KUBECTL_PROCESSES  # pylint: disable=protected-access
+
+
+def test_run_kubectl_maps_process_tree_timeout(monkeypatch):
+    signals = []
+
+    class FakePopen:
+        pid = 456
+        returncode = None
+        communicate_calls = 0
+
+        def __init__(self, _cmd, **_kwargs):
+            return None
+
+        def communicate(self, input=None, timeout=None):  # pylint: disable=redefined-builtin
+            del input
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise subprocess.TimeoutExpired(["kubectl"], timeout)
+            return "", ""
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            del timeout
+            self.returncode = -signal.SIGTERM
+            return self.returncode
+
+    monkeypatch.setattr(reconciler.subprocess, "Popen", FakePopen)
+    group_alive = {"value": True}
+
+    def fake_killpg(pid, sig):
+        if sig == 0:
+            if not group_alive["value"]:
+                raise ProcessLookupError
+            return
+        signals.append((pid, sig))
+        group_alive["value"] = False
+
+    monkeypatch.setattr(reconciler.os, "killpg", fake_killpg)
+    monkeypatch.setattr(
+        reconciler.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("TERM-responsive group should not consume grace")
+        ),
+    )
+
+    try:
+        reconciler._run_kubectl(  # pylint: disable=protected-access
+            ["kubectl", "get", "nodes"],
+            timeout_seconds=30,
+        )
+    except reconciler.ReconcileError as error:
+        assert "kubectl timed out after 30s" in str(error)
+    else:
+        raise AssertionError("expected process-tree timeout failure")
+    assert signals == [(456, signal.SIGTERM)]
+
+
+def test_process_group_cleanup_outlives_exited_leader(monkeypatch):
+    signals = []
+    group_alive = {"value": True}
+
+    class ExitedLeader:
+        pid = 789
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            del timeout
+            return self.returncode
+
+    def fake_killpg(pid, sig):
+        if sig == 0:
+            if not group_alive["value"]:
+                raise ProcessLookupError
+            return
+        signals.append((pid, sig))
+        if sig == signal.SIGKILL:
+            group_alive["value"] = False
+
+    monkeypatch.setattr(reconciler.os, "killpg", fake_killpg)
+
+    reconciler._terminate_process_group(  # pylint: disable=protected-access
+        ExitedLeader(),
+        grace_seconds=0,
+    )
+
+    assert signals == [
+        (789, signal.SIGTERM),
+        (789, signal.SIGKILL),
+    ]
+
+
+def test_global_cleanup_broadcasts_before_escalating(monkeypatch):
+    signals = []
+    alive = {101, 202}
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            del timeout
+            return 0
+
+    def fake_killpg(pid, sig):
+        if sig == 0:
+            if pid not in alive:
+                raise ProcessLookupError
+            return
+        signals.append((pid, sig))
+        if sig == signal.SIGKILL:
+            alive.discard(pid)
+
+    monkeypatch.setattr(reconciler.os, "killpg", fake_killpg)
+
+    reconciler._terminate_process_groups(  # pylint: disable=protected-access
+        [FakeProcess(101), FakeProcess(202)],
+        grace_seconds=0,
+    )
+
+    assert signals[:2] == [
+        (101, signal.SIGTERM),
+        (202, signal.SIGTERM),
+    ]
+    assert signals[2:] == [
+        (101, signal.SIGKILL),
+        (202, signal.SIGKILL),
+    ]
+
+
+def test_zombie_only_process_group_is_not_alive(monkeypatch):
+    monkeypatch.setattr(reconciler.os, "killpg", lambda _pid, _sig: None)
+    monkeypatch.setattr(
+        reconciler.os,
+        "listdir",
+        lambda path: ["101", "202"] if path == "/proc" else [],
+    )
+    stats = {
+        "/proc/101/stat": "101 (leader) Z 1 789 0 0\n",
+        "/proc/202/stat": "202 (child) Z 1 789 0 0\n",
+    }
+    monkeypatch.setattr(
+        reconciler,
+        "open",
+        lambda path, *_args, **_kwargs: io.StringIO(stats[path]),
+        raising=False,
+    )
+
+    assert reconciler._process_group_exists(789) is False  # pylint: disable=protected-access
+
+
+def test_final_cleanup_does_not_override_primary_exception(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        reconciler,
+        "_terminate_all_kubectl_process_groups",
+        lambda: (_ for _ in ()).throw(
+            reconciler.ReconcileError("cleanup failed")
+        ),
+    )
+
+    reconciler._finalize_process_cleanup(  # pylint: disable=protected-access
+        SystemExit(143)
+    )
+
+    assert "final process cleanup failed: cleanup failed" in capsys.readouterr().err
+
+
+def test_cancellation_prevents_new_kubectl_process(monkeypatch):
+    spawned = []
+    monkeypatch.setattr(
+        reconciler.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: spawned.append(True),
+    )
+    reconciler._RECONCILE_CANCELLED.set()  # pylint: disable=protected-access
+    try:
+        reconciler._invoke_kubectl(  # pylint: disable=protected-access
+            ["kubectl", "get", "nodes"],
+            timeout_seconds=30,
+            input_text=None,
+        )
+    except reconciler.ReconcileError as error:
+        assert "reconciliation cancelled" in str(error)
+    else:
+        raise AssertionError("expected cancellation")
+    finally:
+        reconciler._RECONCILE_CANCELLED.clear()  # pylint: disable=protected-access
+    assert not spawned
 
 
 def _namespace_of(cmd):
@@ -687,7 +937,7 @@ class FakeKubeCluster:
 
 
 def _reconcile(monkeypatch, cluster, role, state_root, **kwargs):
-    monkeypatch.setattr(reconciler.subprocess, "run", cluster.run)
+    _patch_kubectl_runner(monkeypatch, cluster.run)
     defaults = {
         "kubeconfig": f"/kube/{role}.config",
         "state_root": str(state_root),
@@ -1093,7 +1343,7 @@ def test_mass_present_node_drift_can_recover_without_deletion(tmp_path, monkeypa
             if (node.get("metadata") or {}).get("labels", {}).get("type") == "kwok":
                 node["status"]["conditions"] = [{"type": "Ready", "status": "True"}]
 
-    monkeypatch.setattr(reconciler.time, "sleep", recover_nodes)
+    monkeypatch.setattr(reconciler, "_cancelable_sleep", recover_nodes)
     result = _reconcile(
         monkeypatch,
         cluster,
@@ -1163,7 +1413,7 @@ def test_mass_present_agent_drift_can_recover_without_deletion(
                 "containerStatuses": [{"ready": True}],
             }
 
-    monkeypatch.setattr(reconciler.time, "sleep", recover_agents)
+    monkeypatch.setattr(reconciler, "_cancelable_sleep", recover_agents)
     result = _reconcile(
         monkeypatch,
         cluster,
@@ -1435,7 +1685,7 @@ def test_reconcile_all_aggregates_ok_and_failed_clusters(tmp_path, monkeypatch):
         role = Path(kubeconfig).stem
         return clusters[role].run(cmd, **kwargs)
 
-    monkeypatch.setattr(reconciler.subprocess, "run", dispatch)
+    _patch_kubectl_runner(monkeypatch, dispatch)
 
     results = reconciler.reconcile_all(
         [
@@ -1939,7 +2189,7 @@ def test_support_infra_check_uses_a_fixed_small_number_of_kubectl_calls(tmp_path
     write_support_manifests(tmp_path, role)
     cluster = FakeKubeCluster()
     cluster.add_support_infra()  # fully healthy: 2 stage + 2 apf + namespace + SA + CRB
-    monkeypatch.setattr(reconciler.subprocess, "run", cluster.run)
+    _patch_kubectl_runner(monkeypatch, cluster.run)
 
     desired = reconciler.load_desired_state(str(tmp_path / role))
     healthy, problems = reconciler.support_infra_is_healthy(
@@ -1966,7 +2216,7 @@ def test_support_infra_check_call_count_is_independent_of_object_count(tmp_path,
     write_support_manifests(tmp_path, role, stage=many_stage_docs)
     cluster = FakeKubeCluster()
     cluster.add_support_infra(stage_names=tuple(f"stage-{i}" for i in range(10)))
-    monkeypatch.setattr(reconciler.subprocess, "run", cluster.run)
+    _patch_kubectl_runner(monkeypatch, cluster.run)
 
     desired = reconciler.load_desired_state(str(tmp_path / role))
     healthy, problems = reconciler.support_infra_is_healthy(
@@ -1986,7 +2236,7 @@ def test_secrets_reconcile_uses_two_batched_kubectl_calls(tmp_path, monkeypatch)
     write_state_dir(tmp_path, role, node_count=1)
     cluster = FakeKubeCluster()
     _seed_clustermesh_sources(cluster)
-    monkeypatch.setattr(reconciler.subprocess, "run", cluster.run)
+    _patch_kubectl_runner(monkeypatch, cluster.run)
 
     repaired = reconciler.reconcile_clustermesh_secrets(
         f"/kube/{role}.config", NAMESPACE, timeout_seconds=5,
@@ -2018,7 +2268,7 @@ def test_kubectl_list_by_name_keys_objects_by_name_and_validates_list_shape(monk
             ],
         }))
 
-    monkeypatch.setattr(reconciler.subprocess, "run", fake_run)
+    _patch_kubectl_runner(monkeypatch, fake_run)
 
     result = reconciler.kubectl_list_by_name(
         "/kube/mesh-1.config", "serviceaccounts", timeout_seconds=5,
@@ -2039,7 +2289,7 @@ def test_kubectl_list_by_name_handles_empty_list(monkeypatch):
         del cmd, input, capture_output, text, timeout, check
         return _completed(json.dumps({"kind": "StageList", "items": []}))
 
-    monkeypatch.setattr(reconciler.subprocess, "run", fake_run)
+    _patch_kubectl_runner(monkeypatch, fake_run)
 
     result = reconciler.kubectl_list_by_name("/kube/mesh-1.config", "stage", timeout_seconds=5)
     assert not result
@@ -2054,7 +2304,7 @@ def test_kubectl_list_by_name_rejects_non_list_shape(monkeypatch):
         del cmd, input, capture_output, text, timeout, check
         return _completed(json.dumps({"kind": "ServiceAccount", "metadata": {"name": "sa-1"}}))
 
-    monkeypatch.setattr(reconciler.subprocess, "run", fake_run)
+    _patch_kubectl_runner(monkeypatch, fake_run)
 
     try:
         reconciler.kubectl_list_by_name("/kube/mesh-1.config", "serviceaccounts", timeout_seconds=5)
@@ -2194,7 +2444,7 @@ def test_reconcile_all_on_result_callback_writes_incremental_progress(tmp_path, 
             role = Path(kubeconfig).stem
         return fakes[role].run(cmd, **kwargs)
 
-    monkeypatch.setattr(reconciler.subprocess, "run", fake_subprocess_run)
+    _patch_kubectl_runner(monkeypatch, fake_subprocess_run)
 
     calls = []
 
