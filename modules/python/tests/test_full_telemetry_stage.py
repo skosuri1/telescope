@@ -737,6 +737,14 @@ def test_n100_resume_bounds_pre_telemetry_reconcile_concurrency():
     assert 'HEALTH_GATE_CILIUM_PROBE_ATTEMPTS: "2"' in stage
     assert 'HEALTH_GATE_CILIUM_PROBE_RETRY_SECONDS: "2"' in stage
     assert (
+        "MOCK_HANDOFF_CNI_RECOVERY_ROLES: "
+        "${{ parameters.scaleDebugMockCniRecoveryRoles }}"
+        in stage
+    )
+    assert "- name: scaleDebugManagedTelemetryEnabled" in pipeline
+    assert "- name: scaleDebugMockCniRecoveryRoles" in pipeline
+    assert "parameters.scaleDebugManagedTelemetryEnabled" in stage
+    assert (
         'CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-'
         '${HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-1800}'
         in EXECUTE_TEMPLATE_PATH.read_text(encoding="utf-8")

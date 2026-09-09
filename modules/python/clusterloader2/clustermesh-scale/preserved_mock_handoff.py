@@ -202,6 +202,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reconcile-concurrent", type=int, default=12)
     parser.add_argument("--command-timeout-seconds", type=int, default=120)
     parser.add_argument("--reconcile-timeout-seconds", type=int, default=3600)
+    parser.add_argument("--reconcile-attempts", type=int, default=15)
+    parser.add_argument("--reconcile-settle-seconds", type=float, default=45)
     args = parser.parse_args(argv)
     for name in (
         "baseline_build_id",
@@ -213,6 +215,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "reconcile_concurrent",
         "command_timeout_seconds",
         "reconcile_timeout_seconds",
+        "reconcile_attempts",
+        "reconcile_settle_seconds",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -283,8 +287,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             artifact_dir=args.artifact_dir,
             max_concurrent=args.reconcile_concurrent,
             timeout_seconds=args.reconcile_timeout_seconds,
-            attempts=10,
-            settle_seconds=30,
+            attempts=args.reconcile_attempts,
+            settle_seconds=args.reconcile_settle_seconds,
             request_timeout_seconds=30,
         )
         if reconcile.get("total_clusters") != args.expected_cluster_count:

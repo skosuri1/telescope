@@ -493,6 +493,8 @@ def test_debug_stages_are_explicitly_mode_gated():
     assert "- name: scaleDebugTopology" in pipeline
     assert "- name: scaleDebugRequiredFamilyVcpus" in pipeline
     assert "- name: scaleDebugRunWorkload" in pipeline
+    assert "- name: scaleDebugManagedTelemetryEnabled" in pipeline
+    assert "- name: scaleDebugMockCniRecoveryRoles" in pipeline
     assert "- name: scaleDebugLeaseExtensionHours" in pipeline
     assert "- name: scaleDebugLeaseRenewalThresholdHours" in pipeline
     assert "- name: scaleDebugLeaseUpdateConcurrency" in pipeline
@@ -1371,12 +1373,24 @@ def test_n100_workload_handoff_requires_verified_artifacts_before_execute():
     assert "run_reconciler" in handoff
     assert "validate_platform_state" in handoff
     assert "capture_live" in handoff
-    assert "attempts=10" in handoff
-    assert "settle_seconds=30" in handoff
+    assert "reconcile_attempts" in handoff
+    assert "reconcile_settle_seconds" in handoff
+    assert "attempts=args.reconcile_attempts" in handoff
+    assert "settle_seconds=args.reconcile_settle_seconds" in handoff
     assert "workloads_started" in handoff
     assert "mock_redeployed" in handoff
     assert "desired_state_files_restored" in handoff
     assert "Restore verified n100 KWOK state before workloads" in handoff_template
+    assert "Recover Azure-CNI-blocked mock agents" in handoff_template
+    assert handoff_template.index(
+        "Recover Azure-CNI-blocked mock agents"
+    ) < handoff_template.index(
+        "Restore verified n100 KWOK state before workloads"
+    )
+    assert "mock_cni_recovery.py" in handoff_template
+    assert "MOCK_HANDOFF_CNI_RECOVERY_ROLES" in handoff_template
+    assert "MOCK_HANDOFF_RECONCILE_ATTEMPTS:-15" in handoff_template
+    assert "MOCK_HANDOFF_RECONCILE_SETTLE_SECONDS:-45" in handoff_template
     assert "Validate post-telemetry n100 workload data path" in handoff_template
     assert "Finalize incomplete n100 workload handoff evidence" in handoff_template
     assert "Publish n100 workload handoff" in handoff_template
