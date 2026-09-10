@@ -834,6 +834,8 @@ def test_cilium_policy_guard_runs_before_each_scenario():
     assert "--max-cycles" in health_recovery
     assert "scenario-health-gate-observation.json" in health_recovery
     assert "scenario-health-repair-clusters.json" in health_recovery
+    assert "SCENARIO_CLEANUP_RECONCILER" in health_recovery
+    assert "scenario-cleanup-reconcile-health-repair.json" in health_recovery
     assert "PRESERVED_WORKER_RECONCILE_WRAPPER" in health_recovery
     assert "preserved-worker-reconcile-health-repair.json" in health_recovery
     assert "mock-layer-reconcile-health-repair.json" in health_recovery
@@ -841,6 +843,7 @@ def test_cilium_policy_guard_runs_before_each_scenario():
     assert "final_reserve=" in health_recovery
     assert "worker_required=" in health_recovery
     assert "mock_required=" in health_recovery
+    assert "cleanup_required=" in health_recovery
     assert (
         'if [ "$target_count" -eq "$cluster_count" ] && '
         '[ "$cluster_count" -lt 50 ]; then'
@@ -848,6 +851,7 @@ def test_cilium_policy_guard_runs_before_each_scenario():
     )
     assert (
         health_recovery.index("scenario-health-gate-observation.json")
+        < health_recovery.index("scenario-cleanup-reconcile-health-repair.json")
         < health_recovery.index("preserved-worker-reconcile-health-repair.json")
         < health_recovery.index("mock-layer-reconcile-health-repair.json")
         < health_recovery.index('if [ "$gate_complete" != "true" ]; then')

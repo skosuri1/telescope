@@ -25,8 +25,9 @@ NOTHING else:
     plus core/RBAC resource kinds) whose name starts with one of the scenario-
     owned prefixes the health gate already recognizes (clustermesh-apiserver,
     hubble-metrics, coredns, kvstoremesh-standalone, mock-cilium-agent,
-    apiserver-backend-exporter) -- EXCEPT an explicit protected-baseline
-    denylist (prometheus-operator, kube-state-metrics, ama-metrics*,
+    apiserver-backend-exporter), plus the exact scenario-owned
+    Prometheus/k8s object -- EXCEPT an explicit protected-baseline denylist
+    (prometheus-operator, kube-state-metrics, ama-metrics*,
     controlplane-apiserver*, managed-prometheus, ...) that is never deleted
     even if a future allowlist prefix were to accidentally overlap it.
   * ClusterRoles/ClusterRoleBindings named apiserver-backend-exporter*.
@@ -110,6 +111,13 @@ MONITORING_ALLOWLIST_PREFIXES = (
     "kvstoremesh-standalone",
     "mock-cilium-agent",
     "apiserver-backend-exporter",
+)
+
+# The health gate treats this exact CL2-created Prometheus object as stale
+# scenario residue. Keep it exact so persistent/custom Prometheus instances
+# with any other name remain outside the mutation allowlist.
+MONITORING_EXACT_TARGETS = (
+    ("Prometheus", "k8s"),
 )
 
 # Explicit, never-touch denylist. Defense in depth: even if a future
@@ -355,7 +363,10 @@ def list_monitoring_targets(
             continue
         if any(name.startswith(prefix) for prefix in MONITORING_PROTECTED_PREFIXES):
             continue
-        if any(name.startswith(prefix) for prefix in MONITORING_ALLOWLIST_PREFIXES):
+        if (
+            (kind, name) in MONITORING_EXACT_TARGETS
+            or any(name.startswith(prefix) for prefix in MONITORING_ALLOWLIST_PREFIXES)
+        ):
             resource = discovered_types.get(kind, kind.lower())
             targets.append((resource, kind, name))
     return sorted(targets)

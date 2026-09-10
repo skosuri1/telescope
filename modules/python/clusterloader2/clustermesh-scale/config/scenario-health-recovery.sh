@@ -32,6 +32,8 @@ health_repair_role_count=0
 health_repair_attempted=false
 health_repair_valid=true
 mock_repair_valid=true
+cleanup_repair_attempted=false
+cleanup_repair_rc=0
 cleanup_gate_rc=0
 gate_complete=false
 
@@ -46,6 +48,8 @@ write_summary() {
     --argjson health_repair_attempted "$health_repair_attempted" \
     --argjson health_repair_valid "$health_repair_valid" \
     --argjson mock_repair_valid "$mock_repair_valid" \
+    --argjson cleanup_repair_attempted "$cleanup_repair_attempted" \
+    --argjson cleanup_repair_rc "$cleanup_repair_rc" \
     --argjson cleanup_gate_rc "$cleanup_gate_rc" \
     '{
       schema_version: 1,
@@ -56,9 +60,62 @@ write_summary() {
       health_repair_attempted: $health_repair_attempted,
       health_repair_valid: $health_repair_valid,
       mock_repair_valid: $mock_repair_valid,
+      cleanup_repair_attempted: $cleanup_repair_attempted,
+      cleanup_repair_rc: $cleanup_repair_rc,
       cleanup_gate_rc: $cleanup_gate_rc
     }' > "$partial" &&
     mv "$partial" "$recovery_summary"
+}
+
+cleanup_repair_budget_seconds() {
+  local target_count="$1"
+  if [ -n "${CL2_HEALTH_GATE_CLEANUP_REPAIR_BUDGET_SECONDS:-}" ]; then
+    echo "$CL2_HEALTH_GATE_CLEANUP_REPAIR_BUDGET_SECONDS"
+    return
+  fi
+  local attempts="${CL2_SCENARIO_CLEANUP_RECONCILE_ATTEMPTS:-5}"
+  local settle="${CL2_SCENARIO_CLEANUP_RECONCILE_SETTLE_SECONDS:-15}"
+  local request="${CL2_SCENARIO_CLEANUP_RECONCILE_REQUEST_TIMEOUT_SECONDS:-30}"
+  local cleanup_concurrency
+  cleanup_concurrency=$(cleanup_repair_concurrency "$target_count")
+  local cleanup_waves=$(( (target_count + cleanup_concurrency - 1) / cleanup_concurrency ))
+  echo $(( cleanup_waves * (attempts * (request + settle) + request) + 60 ))
+}
+
+cleanup_repair_concurrency() {
+  local target_count="$1" cleanup_concurrency
+  if [ "$cluster_count" -ge 50 ]; then
+    cleanup_concurrency="${CL2_SCENARIO_CLEANUP_RECONCILE_CONCURRENCY:-12}"
+  else
+    cleanup_concurrency="${CL2_SCENARIO_CLEANUP_RECONCILE_CONCURRENCY:-$cluster_count}"
+  fi
+  if [ "$cleanup_concurrency" -gt "$target_count" ]; then
+    cleanup_concurrency="$target_count"
+  fi
+  echo "$cleanup_concurrency"
+}
+
+run_cleanup_repair() {
+  local output="$1" target_count="$2" budget="$3"
+  local attempts="${CL2_SCENARIO_CLEANUP_RECONCILE_ATTEMPTS:-5}"
+  local settle="${CL2_SCENARIO_CLEANUP_RECONCILE_SETTLE_SECONDS:-15}"
+  local request="${CL2_SCENARIO_CLEANUP_RECONCILE_REQUEST_TIMEOUT_SECONDS:-30}"
+  local cleanup_concurrency
+  cleanup_concurrency=$(cleanup_repair_concurrency "$target_count")
+  if [ -z "${SCENARIO_CLEANUP_RECONCILER:-}" ] ||
+     [ ! -f "$SCENARIO_CLEANUP_RECONCILER" ]; then
+    echo "scenario cleanup reconciler is missing: ${SCENARIO_CLEANUP_RECONCILER:-unset}" >&2
+    return 127
+  fi
+  timeout --signal=TERM --kill-after=30s "${budget}s" \
+    python3 "$SCENARIO_CLEANUP_RECONCILER" \
+      --clusters "$repair_inventory" \
+      --scenario "$scenario" \
+      --max-concurrent "$cleanup_concurrency" \
+      --attempts "$attempts" \
+      --settle-seconds "$settle" \
+      --request-timeout-seconds "$request" \
+      --summary-file "$output"
 }
 
 run_gate() {
@@ -123,8 +180,7 @@ if [ "${CL2_HEALTH_GATE_REPAIR_ENABLED:-false}" = "true" ]; then
       health_repair_role_count=$(jq 'length' "$repair_inventory")
       if [ "$health_repair_role_count" -gt 0 ]; then
         health_repair_attempted=true
-        echo "${scenario}: auditing real workers after ${health_repair_role_count} unhealthy role observation(s)"
-        worker_output="$report_dir/preserved-worker-reconcile-health-repair.json"
+        echo "${scenario}: repairing ${health_repair_role_count} observed unhealthy role(s)"
         worker_required=0
         if [ "${CLUSTERMESH_PRESERVED_WORKER_RECOVERY_ENABLED:-false}" = "true" ]; then
           worker_required=$((worker_budget + 60))
@@ -134,9 +190,24 @@ if [ "${CL2_HEALTH_GATE_REPAIR_ENABLED:-false}" = "true" ]; then
            [ "$health_repair_role_count" -le "$max_repair_roles" ]; then
           mock_required=$((mock_budget + 30))
         fi
+        cleanup_budget=$(cleanup_repair_budget_seconds "$health_repair_role_count")
+        cleanup_required=$((cleanup_budget + 30))
         remaining=$((deadline - $(date +%s)))
-        if [ "$worker_required" -gt 0 ]; then
+        if [ "$remaining" -ge $((final_reserve + cleanup_required + worker_required + mock_required)) ]; then
+          cleanup_repair_attempted=true
+          cleanup_output="$report_dir/scenario-cleanup-reconcile-health-repair.json"
+          run_cleanup_repair "$cleanup_output" "$health_repair_role_count" "$cleanup_budget" ||
+            cleanup_repair_rc=$?
+          if [ "$cleanup_repair_rc" -ne 0 ]; then
+            echo "##vso[task.logissue type=warning;] ${scenario}: targeted scenario cleanup repair failed rc=${cleanup_repair_rc}; final health certification remains authoritative"
+          fi
+        else
+          echo "##vso[task.logissue type=warning;] ${scenario}: insufficient health budget for targeted cleanup repair while preserving worker/mock repair and final certification; skipping cleanup repair"
+        fi
+        if [ "$health_repair_valid" = "true" ] && [ "$worker_required" -gt 0 ]; then
+          remaining=$((deadline - $(date +%s)))
           if [ "$remaining" -ge $((final_reserve + worker_required + mock_required)) ]; then
+            worker_output="$report_dir/preserved-worker-reconcile-health-repair.json"
             if ! bash "${PRESERVED_WORKER_RECONCILE_WRAPPER:?worker wrapper path is required}" \
                 "$clusters" "$worker_output" "$worker_budget"; then
               health_repair_valid=false

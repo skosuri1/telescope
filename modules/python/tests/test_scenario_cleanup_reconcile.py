@@ -382,6 +382,28 @@ def test_monitoring_cr_deletion_uses_fully_qualified_resource(monkeypatch):
     assert not cluster.monitoring_objects
 
 
+def test_exact_prometheus_k8s_residue_is_deleted(monkeypatch):
+    cluster = FakeCleanupCluster()
+    cluster.monitoring_discovered_types = [
+        ("prometheuses", "Prometheus"),
+    ]
+    cluster.add_monitoring_object("Prometheus", "k8s")
+    cluster.add_monitoring_object("Prometheus", "persistent-observer")
+
+    result = _reconcile(monkeypatch, cluster, "apiserver-failure")
+
+    assert result["status"] == "ok"
+    assert result["deleted"] == ["monitoring/Prometheus/k8s"]
+    assert (
+        "prometheuses.monitoring.coreos.com",
+        "k8s",
+        "monitoring",
+    ) in cluster.delete_calls
+    assert cluster.monitoring_objects == [
+        ("Prometheus", "persistent-observer")
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 7. Transient API failure is retried, not treated as zero
 # ---------------------------------------------------------------------------
