@@ -446,10 +446,11 @@ steps:
           "$CL2_REPORT_DIR"/**/scenario-policy.json \
           "$CL2_REPORT_DIR"/**/scenario-evidence.json \
           "$CL2_REPORT_DIR"/**/mock-layer-reconcile-*.json \
-          "$CL2_REPORT_DIR"/**/scenario-cleanup-reconcile.json \
+          "$CL2_REPORT_DIR"/**/preserved-worker-reconcile-*.json \
+          "$CL2_REPORT_DIR"/**/scenario-cleanup-reconcile*.json \
           "$CL2_REPORT_DIR"/**/artifact-preservation-summary.json \
           "$CL2_REPORT_DIR"/**/artifact-preservation-final-summary.json \
-          "$CL2_REPORT_DIR"/**/scenario-health-gate.json \
+          "$CL2_REPORT_DIR"/**/scenario-health-*.json \
           "$CL2_REPORT_DIR"/**/NodeChurnTimings_*.json \
           "$CL2_REPORT_DIR"/**/ApiserverFailureTimings_*.json \
           "$CL2_REPORT_DIR"/**/IsolationChurnTimings_*.json \
@@ -628,10 +629,11 @@ steps:
             "$CL2_REPORT_DIR"/**/scenario-policy.json \
             "$CL2_REPORT_DIR"/**/scenario-evidence.json \
             "$CL2_REPORT_DIR"/**/mock-layer-reconcile-*.json \
-            "$CL2_REPORT_DIR"/**/scenario-cleanup-reconcile.json \
+            "$CL2_REPORT_DIR"/**/preserved-worker-reconcile-*.json \
+            "$CL2_REPORT_DIR"/**/scenario-cleanup-reconcile*.json \
             "$CL2_REPORT_DIR"/**/artifact-preservation-summary.json \
             "$CL2_REPORT_DIR"/**/artifact-preservation-final-summary.json \
-            "$CL2_REPORT_DIR"/**/scenario-health-gate.json \
+            "$CL2_REPORT_DIR"/**/scenario-health-*.json \
             "$CL2_REPORT_DIR"/**/NodeChurnTimings_*.json \
             "$CL2_REPORT_DIR"/**/ApiserverFailureTimings_*.json \
             "$CL2_REPORT_DIR"/**/IsolationChurnTimings_*.json \
@@ -674,7 +676,8 @@ steps:
         while IFS= read -r -d '' diagnostic_file; do
           rel=${diagnostic_file#"$CL2_REPORT_DIR/"}
           scenario_seg=$(echo "$rel" | cut -d/ -f1)
-          if scenario_artifacts_already_preserved "$scenario_seg"; then
+          if scenario_artifacts_already_preserved "$scenario_seg" &&
+             [[ "$rel" != */mock-layer-diagnostics/health-repair/* ]]; then
             skipped_preserved_count=$((skipped_preserved_count + 1))
             continue
           fi

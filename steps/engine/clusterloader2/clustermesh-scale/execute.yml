@@ -95,6 +95,13 @@ steps:
       export CL2_SUITE_TOTAL_BUDGET_SECONDS="${SUITE_TOTAL_BUDGET_SECONDS:-0}"
       export CL2_SUITE_FINALIZATION_RESERVE_SECONDS="${SUITE_FINALIZATION_RESERVE_SECONDS:-0}"
       export CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS="${CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-${HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-1800}}"
+      export CL2_HEALTH_GATE_CYCLE_TIMEOUT_SECONDS="${CL2_HEALTH_GATE_CYCLE_TIMEOUT_SECONDS:-1800}"
+      export CL2_HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS="${CL2_HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS:-${HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS:-180}}"
+      export CL2_HEALTH_GATE_COMPLETION_MARGIN_SECONDS="${CL2_HEALTH_GATE_COMPLETION_MARGIN_SECONDS:-${HEALTH_GATE_COMPLETION_MARGIN_SECONDS:-5}}"
+      export CL2_HEALTH_GATE_REPAIR_ENABLED="${CL2_HEALTH_GATE_REPAIR_ENABLED:-false}"
+      export CL2_HEALTH_GATE_INITIAL_CYCLES="${CL2_HEALTH_GATE_INITIAL_CYCLES:-1}"
+      export CL2_HEALTH_GATE_MAX_REPAIR_ROLES="${CL2_HEALTH_GATE_MAX_REPAIR_ROLES:-25}"
+      export CL2_HEALTH_GATE_WORKER_REPAIR_BUDGET_SECONDS="${CL2_HEALTH_GATE_WORKER_REPAIR_BUDGET_SECONDS:-3600}"
       # Phase 4b — Scenario #6 (Upper Bound / Saturation) knobs.
       # upper-bound.yaml consumes these via CL2's DefaultParam template
       # func; non-saturation scenarios ignore them. Defaults mirror
@@ -486,14 +493,34 @@ steps:
         echo $(( _prewait + _ready + _count * (_interval + _peer + _per_iter_overhead) + _margin ))
       }
 
-      scenario_post_budget_seconds() {
-        local _quiet _artifact _diag _mock_reconcile _cleanup_reconcile
+      scenario_health_gate_timeout_seconds() {
+        local _quiet _concurrency _cluster_timeout _waves _configured _minimum
         _quiet=$(scenario_quiet_window_seconds "$1")
+        if [ "$cluster_count" -ge 50 ]; then
+          _concurrency=12
+          _cluster_timeout="$CL2_HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS"
+        else
+          _concurrency="$cluster_count"
+          _cluster_timeout=60
+        fi
+        _waves=$(( (cluster_count + _concurrency - 1) / _concurrency ))
+        _configured=$(( _quiet + CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS ))
+        _minimum=$(( 2 * _waves * _cluster_timeout + _quiet + CL2_HEALTH_GATE_COMPLETION_MARGIN_SECONDS ))
+        if [ "$_configured" -gt "$_minimum" ]; then
+          echo "$_configured"
+        else
+          echo "$_minimum"
+        fi
+      }
+
+      scenario_post_budget_seconds() {
+        local _health _artifact _diag _mock_reconcile _cleanup_reconcile
+        _health=$(scenario_health_gate_timeout_seconds "$1")
         _artifact=$(scenario_artifact_budget_seconds)
         _diag=$(scenario_diag_budget_seconds)
         _mock_reconcile=$(( 2 * $(scenario_mock_reconcile_budget_seconds) ))
         _cleanup_reconcile=$(scenario_cleanup_reconcile_budget_seconds)
-        echo $(( _quiet + CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS + _artifact + _diag + _mock_reconcile + _cleanup_reconcile ))
+        echo $(( _health + _artifact + _diag + _mock_reconcile + _cleanup_reconcile ))
       }
 
       # Scenarios that drive their stimulus via node-churner.sh on the AzDO
@@ -535,18 +562,31 @@ steps:
       # Reconcile the persisted mock layer before and after each scenario.
       run_mock_layer_reconcile() {
         local _label="$1" _output="$2"
+        local _clusters="${3:-$HOME/.kube/clustermesh-clusters.json}"
+        local _budget_override="${4:-}"
         if [ "${CL2_MOCK_MODE:-false}" != "true" ]; then
           return 0
         fi
         mkdir -p "$(dirname "$_output")"
-        local _concurrency
-        if [ "$cluster_count" -ge 50 ]; then
+        local _concurrency _target_count
+        _target_count=$(jq 'length' "$_clusters")
+        if [ "$_target_count" -eq 0 ]; then
+          echo "mock-layer-reconcile (${_label}): no clusters selected"
+          return 0
+        fi
+        if [ "$_target_count" -eq "$cluster_count" ] && [ "$cluster_count" -lt 50 ]; then
+          _concurrency="$cluster_count"
+        elif [ "$_target_count" -gt 12 ]; then
           _concurrency=12
         else
-          _concurrency="$cluster_count"
+          _concurrency="$_target_count"
         fi
         local _budget
-        _budget=$(scenario_mock_reconcile_budget_seconds)
+        if [ -n "$_budget_override" ]; then
+          _budget="$_budget_override"
+        else
+          _budget=$(scenario_mock_reconcile_budget_seconds)
+        fi
         local _attempts _settle_seconds
         if [ "$cluster_count" -ge 50 ]; then
           _attempts="${CL2_MOCK_RECONCILE_ATTEMPTS:-15}"
@@ -558,7 +598,7 @@ steps:
         local _rc=0
         timeout --signal=TERM --kill-after=30s "${_budget}s" \
           python3 "$MOCK_RECONCILER_SCRIPT" \
-          --clusters "$HOME/.kube/clustermesh-clusters.json" \
+          --clusters "$_clusters" \
           --state-root "$HOME/.kube/mock-layer-state/${RUN_ID}" \
           --run-id "${RUN_ID}" \
           --expected-mock-count "${CL2_MOCK_NODE_COUNT}" \
@@ -652,6 +692,38 @@ steps:
           echo "##vso[task.logissue type=error;] scenario-cleanup-reconcile failed rc=${_rc} for ${SCENARIO}; see ${_output} (scenario-health-gate.sh remains authoritative)"
         fi
         return "$_rc"
+      }
+
+      run_preserved_worker_reconcile() {
+        local _clusters="$1" _output="$2"
+        local _budget="${3:-$CL2_HEALTH_GATE_WORKER_REPAIR_BUDGET_SECONDS}"
+        if [ "${CLUSTERMESH_PRESERVED_WORKER_RECOVERY_ENABLED:-false}" != "true" ]; then
+          return 0
+        fi
+        bash "$PRESERVED_WORKER_RECONCILE_WRAPPER" \
+          "$_clusters" "$_output" "$_budget"
+      }
+
+      run_scenario_health_gate() {
+        local _summary="$1" _timeout="$2" _max_cycles="${3:-0}"
+        local -a _cycle_args=()
+        if [ "$_max_cycles" -gt 0 ]; then
+          _cycle_args=(--max-cycles "$_max_cycles")
+        fi
+        bash "$HEALTH_GATE_SCRIPT" \
+          --clusters "$HOME/.kube/clustermesh-clusters.json" \
+          --scenario "$SCENARIO" \
+          --expected-mock-count "$expected_mock_count" \
+          --expected-remote-count $(( cluster_count - 1 )) \
+          --timeout-seconds "$_timeout" \
+          --cycle-timeout-seconds "$cleanup_cycle_timeout_seconds" \
+          --cluster-timeout-seconds "$cleanup_cluster_timeout_seconds" \
+          --quiet-window-seconds "$cleanup_quiet_seconds" \
+          --poll-interval-seconds 30 \
+          --concurrency "$cleanup_concurrency" \
+          --completion-margin-seconds "$CL2_HEALTH_GATE_COMPLETION_MARGIN_SECONDS" \
+          "${_cycle_args[@]}" \
+          --summary-file "$_summary"
       }
 
       LAST_PROCESS_GROUP_PID=""
@@ -1935,32 +2007,152 @@ steps:
           fi
 
           cleanup_quiet_seconds=$(scenario_quiet_window_seconds "$SCENARIO")
-          cleanup_timeout_seconds=$(( cleanup_quiet_seconds + CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS ))
+          cleanup_timeout_seconds=$(scenario_health_gate_timeout_seconds "$SCENARIO")
           if [ "$cluster_count" -ge 50 ]; then
-            cleanup_cycle_timeout_seconds="${CL2_HEALTH_GATE_CYCLE_TIMEOUT_SECONDS:-900}"
+            cleanup_cycle_timeout_seconds="${CL2_HEALTH_GATE_CYCLE_TIMEOUT_SECONDS:-1800}"
+            cleanup_cluster_timeout_seconds="${CL2_HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS:-180}"
             cleanup_concurrency=12
           else
             cleanup_cycle_timeout_seconds=60
+            cleanup_cluster_timeout_seconds=60
             cleanup_concurrency="$cluster_count"
           fi
+          cleanup_wave_count=$(( (cluster_count + cleanup_concurrency - 1) / cleanup_concurrency ))
+          cleanup_full_cycle_min_seconds=$(( cleanup_wave_count * cleanup_cluster_timeout_seconds ))
+          health_final_reserve_seconds=$(( 2 * cleanup_full_cycle_min_seconds + cleanup_quiet_seconds + CL2_HEALTH_GATE_COMPLETION_MARGIN_SECONDS ))
           cleanup_summary="${CL2_REPORT_DIR}/${SCENARIO}/scenario-health-gate.json"
           # Always prove baseline recovery, even after measurement failure.
           cleanup_gate_rc=0
+          health_gate_deadline_epoch=$(( $(date +%s) + cleanup_timeout_seconds ))
+          health_repair_valid=true
+          health_repair_attempted=false
+          health_repair_role_count=0
+          health_observation_rc=0
           expected_mock_count=0
           if [ "$CL2_MOCK_MODE" = "true" ]; then
             expected_mock_count="$CL2_MOCK_NODE_COUNT"
           fi
-          bash "$HEALTH_GATE_SCRIPT" \
-            --clusters "$HOME/.kube/clustermesh-clusters.json" \
-            --scenario "$SCENARIO" \
-            --expected-mock-count "$expected_mock_count" \
-            --expected-remote-count $(( cluster_count - 1 )) \
-            --timeout-seconds "$cleanup_timeout_seconds" \
-            --cycle-timeout-seconds "$cleanup_cycle_timeout_seconds" \
-            --quiet-window-seconds "$cleanup_quiet_seconds" \
-            --poll-interval-seconds 30 \
-            --concurrency "$cleanup_concurrency" \
-            --summary-file "$cleanup_summary" || cleanup_gate_rc=$?
+          health_gate_complete=false
+          if [ "$CL2_HEALTH_GATE_REPAIR_ENABLED" = "true" ]; then
+            health_observation_summary="${CL2_REPORT_DIR}/${SCENARIO}/scenario-health-gate-observation.json"
+            health_repair_inventory="${CL2_REPORT_DIR}/${SCENARIO}/scenario-health-repair-clusters.json"
+            health_observation_timeout=$(( CL2_HEALTH_GATE_INITIAL_CYCLES * cleanup_cycle_timeout_seconds + 60 ))
+            health_remaining_seconds=$(( health_gate_deadline_epoch - $(date +%s) ))
+            if [ "$health_observation_timeout" -gt "$health_remaining_seconds" ]; then
+              health_observation_timeout="$health_remaining_seconds"
+            fi
+            run_scenario_health_gate \
+              "$health_observation_summary" \
+              "$health_observation_timeout" \
+              "$CL2_HEALTH_GATE_INITIAL_CYCLES" || health_observation_rc=$?
+
+            if [ "$health_observation_rc" -eq 0 ]; then
+              if cp "$health_observation_summary" "$cleanup_summary"; then
+                health_gate_complete=true
+              else
+                health_observation_rc=1
+                echo "##vso[task.logissue type=warning;] ${SCENARIO}: unable to checkpoint the successful initial health gate; running final certification"
+              fi
+            elif [ "$health_observation_rc" -eq 3 ] &&
+                 jq -e \
+                   --argjson expected "$cluster_count" \
+                   --argjson cycles "$CL2_HEALTH_GATE_INITIAL_CYCLES" \
+                   --slurpfile inventory "$HOME/.kube/clustermesh-clusters.json" '
+                     .termination_reason == "cycle-limit" and
+                     .completed_cycle_count == $cycles and
+                     (.clusters | type == "array" and length == $expected) and
+                     ([.clusters[].role] | unique | length) == $expected and
+                     ([.clusters[].role] | sort) ==
+                       ($inventory[0] | map(.role) | sort)
+                   ' "$health_observation_summary" >/dev/null 2>&1; then
+              if jq \
+                  --slurpfile observations "$health_observation_summary" '
+                    [.[]
+                     | .role as $role
+                     | select(any($observations[0].clusters[];
+                         .role == $role and (.healthy | not)))]
+                  ' "$HOME/.kube/clustermesh-clusters.json" \
+                  > "${health_repair_inventory}.tmp" &&
+                 mv "${health_repair_inventory}.tmp" "$health_repair_inventory"; then
+                health_repair_role_count=$(jq 'length' "$health_repair_inventory")
+                if [ "$health_repair_role_count" -gt 0 ]; then
+                  health_repair_attempted=true
+                  echo "${SCENARIO}: auditing real workers after ${health_repair_role_count} unhealthy role observation(s)"
+                  health_worker_output="${CL2_REPORT_DIR}/${SCENARIO}/preserved-worker-reconcile-health-repair.json"
+                  health_mock_budget=0
+                  if [ "$CL2_MOCK_MODE" = "true" ] &&
+                     [ "$health_repair_role_count" -le "$CL2_HEALTH_GATE_MAX_REPAIR_ROLES" ]; then
+                    health_mock_budget=$(scenario_mock_reconcile_budget_seconds)
+                  fi
+                  if [ "${CLUSTERMESH_PRESERVED_WORKER_RECOVERY_ENABLED:-false}" = "true" ]; then
+                    health_remaining_seconds=$(( health_gate_deadline_epoch - $(date +%s) ))
+                    health_worker_required_seconds=$(( CL2_HEALTH_GATE_WORKER_REPAIR_BUDGET_SECONDS + 60 ))
+                    health_mock_required_seconds=0
+                    if [ "$health_mock_budget" -gt 0 ]; then
+                      health_mock_required_seconds=$((health_mock_budget + 30))
+                    fi
+                    if [ "$health_remaining_seconds" -ge \
+                         $((health_final_reserve_seconds + health_worker_required_seconds + health_mock_required_seconds)) ]; then
+                      if ! run_preserved_worker_reconcile \
+                          "$HOME/.kube/clustermesh-clusters.json" \
+                          "$health_worker_output" \
+                          "$CL2_HEALTH_GATE_WORKER_REPAIR_BUDGET_SECONDS"; then
+                        health_repair_valid=false
+                      fi
+                    else
+                      health_repair_valid=false
+                      echo "##vso[task.logissue type=error;] ${SCENARIO}: insufficient shared health budget for bounded real-worker repair plus final certification"
+                    fi
+                  fi
+                  if [ "$health_repair_valid" = "true" ] &&
+                     [ "$CL2_MOCK_MODE" = "true" ] &&
+                     [ "$health_repair_role_count" -le "$CL2_HEALTH_GATE_MAX_REPAIR_ROLES" ]; then
+                    echo "${SCENARIO}: reconciling ${health_repair_role_count} unhealthy mock role(s) before final health certification"
+                    health_mock_output="${CL2_REPORT_DIR}/${SCENARIO}/mock-layer-reconcile-health-repair.json"
+                    health_remaining_seconds=$(( health_gate_deadline_epoch - $(date +%s) ))
+                    if [ "$health_remaining_seconds" -ge \
+                         $((health_final_reserve_seconds + health_mock_budget + 30)) ]; then
+                      if ! run_mock_layer_reconcile \
+                          "health-repair" "$health_mock_output" \
+                          "$health_repair_inventory" "$health_mock_budget"; then
+                        health_repair_valid=false
+                        mock_reconcile_valid=false
+                      fi
+                    else
+                      health_repair_valid=false
+                      mock_reconcile_valid=false
+                      echo "##vso[task.logissue type=error;] ${SCENARIO}: insufficient shared health budget for bounded mock repair plus final certification"
+                    fi
+                  else
+                    if [ "$health_repair_valid" != "true" ]; then
+                      echo "##vso[task.logissue type=warning;] ${SCENARIO}: skipping mock repair after an unsafe real-worker repair result"
+                    elif [ "$CL2_MOCK_MODE" = "true" ] &&
+                         [ "$health_repair_role_count" -gt "$CL2_HEALTH_GATE_MAX_REPAIR_ROLES" ]; then
+                      echo "##vso[task.logissue type=warning;] ${SCENARIO}: ${health_repair_role_count} unhealthy roles exceed the targeted mock-repair limit ${CL2_HEALTH_GATE_MAX_REPAIR_ROLES}; refusing broad mock mutation and continuing to strict observation"
+                    fi
+                  fi
+                else
+                  echo "${SCENARIO}: initial full observation found no unhealthy roles; proceeding to quiet-window certification"
+                fi
+              else
+                rm -f "${health_repair_inventory}.tmp"
+                echo "##vso[task.logissue type=warning;] ${SCENARIO}: unable to derive targeted repair inventory; continuing to strict observation"
+              fi
+            else
+              echo "##vso[task.logissue type=warning;] ${SCENARIO}: initial health observation was not usable for targeted repair (rc=${health_observation_rc}); continuing to strict observation"
+            fi
+          fi
+
+          if [ "$health_gate_complete" != "true" ]; then
+            health_remaining_seconds=$(( health_gate_deadline_epoch - $(date +%s) ))
+            if [ "$health_remaining_seconds" -gt 0 ]; then
+              run_scenario_health_gate \
+                "$cleanup_summary" "$health_remaining_seconds" || cleanup_gate_rc=$?
+            else
+              cleanup_gate_rc=1
+              echo "##vso[task.logissue type=error;] ${SCENARIO}: post-scenario repair consumed the complete health budget before final certification"
+            fi
+          fi
 
           # Node churn also requires its pool-restoration finalizer.
           infrastructure_healthy=true
@@ -1969,6 +2161,10 @@ steps:
             echo "##vso[task.logissue type=error;] ${SCENARIO}: post-scenario health gate failed"
           fi
           recovery_valid="$infrastructure_healthy"
+          if [ "$health_repair_valid" != "true" ]; then
+            recovery_valid=false
+            echo "##vso[task.logissue type=error;] ${SCENARIO}: targeted post-scenario repair did not complete safely"
+          fi
           if is_node_churn_scenario "$SCENARIO" && [ "$_cleanup_failed" = "true" ]; then
             recovery_valid=false
             echo "##vso[task.logissue type=error;] ${SCENARIO}: node-churner cleanup_failed=true; recovery not verified"
@@ -2012,6 +2208,11 @@ steps:
           jq \
             --argjson cleanup_gate_rc "$cleanup_gate_rc" \
             --argjson cleanup_quiet_seconds "$cleanup_quiet_seconds" \
+            --arg health_repair_enabled "$CL2_HEALTH_GATE_REPAIR_ENABLED" \
+            --argjson health_observation_rc "$health_observation_rc" \
+            --argjson health_repair_role_count "$health_repair_role_count" \
+            --argjson health_repair_attempted "$health_repair_attempted" \
+            --argjson health_repair_valid "$health_repair_valid" \
             --argjson recovery_valid "$recovery_valid" \
             --argjson infrastructure_healthy "$infrastructure_healthy" \
             --argjson artifact_preserved "$artifact_preserved" \
@@ -2023,6 +2224,11 @@ steps:
             '.[-1] += {
               cleanup_gate_rc: $cleanup_gate_rc,
               cleanup_quiet_window_seconds: $cleanup_quiet_seconds,
+              health_repair_enabled: ($health_repair_enabled == "true"),
+              health_observation_rc: $health_observation_rc,
+              health_repair_role_count: $health_repair_role_count,
+              health_repair_attempted: $health_repair_attempted,
+              health_repair_valid: $health_repair_valid,
               recovery_valid: $recovery_valid,
               infrastructure_healthy: $infrastructure_healthy,
               artifact_preserved: $artifact_preserved,
@@ -2320,6 +2526,8 @@ steps:
       SCENARIO_POLICY_SCRIPT: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/scenario_policy.py
       SCENARIO_EVIDENCE_SCRIPT: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/scenario_evidence.py
       MOCK_RECONCILER_SCRIPT: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/mock_layer_reconcile.py
+      PRESERVED_WORKER_RECONCILER: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_worker_reconcile.py
+      PRESERVED_WORKER_RECONCILE_WRAPPER: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/config/run-preserved-worker-reconcile.sh
       SCENARIO_CLEANUP_RECONCILER: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/scenario_cleanup_reconcile.py
       WORKER_SCRIPT: $(Pipeline.Workspace)/s/steps/engine/clusterloader2/clustermesh-scale/run-cl2-on-cluster.sh
       CL2_IMAGE: ${{ parameters.engine_input.image }}

@@ -22,8 +22,8 @@ snapshot_target="${CL2_PROM_SNAPSHOT_TARGET:-artifact}"
 # more, from execute.yml, AFTER the final scenario-policy.json/health-gate
 # metadata for this scenario is on disk -- it re-uploads just the small
 # durable-state files (final scenario-policy.json, scenario-evidence.json,
-# scenario-health-gate.json, mock-layer-reconcile-{before,after}.json,
-# timing/evidence JSON, and the earlier artifact-preservation-summary.json)
+# health observation/repair/final-gate JSON, mock and real-worker reconcile
+# summaries, timing/evidence JSON, and the earlier preservation summary)
 # so Blob storage has the FINAL suite_continue/recovery fields even if the
 # job dies before the end-of-stage collect() step runs. It writes to a
 # DISTINCT summary file so it never races with (or overwrites) the early
@@ -678,8 +678,10 @@ lifecycle_find_names=(
   -o -name 'scenario-policy.json'
   -o -name 'scenario-evidence.json'
   -o -name 'mock-layer-reconcile-*.json'
+  -o -name 'preserved-worker-reconcile-*.json'
   -o -name 'cilium-policy-guard-*.json'
-  -o -name 'scenario-cleanup-reconcile.json'
+  -o -name 'scenario-cleanup-reconcile*.json'
+  -o -name 'scenario-health-*.json'
   -o -name 'NodeChurnTimings_*.json'
   -o -name 'ApiserverFailureTimings_*.json'
   -o -name 'IsolationChurnTimings_*.json'
@@ -694,10 +696,11 @@ if [ "${lifecycle_only,,}" = "true" ]; then
   lifecycle_find_names=(
     -name 'scenario-policy.json'
     -o -name 'scenario-evidence.json'
-    -o -name 'scenario-health-gate.json'
+    -o -name 'scenario-health-*.json'
     -o -name 'mock-layer-reconcile-*.json'
+    -o -name 'preserved-worker-reconcile-*.json'
     -o -name 'cilium-policy-guard-*.json'
-    -o -name 'scenario-cleanup-reconcile.json'
+    -o -name 'scenario-cleanup-reconcile*.json'
     -o -name 'NodeChurnTimings_*.json'
     -o -name 'ApiserverFailureTimings_*.json'
     -o -name 'IsolationChurnTimings_*.json'

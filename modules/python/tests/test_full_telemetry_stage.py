@@ -732,10 +732,17 @@ def test_n100_resume_bounds_pre_telemetry_reconcile_concurrency():
 
     assert 'CL2_MOCK_WORKER_RECONCILE_CONCURRENCY: "12"' in stage
     assert 'CL2_MOCK_WORKER_RECONCILE_LOCK_WAIT_SECONDS: "900"' in stage
-    assert 'CL2_HEALTH_GATE_CYCLE_TIMEOUT_SECONDS: "1200"' in stage
-    assert 'CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS: "3000"' in stage
-    assert 'HEALTH_GATE_CILIUM_PROBE_ATTEMPTS: "2"' in stage
-    assert 'HEALTH_GATE_CILIUM_PROBE_RETRY_SECONDS: "2"' in stage
+    assert 'CL2_HEALTH_GATE_CYCLE_TIMEOUT_SECONDS: "1800"' in stage
+    assert 'CL2_HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS: "180"' in stage
+    assert 'CL2_HEALTH_GATE_COMPLETION_MARGIN_SECONDS: "60"' in stage
+    assert 'CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS: "10800"' in stage
+    assert 'CL2_HEALTH_GATE_REPAIR_ENABLED: "true"' in stage
+    assert 'CL2_HEALTH_GATE_INITIAL_CYCLES: "1"' in stage
+    assert 'CL2_HEALTH_GATE_MAX_REPAIR_ROLES: "25"' in stage
+    assert 'CL2_HEALTH_GATE_WORKER_REPAIR_BUDGET_SECONDS: "3600"' in stage
+    assert 'HEALTH_GATE_KUBECTL_REQUEST_TIMEOUT_SECONDS: "20"' in stage
+    assert 'HEALTH_GATE_CILIUM_PROBE_ATTEMPTS: "3"' in stage
+    assert 'HEALTH_GATE_CILIUM_PROBE_RETRY_SECONDS: "10"' in stage
     assert (
         "MOCK_HANDOFF_CNI_RECOVERY_ROLES: "
         "${{ parameters.scaleDebugMockCniRecoveryRoles }}"
@@ -780,7 +787,33 @@ def test_cilium_policy_guard_runs_before_each_scenario():
     assert "ensure-cilium-policy.sh" in execute
     assert 'CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS="${' in execute
     assert "HEALTH_GATE_TIMEOUT_BUFFER_SECONDS:-1800" in execute
-    assert 'CL2_HEALTH_GATE_CYCLE_TIMEOUT_SECONDS:-900' in execute
+    assert 'CL2_HEALTH_GATE_CYCLE_TIMEOUT_SECONDS:-1800' in execute
+    assert 'CL2_HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS:-180' in execute
+    assert 'CL2_HEALTH_GATE_COMPLETION_MARGIN_SECONDS="${' in execute
+    assert 'CL2_HEALTH_GATE_REPAIR_ENABLED="${' in execute
+    assert "--max-cycles" in execute
+    assert "scenario-health-gate-observation.json" in execute
+    assert "scenario-health-repair-clusters.json" in execute
+    assert "run_preserved_worker_reconcile" in execute
+    assert "preserved-worker-reconcile-health-repair.json" in execute
+    assert "mock-layer-reconcile-health-repair.json" in execute
+    assert "health_gate_deadline_epoch" in execute
+    assert "health_final_reserve_seconds" in execute
+    assert "health_worker_required_seconds" in execute
+    assert "health_mock_required_seconds" in execute
+    assert (
+        'if [ "$_target_count" -eq "$cluster_count" ] && '
+        '[ "$cluster_count" -lt 50 ]; then'
+        in execute
+    )
+    final_health_gate = 'if [ "$health_gate_complete" != "true" ]; then'
+    assert (
+        execute.index("scenario-health-gate-observation.json")
+        < execute.index("preserved-worker-reconcile-health-repair.json")
+        < execute.index("mock-layer-reconcile-health-repair.json")
+        < execute.index(final_health_gate)
+    )
+    assert "cleanup_concurrency=12" in execute
 
 
 def test_upper_bound_collection_uses_execution_defaults():
@@ -1312,9 +1345,8 @@ def test_collect_yml_lifecycle_files_stage_unconditionally_when_snapshots_disabl
     assert "eq(variables['cl2_prom_snapshot_enabled'], 'true')" in upload_condition
 
 
-def test_collect_yml_lifecycle_glob_patterns_include_final_summary():
-    """Fix: both lifecycle glob loops (local staging + blob upload) must
-    pick up the new artifact-preservation-final-summary.json file."""
+def test_collect_yml_lifecycle_globs_include_late_repair_evidence():
+    """Both local staging and blob fallback include late lifecycle files."""
     template = SNAPSHOT_TEMPLATE_PATH.read_text(encoding="utf-8")
 
     assert (
@@ -1326,4 +1358,23 @@ def test_collect_yml_lifecycle_glob_patterns_include_final_summary():
     assert (
         template.count('"$CL2_REPORT_DIR"/**/artifact-preservation-summary.json')
         == 2
+    )
+    assert (
+        template.count('"$CL2_REPORT_DIR"/**/scenario-health-*.json') == 2
+    )
+    assert (
+        template.count(
+            '"$CL2_REPORT_DIR"/**/preserved-worker-reconcile-*.json'
+        )
+        == 2
+    )
+    assert (
+        template.count(
+            '"$CL2_REPORT_DIR"/**/scenario-cleanup-reconcile*.json'
+        )
+        == 2
+    )
+    assert (
+        '[[ "$rel" != */mock-layer-diagnostics/health-repair/* ]]'
+        in template
     )

@@ -12,9 +12,13 @@ Options override the corresponding environment variables:
   --expected-remote-count N    EXPECTED_REMOTE_COUNT
   --timeout-seconds N          HEALTH_GATE_TIMEOUT_SECONDS
   --cycle-timeout-seconds N    HEALTH_GATE_CYCLE_TIMEOUT_SECONDS
+  --cluster-timeout-seconds N  HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS
   --quiet-window-seconds N     HEALTH_GATE_QUIET_WINDOW_SECONDS
   --poll-interval-seconds N    HEALTH_GATE_POLL_INTERVAL_SECONDS
   --concurrency N              HEALTH_GATE_CONCURRENCY
+  --completion-margin-seconds N
+                               HEALTH_GATE_COMPLETION_MARGIN_SECONDS
+  --max-cycles N               HEALTH_GATE_MAX_CYCLES (0 means unlimited)
   --summary-file FILE          HEALTH_GATE_SUMMARY_FILE
 EOF
 }
@@ -25,9 +29,12 @@ expected_mock_count="${EXPECTED_MOCK_COUNT:-0}"
 expected_remote_count="${EXPECTED_REMOTE_COUNT:-}"
 timeout_seconds="${HEALTH_GATE_TIMEOUT_SECONDS:-600}"
 cycle_timeout_seconds="${HEALTH_GATE_CYCLE_TIMEOUT_SECONDS:-180}"
+cluster_timeout_seconds="${HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS:-120}"
 quiet_window_seconds="${HEALTH_GATE_QUIET_WINDOW_SECONDS:-60}"
 poll_interval_seconds="${HEALTH_GATE_POLL_INTERVAL_SECONDS:-10}"
 concurrency="${HEALTH_GATE_CONCURRENCY:-8}"
+completion_margin_seconds="${HEALTH_GATE_COMPLETION_MARGIN_SECONDS:-5}"
+max_cycles="${HEALTH_GATE_MAX_CYCLES:-0}"
 kubectl_request_timeout_seconds="${HEALTH_GATE_KUBECTL_REQUEST_TIMEOUT_SECONDS:-15}"
 cilium_probe_attempts="${HEALTH_GATE_CILIUM_PROBE_ATTEMPTS:-2}"
 cilium_probe_retry_seconds="${HEALTH_GATE_CILIUM_PROBE_RETRY_SECONDS:-2}"
@@ -55,6 +62,10 @@ while [ "$#" -gt 0 ]; do
       cycle_timeout_seconds="${2:?missing value for --cycle-timeout-seconds}"
       shift 2
       ;;
+    --cluster-timeout-seconds)
+      cluster_timeout_seconds="${2:?missing value for --cluster-timeout-seconds}"
+      shift 2
+      ;;
     --quiet-window-seconds)
       quiet_window_seconds="${2:?missing value for --quiet-window-seconds}"
       shift 2
@@ -65,6 +76,14 @@ while [ "$#" -gt 0 ]; do
       ;;
     --concurrency)
       concurrency="${2:?missing value for --concurrency}"
+      shift 2
+      ;;
+    --completion-margin-seconds)
+      completion_margin_seconds="${2:?missing value for --completion-margin-seconds}"
+      shift 2
+      ;;
+    --max-cycles)
+      max_cycles="${2:?missing value for --max-cycles}"
       shift 2
       ;;
     --summary-file)
@@ -100,8 +119,8 @@ if [ -z "$expected_remote_count" ]; then
 fi
 for value_name in \
   expected_mock_count expected_remote_count timeout_seconds cycle_timeout_seconds \
-  quiet_window_seconds poll_interval_seconds concurrency \
-  kubectl_request_timeout_seconds cilium_probe_attempts \
+  cluster_timeout_seconds quiet_window_seconds poll_interval_seconds concurrency \
+  completion_margin_seconds max_cycles kubectl_request_timeout_seconds cilium_probe_attempts \
   cilium_probe_retry_seconds; do
   value="${!value_name}"
   if ! [[ "$value" =~ ^[0-9]+$ ]]; then
@@ -111,11 +130,18 @@ for value_name in \
 done
 if [ "$timeout_seconds" -eq 0 ] ||
    [ "$cycle_timeout_seconds" -eq 0 ] ||
+   [ "$cluster_timeout_seconds" -eq 0 ] ||
    [ "$poll_interval_seconds" -eq 0 ] ||
    [ "$concurrency" -eq 0 ] ||
    [ "$kubectl_request_timeout_seconds" -eq 0 ] ||
    [ "$cilium_probe_attempts" -eq 0 ]; then
-  echo "timeout_seconds, cycle_timeout_seconds, poll_interval_seconds, concurrency, kubectl_request_timeout_seconds, and cilium_probe_attempts must be greater than zero." >&2
+  echo "timeout_seconds, cycle_timeout_seconds, cluster_timeout_seconds, poll_interval_seconds, concurrency, kubectl_request_timeout_seconds, and cilium_probe_attempts must be greater than zero." >&2
+  exit 2
+fi
+observation_wave_count=$(( (cluster_count + concurrency - 1) / concurrency ))
+minimum_fair_cycle_seconds=$(( observation_wave_count * cluster_timeout_seconds ))
+if [ "$cycle_timeout_seconds" -lt "$minimum_fair_cycle_seconds" ]; then
+  echo "cycle_timeout_seconds=${cycle_timeout_seconds} is too small for ${cluster_count} clusters at concurrency=${concurrency}; require at least ${minimum_fair_cycle_seconds}s (${observation_wave_count} waves x ${cluster_timeout_seconds}s)." >&2
   exit 2
 fi
 if ! command -v timeout >/dev/null 2>&1; then
@@ -142,20 +168,27 @@ mkdir -p "$state_dir"
 trap 'rm -rf "$state_dir"' EXIT
 last_observations_file="$state_dir/last-observations.json"
 printf '[]\n' > "$last_observations_file"
+cycle_clusters_file="$state_dir/cycle-clusters.json"
+if ! cp "$clusters_json" "$cycle_clusters_file"; then
+  echo "Unable to initialize health-cycle inventory: $cycle_clusters_file" >&2
+  exit 1
+fi
+cycle_scope="full"
 
 K_OUT=""
 K_ERROR=""
 active_cycle_deadline=0
+active_observation_deadline=0
 kube() {
   local kubeconfig="$1"
   local context="$2"
   shift 2
   local output rc now remaining request_timeout
   now=$(date +%s)
-  remaining=$((active_cycle_deadline - now))
+  remaining=$((active_observation_deadline - now))
   if [ "$remaining" -le 0 ]; then
     K_OUT=""
-    K_ERROR="observation cycle deadline exhausted before kubectl invocation"
+    K_ERROR="cluster observation deadline exhausted before kubectl invocation"
     return 1
   fi
   request_timeout="$kubectl_request_timeout_seconds"
@@ -175,7 +208,7 @@ kube() {
   K_OUT=""
   output=$(printf '%s' "$output" | tr '\n' ' ' | cut -c1-500)
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-    K_ERROR="kubectl timed out after ${remaining}s at the observation cycle deadline${output:+: $output}"
+    K_ERROR="kubectl timed out after ${remaining}s at the cluster observation deadline${output:+: $output}"
   else
     K_ERROR="$output"
   fi
@@ -204,6 +237,12 @@ observe_cluster() {
   kubeconfig=$(jq -r '.kubeconfig' <<<"$cluster")
   context=$(jq -r '.context // .name' <<<"$cluster")
   observed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local observation_started_epoch
+  observation_started_epoch=$(date +%s)
+  active_observation_deadline=$((observation_started_epoch + cluster_timeout_seconds))
+  if [ "$active_observation_deadline" -gt "$active_cycle_deadline" ]; then
+    active_observation_deadline="$active_cycle_deadline"
+  fi
 
   local failures='[]'
   local namespace_names='[]' namespace_count=0
@@ -528,7 +567,7 @@ observe_cluster() {
   cilium_agent_log="$state_dir/cilium-agents-${role}.log"
   rm -f "$cilium_agent_summary" "$cilium_agent_log"
   now=$(date +%s)
-  remaining=$((active_cycle_deadline - now))
+  remaining=$((active_observation_deadline - now))
   cilium_probe_rc=0
   if [ "$remaining" -le 0 ]; then
     cilium_probe_rc=1
@@ -724,6 +763,7 @@ write_failed_observation() {
 }
 
 collect_observations() {
+  local cycle_inventory="$1"
   local index=0 cluster output_file pid completed_pid wait_rc
   local -a pids=() remaining_pids=()
   rm -f "$state_dir"/observation-*.json
@@ -761,7 +801,7 @@ collect_observations() {
       done
       pids=("${remaining_pids[@]}")
     fi
-  done < <(jq -c '.[]' "$clusters_json")
+  done < <(jq -c '.[]' "$cycle_inventory")
 
   for pid in "${pids[@]}"; do
     wait "$pid" || true
@@ -774,6 +814,10 @@ started_epoch=$(date +%s)
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 deadline=$((started_epoch + timeout_seconds))
 stable_since=""
+completed_cycle_count=0
+last_completed_cycle_scope=""
+last_completed_cycle_cluster_count=0
+termination_reason="running"
 
 write_summary() {
   local success="$1"
@@ -792,13 +836,24 @@ write_summary() {
     --arg scenario "$scenario" \
     --argjson timeout_seconds "$timeout_seconds" \
     --argjson cycle_timeout_seconds "$cycle_timeout_seconds" \
+    --argjson cluster_timeout_seconds "$cluster_timeout_seconds" \
+    --argjson observation_wave_count "$observation_wave_count" \
+    --argjson minimum_fair_cycle_seconds "$minimum_fair_cycle_seconds" \
     --argjson quiet_window_seconds "$quiet_window_seconds" \
     --argjson poll_interval_seconds "$poll_interval_seconds" \
     --argjson concurrency "$concurrency" \
+    --argjson completion_margin_seconds "$completion_margin_seconds" \
+    --argjson max_cycles "$max_cycles" \
     --argjson kubectl_request_timeout_seconds "$kubectl_request_timeout_seconds" \
     --argjson expected_mock_count "$expected_mock_count" \
     --argjson expected_remote_count "$expected_remote_count" \
     --argjson stable_seconds "$stable_seconds" \
+    --argjson completed_cycle_count "$completed_cycle_count" \
+    --arg last_completed_cycle_scope "$last_completed_cycle_scope" \
+    --argjson last_completed_cycle_cluster_count "$last_completed_cycle_cluster_count" \
+    --arg termination_reason "$termination_reason" \
+    --arg cycle_scope "$cycle_scope" \
+    --argjson next_cycle_cluster_count "$(jq 'length' "$cycle_clusters_file")" \
     --slurpfile observation_documents "$last_observations_file" \
     '{
       schema_version: 1,
@@ -809,52 +864,121 @@ write_summary() {
       scenario: $scenario,
       timeout_seconds: $timeout_seconds,
       cycle_timeout_seconds: $cycle_timeout_seconds,
+      cluster_timeout_seconds: $cluster_timeout_seconds,
+      observation_wave_count: $observation_wave_count,
+      minimum_fair_cycle_seconds: $minimum_fair_cycle_seconds,
       quiet_window_seconds: $quiet_window_seconds,
       poll_interval_seconds: $poll_interval_seconds,
       concurrency: $concurrency,
+      completion_margin_seconds: $completion_margin_seconds,
+      max_cycles: $max_cycles,
       kubectl_request_timeout_seconds: $kubectl_request_timeout_seconds,
       expected_mock_count: $expected_mock_count,
       expected_remote_count: $expected_remote_count,
       quiet_window_basis: "continuous-health",
       stable_seconds: $stable_seconds,
+      completed_cycle_count: $completed_cycle_count,
+      last_completed_cycle_scope: $last_completed_cycle_scope,
+      last_completed_cycle_cluster_count: $last_completed_cycle_cluster_count,
+      termination_reason: $termination_reason,
+      next_cycle_scope: $cycle_scope,
+      next_cycle_cluster_count: $next_cycle_cluster_count,
       clusters: ($observation_documents[0] // [])
     }' > "$partial" &&
     mv "$partial" "$summary_file"
 }
 
-echo "Waiting for post-${scenario} ClusterMesh health across ${cluster_count} cluster(s): timeout=${timeout_seconds}s cycle=${cycle_timeout_seconds}s quiet=${quiet_window_seconds}s poll=${poll_interval_seconds}s concurrency=${concurrency}"
+echo "Waiting for post-${scenario} ClusterMesh health across ${cluster_count} cluster(s): timeout=${timeout_seconds}s cycle=${cycle_timeout_seconds}s cluster=${cluster_timeout_seconds}s waves=${observation_wave_count} fair_cycle_min=${minimum_fair_cycle_seconds}s quiet=${quiet_window_seconds}s poll=${poll_interval_seconds}s concurrency=${concurrency}"
 while true; do
   now=$(date +%s)
   if [ "$now" -ge "$deadline" ]; then
+    termination_reason="timeout"
     write_summary false || true
     echo "ClusterMesh scenario health gate timed out after ${timeout_seconds}s before starting another observation cycle; summary: $summary_file" >&2
     exit 1
   fi
   remaining=$((deadline - now))
+  cycle_cluster_count=$(jq 'length' "$cycle_clusters_file")
+  cycle_wave_count=$(( (cycle_cluster_count + concurrency - 1) / concurrency ))
+  cycle_minimum_seconds=$(( cycle_wave_count * cluster_timeout_seconds ))
+  required_remaining=$((cycle_minimum_seconds + completion_margin_seconds))
+  if [ "$max_cycles" -eq 0 ]; then
+    if [ "$cycle_scope" = "targeted" ] || [ -z "$stable_since" ]; then
+      required_remaining=$((required_remaining + quiet_window_seconds + minimum_fair_cycle_seconds))
+    else
+      stable_seconds=$((now - stable_since))
+      if [ "$stable_seconds" -lt "$quiet_window_seconds" ]; then
+        required_remaining=$((required_remaining + quiet_window_seconds - stable_seconds))
+      fi
+    fi
+  fi
+  if [ "$remaining" -lt "$required_remaining" ]; then
+    termination_reason="insufficient-time-for-fair-cycle"
+    write_summary false || true
+    echo "ClusterMesh scenario health gate has ${remaining}s remaining, below the ${required_remaining}s required for a fair ${cycle_scope} observation and final full certification; summary: $summary_file" >&2
+    exit 1
+  fi
   cycle_budget="$cycle_timeout_seconds"
   if [ "$cycle_budget" -gt "$remaining" ]; then
     cycle_budget="$remaining"
   fi
   active_cycle_deadline=$((now + cycle_budget))
+  cycle_started_epoch="$now"
+  cycle_number=$((completed_cycle_count + 1))
+  echo "Starting health observation cycle ${cycle_number}: scope=${cycle_scope} clusters=${cycle_cluster_count} waves=${cycle_wave_count} minimum=${cycle_minimum_seconds}s budget=${cycle_budget}s deadline=$(date -u -d "@${active_cycle_deadline}" +%Y-%m-%dT%H:%M:%SZ)"
   observations_partial="${last_observations_file}.partial"
-  if ! collect_observations > "$observations_partial"; then
+  if ! collect_observations "$cycle_clusters_file" > "$observations_partial"; then
     rm -f "$observations_partial"
+    termination_reason="observation-collection-failed"
     write_summary false || true
     echo "ClusterMesh scenario health observation collection failed; summary: $summary_file" >&2
     exit 1
   fi
-  if ! jq -e --argjson expected "$cluster_count" '
+  if ! jq -e --argjson expected "$cycle_cluster_count" '
       type == "array" and length == $expected
     ' "$observations_partial" >/dev/null 2>&1; then
     rm -f "$observations_partial"
+    termination_reason="observation-set-invalid"
     write_summary false || true
     echo "ClusterMesh scenario health observation set is incomplete or malformed; summary: $summary_file" >&2
     exit 1
   fi
-  if ! mv -f "$observations_partial" "$last_observations_file"; then
+  if [ "$cycle_scope" = "full" ]; then
+    if ! mv -f "$observations_partial" "$last_observations_file"; then
+      rm -f "$observations_partial"
+      termination_reason="observation-checkpoint-failed"
+      write_summary false || true
+      echo "ClusterMesh scenario health observations could not be checkpointed; summary: $summary_file" >&2
+      exit 1
+    fi
+  else
+    observations_merged="${last_observations_file}.merged"
+    if ! jq -s '
+        .[0] as $current
+        | .[1] as $updates
+        | ($updates | map({key: .role, value: .}) | from_entries) as $by_role
+        | $current
+        | map($by_role[.role] // .)
+      ' "$last_observations_file" "$observations_partial" \
+        > "$observations_merged" ||
+       ! mv -f "$observations_merged" "$last_observations_file"; then
+      rm -f "$observations_partial" "$observations_merged"
+      termination_reason="observation-checkpoint-failed"
+      write_summary false || true
+      echo "ClusterMesh targeted observations could not be merged; summary: $summary_file" >&2
+      exit 1
+    fi
     rm -f "$observations_partial"
+  fi
+  completed_cycle_count="$cycle_number"
+  last_completed_cycle_scope="$cycle_scope"
+  last_completed_cycle_cluster_count="$cycle_cluster_count"
+  now=$(date +%s)
+  echo "Completed health observation cycle ${completed_cycle_count} in $((now - cycle_started_epoch))s."
+  if [ "$now" -ge "$deadline" ]; then
+    termination_reason="timeout"
     write_summary false || true
-    echo "ClusterMesh scenario health observations could not be checkpointed; summary: $summary_file" >&2
+    echo "ClusterMesh scenario health gate reached its ${timeout_seconds}s deadline before cycle ${completed_cycle_count} could be certified; summary: $summary_file" >&2
     exit 1
   fi
 
@@ -867,33 +991,85 @@ while true; do
     # fingerprint, but exact count equality is not a health invariant. Any
     # actual unsafe transition is represented by healthy=false below and
     # resets the quiet window.
-    if [ -z "$stable_since" ]; then
-      echo "All clusters healthy; starting ${quiet_window_seconds}s continuous-health window."
-      stable_since="$now"
-    fi
-    stable_seconds=$((now - stable_since))
-    if [ "$stable_seconds" -ge "$quiet_window_seconds" ]; then
-      if ! write_summary true; then
-        echo "ClusterMesh scenario health passed but its summary could not be written: $summary_file" >&2
+    if [ "$cycle_scope" = "targeted" ]; then
+      if ! cp "$clusters_json" "${cycle_clusters_file}.tmp" ||
+         ! mv "${cycle_clusters_file}.tmp" "$cycle_clusters_file"; then
+        rm -f "${cycle_clusters_file}.tmp"
+        termination_reason="inventory-checkpoint-failed"
+        write_summary false || true
+        echo "Unable to restore the full health-cycle inventory; summary: $summary_file" >&2
         exit 1
       fi
-      echo "ClusterMesh scenario health gate passed after ${stable_seconds}s continuously healthy: $summary_file"
-      exit 0
+      cycle_scope="full"
+      stable_since="$now"
+      sleep_seconds="$quiet_window_seconds"
+      if [ "$sleep_seconds" -lt "$poll_interval_seconds" ]; then
+        sleep_seconds="$poll_interval_seconds"
+      fi
+      echo "Targeted unhealthy-role rechecks are healthy; waiting ${sleep_seconds}s before a full ${cluster_count}-cluster certification cycle."
+    else
+      if [ -z "$stable_since" ]; then
+        echo "All clusters healthy in a full cycle; starting ${quiet_window_seconds}s continuous-health window."
+        stable_since="$now"
+      fi
+      stable_seconds=$((now - stable_since))
+      if [ "$stable_seconds" -ge "$quiet_window_seconds" ]; then
+        termination_reason="healthy"
+        if ! write_summary true; then
+          echo "ClusterMesh scenario health passed but its summary could not be written: $summary_file" >&2
+          exit 1
+        fi
+        echo "ClusterMesh scenario health gate passed after ${stable_seconds}s continuously healthy: $summary_file"
+        exit 0
+      fi
+      echo "All clusters continuously healthy for ${stable_seconds}/${quiet_window_seconds}s."
+      sleep_seconds=$((quiet_window_seconds - stable_seconds))
+      if [ "$sleep_seconds" -lt "$poll_interval_seconds" ]; then
+        sleep_seconds="$poll_interval_seconds"
+      fi
     fi
-    echo "All clusters continuously healthy for ${stable_seconds}/${quiet_window_seconds}s."
   else
     stable_since=""
+    sleep_seconds="$poll_interval_seconds"
     jq -r '
       .[] | select(.healthy | not)
       | "\(.role) (\(.name)): \(.failures | join("; "))"
     ' "$last_observations_file" >&2
+    if ! jq --slurpfile observations "$last_observations_file" '
+        [.[]
+         | .role as $role
+         | select(any($observations[0][];
+             .role == $role and (.healthy | not)))]
+      ' "$clusters_json" > "${cycle_clusters_file}.tmp" ||
+       ! mv "${cycle_clusters_file}.tmp" "$cycle_clusters_file"; then
+      rm -f "${cycle_clusters_file}.tmp"
+      termination_reason="target-selection-failed"
+      write_summary false || true
+      echo "Unable to select unhealthy roles for targeted recheck; summary: $summary_file" >&2
+      exit 1
+    fi
+    cycle_scope="targeted"
+    echo "Next health cycle will target ${unhealthy_count} unhealthy role(s), then require a full certification cycle."
+  fi
+
+  if [ "$max_cycles" -gt 0 ] &&
+     [ "$completed_cycle_count" -ge "$max_cycles" ]; then
+    termination_reason="cycle-limit"
+    write_summary false || true
+    echo "ClusterMesh scenario health observation stopped after ${completed_cycle_count} configured cycle(s); summary: $summary_file"
+    exit 3
   fi
 
   now=$(date +%s)
   if [ "$now" -ge "$deadline" ]; then
+    termination_reason="timeout"
     write_summary false || true
     echo "ClusterMesh scenario health gate timed out after ${timeout_seconds}s; summary: $summary_file" >&2
     exit 1
   fi
-  sleep "$poll_interval_seconds"
+  remaining=$((deadline - now))
+  if [ "$sleep_seconds" -gt "$remaining" ]; then
+    sleep_seconds="$remaining"
+  fi
+  sleep "$sleep_seconds"
 done

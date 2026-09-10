@@ -2485,6 +2485,13 @@ EXECUTE_YML_PATH = (
     / "clustermesh-scale"
     / "execute.yml"
 )
+PRESERVED_WORKER_WRAPPER_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "clusterloader2"
+    / "clustermesh-scale"
+    / "config"
+    / "run-preserved-worker-reconcile.sh"
+)
 
 
 def _extract_bash_function(script_text, func_name):
@@ -2571,6 +2578,7 @@ def test_scenario_post_budget_seconds_reflects_bumped_mock_reconcile_budget():
             "scenario_diag_budget_seconds",
             "scenario_mock_reconcile_budget_seconds",
             "scenario_cleanup_reconcile_budget_seconds",
+            "scenario_health_gate_timeout_seconds",
             "scenario_post_budget_seconds",
         ],
         'cluster_count=2 scenario_post_budget_seconds "generic-scenario"',
@@ -2583,6 +2591,26 @@ def test_scenario_post_budget_seconds_reflects_bumped_mock_reconcile_budget():
     )
     # 60 + 900 + 600 + 300 + (2 * 300) + 315 = 2775.
     assert out == "2775"
+
+
+def test_large_health_gate_budget_covers_two_fair_cycles():
+    out = _run_budget_function(
+        [
+            "scenario_quiet_window_seconds",
+            "scenario_health_gate_timeout_seconds",
+        ],
+        'cluster_count=100 scenario_health_gate_timeout_seconds "generic-scenario"',
+        env={
+            "PATH": "/usr/bin:/bin",
+            "CL2_SHARE_INFRA_SETTLE_SECONDS": "300",
+            "CL2_HEALTH_GATE_TIMEOUT_BUFFER_SECONDS": "1800",
+            "CL2_HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS": "180",
+            "CL2_HEALTH_GATE_COMPLETION_MARGIN_SECONDS": "5",
+        },
+    )
+
+    # 2 * ceil(100 / 12) * 180 + 300 quiet + 5 completion margin.
+    assert out == "3545"
 
 
 def test_run_mock_layer_reconcile_timeout_fallback_is_syntactically_wired():
@@ -2602,3 +2630,21 @@ def test_run_mock_layer_reconcile_timeout_fallback_is_syntactically_wired():
     assert "mock-layer-reconcile[<role>] phase:" in function_src
     assert 'CL2_MOCK_RECONCILE_ATTEMPTS:-15' in function_src
     assert 'CL2_MOCK_RECONCILE_SETTLE_SECONDS:-45' in function_src
+
+
+def test_run_preserved_worker_reconcile_timeout_fallback_is_wired():
+    function_src = PRESERVED_WORKER_WRAPPER_PATH.read_text(encoding="utf-8")
+    syntax = subprocess.run(
+        ["bash", "-n", str(PRESERVED_WORKER_WRAPPER_PATH)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert syntax.returncode == 0, syntax.stderr
+    assert '"$rc" -eq 124' in function_src
+    assert '"$rc" -eq 137' in function_src
+    assert ".healthy = false" in function_src or "healthy: false" in function_src
+    assert ".timed_out = true" in function_src or "timed_out: true" in function_src
+    assert "budget_seconds" in function_src
+    assert "timeout_rc" in function_src

@@ -67,6 +67,14 @@ def _write_fake_tools(tmp_path: Path) -> tuple[Path, Path, Path]:
             set -euo pipefail
             args="$*"
             poll=$(cat "$FAKE_POLL")
+            kubeconfig="${KUBECONFIG:-}"
+            role="${kubeconfig##*/}"
+            role="${role%.config}"
+            if [[ "$args" == *"/fake/mesh-1.config"* ]]; then
+              role="mesh-1"
+            elif [[ "$args" == *"/fake/mesh-2.config"* ]]; then
+              role="mesh-2"
+            fi
 
             if [[ " $args " == *" get namespaces -o name "* ]]; then
               poll=$((poll + 1))
@@ -74,6 +82,11 @@ def _write_fake_tools(tmp_path: Path) -> tuple[Path, Path, Path]:
               if [ "$FAKE_MODE" = "transient-cleanup" ] && [ "$poll" -eq 1 ]; then
                 echo "Unable to connect to the server: connection reset" >&2
                 exit 1
+              fi
+              if [ "$FAKE_MODE" = "targeted-recheck" ] &&
+                 [ "$role" = "mesh-2" ] &&
+                 [ "$poll" -le "$FAKE_CLUSTER_COUNT" ]; then
+                printf '%s\\n' 'namespace/clustermesh-old'
               fi
               exit 0
             elif [[ " $args " == *" get containernetworklogs.acn.azure.com -o name "* ]]; then
@@ -157,17 +170,26 @@ def _write_fake_tools(tmp_path: Path) -> tuple[Path, Path, Path]:
                   '{"items":[{"metadata":{"name":"kwok-node-1","ownerReferences":[{"kind":"StatefulSet","name":"kwok-node","controller":true}]},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}},{"metadata":{"name":"kwok-node-2","ownerReferences":[{"kind":"StatefulSet","name":"kwok-node","controller":true}]},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}}]}'
               fi
             elif [[ " $args " == *" -n kube-system exec cilium-a -c cilium-agent -- cilium-dbg status -o json "* ]]; then
-              printf '%s\\n' '{"cluster-mesh":{"clusters":[]}}'
+              if [ "$FAKE_CLUSTER_COUNT" -eq 2 ] && [ "$role" = "mesh-1" ]; then
+                printf '%s\\n' '{"cluster-mesh":{"clusters":[{"name":"mesh-22","ready":true,"connected":true,"config":{"required":true,"retrieved":true}}]}}'
+              elif [ "$FAKE_CLUSTER_COUNT" -eq 2 ] && [ "$role" = "mesh-2" ]; then
+                printf '%s\\n' '{"cluster-mesh":{"clusters":[{"name":"mesh-11","ready":true,"connected":true,"config":{"required":true,"retrieved":true}}]}}'
+              else
+                printf '%s\\n' '{"cluster-mesh":{"clusters":[]}}'
+              fi
             elif [[ " $args " == *" get ciliumidentities.cilium.io -o name "* ]]; then
               echo 'No resources found' >&2
               count=5
-              if [ "$FAKE_MODE" = "instability" ] && [ "$poll" -ge 3 ]; then
+              if [ "$FAKE_MODE" = "instability" ] && [ "$poll" -ge 2 ]; then
                 count=6
               fi
               for ((i=1; i<=count; i++)); do
                 printf 'ciliumidentity.cilium.io/%s\\n' "$i"
               done
             elif [[ " $args " == *" get services -A -o json "* ]]; then
+              if [ "$FAKE_MODE" = "deadline-at-cycle-end" ]; then
+                printf '%s\\n' "$FAKE_DEADLINE_CLOCK" > "$FAKE_CLOCK"
+              fi
               printf '%s\\n' \
                 '{"items":[{"metadata":{"annotations":{"service.cilium.io/global":"true"}}}]}'
             else
@@ -190,6 +212,12 @@ def _run_gate(
     *,
     quiet_window: int,
     timeout: int,
+    cycle_timeout: int = 180,
+    cluster_timeout: int = 1,
+    cluster_count: int = 1,
+    concurrency: int = 8,
+    completion_margin: int = 1,
+    max_cycles: int = 0,
     mock_nodes_json: str | None = None,
     mock_agents_json: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict, int]:
@@ -199,11 +227,12 @@ def _run_gate(
         json.dumps(
             [
                 {
-                    "role": "mesh-1",
-                    "name": "cluster-a",
-                    "context": "cluster-a",
-                    "kubeconfig": "/fake/mesh-1.config",
+                    "role": f"mesh-{index}",
+                    "name": f"cluster-{index}",
+                    "context": f"cluster-{index}",
+                    "kubeconfig": f"/fake/mesh-{index}.config",
                 }
+                for index in range(1, cluster_count + 1)
             ]
         ),
         encoding="utf-8",
@@ -212,7 +241,14 @@ def _run_gate(
     cilium_identity_inventory = tmp_path / "cilium-identities.json"
     cilium_identity_inventory.write_text(
         json.dumps(
-            [{"role": "mesh-1", "cluster_name": "mesh-11", "cluster_id": 1}]
+            [
+                {
+                    "role": f"mesh-{index}",
+                    "cluster_name": f"mesh-{index}{index}",
+                    "cluster_id": index,
+                }
+                for index in range(1, cluster_count + 1)
+            ]
         ),
         encoding="utf-8",
     )
@@ -222,6 +258,8 @@ def _run_gate(
             "FAKE_CLOCK": str(clock_file),
             "FAKE_POLL": str(poll_file),
             "FAKE_MODE": mode,
+            "FAKE_CLUSTER_COUNT": str(cluster_count),
+            "FAKE_DEADLINE_CLOCK": str(timeout),
             "PATH": f"{fake_bin}:{environment['PATH']}",
             "CILIUM_AGENT_HEALTH_PROBE": str(CILIUM_AGENT_HEALTH_PROBE),
             "CILIUM_IDENTITY_INVENTORY": str(cilium_identity_inventory),
@@ -235,34 +273,49 @@ def _run_gate(
         mock_agents_path = tmp_path / "mock-agents.json"
         mock_agents_path.write_text(mock_agents_json, encoding="utf-8")
         environment["FAKE_MOCK_AGENTS_JSON"] = str(mock_agents_path)
+    command = [
+        "bash",
+        str(SCRIPT_PATH),
+        "--clusters",
+        str(inventory),
+        "--scenario",
+        "pod-churn-combined",
+        "--expected-mock-count",
+        "2",
+        "--expected-remote-count",
+        str(cluster_count - 1),
+        "--timeout-seconds",
+        str(timeout),
+        "--cycle-timeout-seconds",
+        str(cycle_timeout),
+        "--cluster-timeout-seconds",
+        str(cluster_timeout),
+        "--quiet-window-seconds",
+        str(quiet_window),
+        "--poll-interval-seconds",
+        "1",
+        "--concurrency",
+        str(concurrency),
+        "--completion-margin-seconds",
+        str(completion_margin),
+        "--summary-file",
+        str(summary_file),
+    ]
+    if max_cycles > 0:
+        command.extend(["--max-cycles", str(max_cycles)])
     result = subprocess.run(
-        [
-            "bash",
-            str(SCRIPT_PATH),
-            "--clusters",
-            str(inventory),
-            "--scenario",
-            "pod-churn-combined",
-            "--expected-mock-count",
-            "2",
-            "--expected-remote-count",
-            "0",
-            "--timeout-seconds",
-            str(timeout),
-            "--quiet-window-seconds",
-            str(quiet_window),
-            "--poll-interval-seconds",
-            "1",
-            "--summary-file",
-            str(summary_file),
-        ],
+        command,
         check=False,
         capture_output=True,
         text=True,
         env=environment,
         timeout=10,
     )
-    summary = json.loads(summary_file.read_text(encoding="utf-8"))
+    summary = (
+        json.loads(summary_file.read_text(encoding="utf-8"))
+        if summary_file.exists()
+        else {}
+    )
     poll_count = int(poll_file.read_text(encoding="utf-8"))
     return result, summary, poll_count
 
@@ -276,11 +329,15 @@ def test_health_gate_succeeds_after_transient_cleanup(tmp_path):
     )
 
     assert result.returncode == 0
-    assert poll_count == 4
+    assert poll_count == 3
     assert summary["success"] is True
     assert summary["infrastructure_healthy"] is True
     assert summary["scenario"] == "pod-churn-combined"
     assert summary["quiet_window_basis"] == "continuous-health"
+    assert summary["cluster_timeout_seconds"] == 1
+    assert summary["observation_wave_count"] == 1
+    assert summary["minimum_fair_cycle_seconds"] == 1
+    assert summary["completed_cycle_count"] >= 1
     assert summary["stable_seconds"] == 2
     assert summary["clusters"][0]["healthy"] is True
     assert summary["clusters"][0]["cleanup"]["scenario_namespace_count"] == 0
@@ -322,7 +379,7 @@ def test_health_gate_keeps_quiet_window_when_diagnostic_counts_change(
     )
 
     assert result.returncode == 0
-    assert poll_count == 3
+    assert poll_count == 2
     assert summary["success"] is True
     assert summary["quiet_window_basis"] == "continuous-health"
     assert summary["clusters"][0]["fingerprint"]["cilium_identities"] == 6
@@ -335,11 +392,11 @@ def test_health_gate_times_out_with_actionable_summary(tmp_path):
         tmp_path,
         "timeout",
         quiet_window=2,
-        timeout=2,
+        timeout=5,
     )
 
     assert result.returncode == 1
-    assert poll_count == 2
+    assert poll_count == 1
     assert summary["success"] is False
     cluster = summary["clusters"][0]
     assert cluster["healthy"] is False
@@ -348,8 +405,25 @@ def test_health_gate_times_out_with_actionable_summary(tmp_path):
         "ContainerNetworkLog resource(s) remain" in failure
         for failure in cluster["failures"]
     )
-    assert "ClusterMesh scenario health gate timed out" in result.stderr
-    assert "before starting another observation cycle" in result.stderr
+    assert summary["termination_reason"] == "insufficient-time-for-fair-cycle"
+    assert "below the" in result.stderr
+    assert "final full certification" in result.stderr
+
+
+def test_health_gate_rejects_unfair_cycle_budget(tmp_path):
+    result, summary, _ = _run_gate(
+        tmp_path,
+        "transient-cleanup",
+        quiet_window=1,
+        timeout=10,
+        cycle_timeout=1,
+        cluster_timeout=2,
+    )
+
+    assert result.returncode == 2
+    assert not summary
+    assert "too small" in result.stderr
+    assert "require at least 2s" in result.stderr
 
 
 def test_health_gate_removes_prior_cilium_agent_summary_before_probe():
@@ -371,7 +445,10 @@ def test_health_gate_checkpoints_large_observations_outside_argv():
     assert 'last_observations_file="$state_dir/last-observations.json"' in script
     assert '--slurpfile observation_documents "$last_observations_file"' in script
     assert '--argjson clusters "$last_observations"' not in script
-    assert 'collect_observations > "$observations_partial"' in script
+    assert (
+        'collect_observations "$cycle_clusters_file" > "$observations_partial"'
+        in script
+    )
     assert 'length == $expected' in script
     assert "if ! write_summary true; then" in script
 
@@ -385,6 +462,84 @@ def test_health_gate_reaps_any_completed_worker_and_retries_cilium():
     assert "HEALTH_GATE_CILIUM_PROBE_RETRY_SECONDS:-2" in script
     assert '--attempts "$cilium_probe_attempts"' in script
     assert '--retry-seconds "$cilium_probe_retry_seconds"' in script
+
+
+def test_health_gate_assigns_each_role_a_fair_deadline():
+    script = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert (
+        "minimum_fair_cycle_seconds=$(( observation_wave_count * "
+        "cluster_timeout_seconds ))"
+        in script
+    )
+    assert (
+        "active_observation_deadline=$((observation_started_epoch + "
+        "cluster_timeout_seconds))"
+        in script
+    )
+    assert "remaining=$((active_observation_deadline - now))" in script
+    assert 'if [ "$remaining" -lt "$required_remaining" ]; then' in script
+    assert "Completed health observation cycle" in script
+
+
+def test_health_gate_targets_only_unhealthy_roles_before_full_certification(
+    tmp_path,
+):
+    result, summary, poll_count = _run_gate(
+        tmp_path,
+        "targeted-recheck",
+        quiet_window=1,
+        timeout=20,
+        cluster_count=2,
+        concurrency=1,
+    )
+
+    assert result.returncode == 0
+    assert poll_count == 5
+    assert summary["success"] is True
+    assert summary["completed_cycle_count"] == 3
+    assert summary["last_completed_cycle_scope"] == "full"
+    assert summary["last_completed_cycle_cluster_count"] == 2
+    assert summary["termination_reason"] == "healthy"
+    assert all(cluster["healthy"] for cluster in summary["clusters"])
+    assert "scope=targeted clusters=1" in result.stdout
+    assert "full 2-cluster certification cycle" in result.stdout
+
+
+def test_health_gate_cycle_limit_writes_complete_observation(tmp_path):
+    result, summary, poll_count = _run_gate(
+        tmp_path,
+        "timeout",
+        quiet_window=2,
+        timeout=10,
+        max_cycles=1,
+    )
+
+    assert result.returncode == 3
+    assert poll_count == 1
+    assert summary["success"] is False
+    assert summary["termination_reason"] == "cycle-limit"
+    assert summary["completed_cycle_count"] == 1
+    assert summary["last_completed_cycle_scope"] == "full"
+    assert summary["last_completed_cycle_cluster_count"] == 1
+    assert summary["next_cycle_scope"] == "targeted"
+    assert summary["next_cycle_cluster_count"] == 1
+
+
+def test_health_gate_cannot_certify_after_deadline(tmp_path):
+    result, summary, poll_count = _run_gate(
+        tmp_path,
+        "deadline-at-cycle-end",
+        quiet_window=1,
+        timeout=4,
+    )
+
+    assert result.returncode == 1
+    assert poll_count == 1
+    assert summary["success"] is False
+    assert summary["termination_reason"] == "timeout"
+    assert summary["completed_cycle_count"] == 1
+    assert "before cycle 1 could be certified" in result.stderr
 
 
 def _healthy_nodes_json() -> str:
@@ -460,7 +615,7 @@ def test_health_gate_detects_unschedulable_kwok_node(tmp_path):
         tmp_path,
         "transient-cleanup",
         quiet_window=1,
-        timeout=2,
+        timeout=5,
         mock_nodes_json=json.dumps(nodes),
         mock_agents_json=_healthy_agents_json(),
     )
@@ -485,7 +640,7 @@ def test_health_gate_detects_unready_mock_agent_container(tmp_path):
         tmp_path,
         "transient-cleanup",
         quiet_window=1,
-        timeout=2,
+        timeout=5,
         mock_nodes_json=_healthy_nodes_json(),
         mock_agents_json=json.dumps(agents),
     )
@@ -514,7 +669,7 @@ def test_health_gate_detects_duplicate_and_missing_serves_node_coverage(tmp_path
         tmp_path,
         "transient-cleanup",
         quiet_window=1,
-        timeout=2,
+        timeout=5,
         mock_nodes_json=_healthy_nodes_json(),
         mock_agents_json=json.dumps(agents),
     )
@@ -544,7 +699,7 @@ def test_health_gate_detects_orphan_serves_node_agent(tmp_path):
         tmp_path,
         "transient-cleanup",
         quiet_window=1,
-        timeout=2,
+        timeout=5,
         mock_nodes_json=_healthy_nodes_json(),
         mock_agents_json=json.dumps(agents),
     )
@@ -621,12 +776,16 @@ def test_health_gate_hard_bounds_a_hung_kubectl(tmp_path):
             "--expected-remote-count",
             "0",
             "--timeout-seconds",
-            "2",
+            "4",
             "--cycle-timeout-seconds",
+            "1",
+            "--cluster-timeout-seconds",
             "1",
             "--quiet-window-seconds",
             "1",
             "--poll-interval-seconds",
+            "1",
+            "--completion-margin-seconds",
             "1",
             "--summary-file",
             str(summary_file),
@@ -655,6 +814,7 @@ def test_health_gate_hard_bounds_a_hung_kubectl(tmp_path):
     assert any(
         "kubectl timed out after" in failure
         or "observation cycle deadline exhausted" in failure
+        or "cluster observation deadline exhausted" in failure
         for failure in summary["clusters"][0]["failures"]
     )
-    assert "ClusterMesh scenario health gate timed out" in result.stderr
+    assert "below the" in result.stderr

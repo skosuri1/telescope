@@ -765,12 +765,24 @@ def test_lifecycle_only_mode_success(tmp_path):
     (scenario_dir / "scenario-health-gate.json").write_text(
         '{"healthy": true}\n', encoding="utf-8"
     )
+    (scenario_dir / "scenario-health-gate-observation.json").write_text(
+        '{"termination_reason": "cycle-limit"}\n', encoding="utf-8"
+    )
+    (scenario_dir / "scenario-health-repair-clusters.json").write_text(
+        '[{"role": "mesh-1"}]\n', encoding="utf-8"
+    )
     (scenario_dir / "mock-layer-reconcile-before.json").write_text(
         '{"success": true}\n', encoding="utf-8"
     )
     (scenario_dir / "mock-layer-reconcile-after.json").write_text(
         '{"success": true}\n', encoding="utf-8"
     )
+    (scenario_dir / "mock-layer-reconcile-health-repair.json").write_text(
+        '{"success": true}\n', encoding="utf-8"
+    )
+    (
+        scenario_dir / "preserved-worker-reconcile-health-repair.json"
+    ).write_text('{"healthy": true}\n', encoding="utf-8")
     (scenario_dir / "artifact-preservation-summary.json").write_text(
         '{"success": true}\n', encoding="utf-8"
     )
@@ -813,7 +825,7 @@ def test_lifecycle_only_mode_success(tmp_path):
     assert summary["infrastructure_failure"] is False
     assert summary["scenario_incomplete"] is False
     assert summary["uploaded_snapshot_count"] == 0
-    assert summary["uploaded_lifecycle_count"] == 6
+    assert summary["uploaded_lifecycle_count"] == 10
 
     assert not (tmp_path / "relabel-log.json").exists()
     calls = _az_calls(tmp_path / "az-log.jsonl")
@@ -827,9 +839,17 @@ def test_lifecycle_only_mode_success(tmp_path):
         "feature-branch/lifecycle/share-infra-1/run-123/scenario-evidence.json",
         "feature-branch/lifecycle/share-infra-1/run-123/scenario-health-gate.json",
         "feature-branch/lifecycle/share-infra-1/run-123/"
+        "scenario-health-gate-observation.json",
+        "feature-branch/lifecycle/share-infra-1/run-123/"
+        "scenario-health-repair-clusters.json",
+        "feature-branch/lifecycle/share-infra-1/run-123/"
         "mock-layer-reconcile-before.json",
         "feature-branch/lifecycle/share-infra-1/run-123/"
         "mock-layer-reconcile-after.json",
+        "feature-branch/lifecycle/share-infra-1/run-123/"
+        "mock-layer-reconcile-health-repair.json",
+        "feature-branch/lifecycle/share-infra-1/run-123/"
+        "preserved-worker-reconcile-health-repair.json",
         "feature-branch/lifecycle/share-infra-1/run-123/"
         "artifact-preservation-summary.json",
     }
