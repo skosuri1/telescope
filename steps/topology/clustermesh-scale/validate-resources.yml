@@ -1029,8 +1029,8 @@ steps:
           _role=$(echo "$_row" | jq -r '.role')
           _kc="$HOME/.kube/${_role}.config"
           ensure_kubeconfig "$_rg" "$_name" "$_kc"
-          _cm=$(KUBECONFIG="$_kc" kubectl --request-timeout=45s \
-            -n kube-system get cm cilium-config -o json)
+          _cm=$(KUBECONFIG="$_kc" bash "$KUBECTL_READ_RETRY" 90 \
+            get cm cilium-config -n kube-system -o json)
           _cid=$(jq -r '.data["cluster-id"] // ""' <<<"$_cm")
           _cn=$(jq -r '.data["cluster-name"] // ""' <<<"$_cm")
           if ! [[ "$_cid" =~ ^[1-9][0-9]*$ ]] || [ -z "$_cn" ]; then
@@ -1137,9 +1137,9 @@ steps:
           # fetch — a failure here just means "?" columns below, which is
           # still useful signal.
           ensure_kubeconfig "$_rg" "$_name" "$_kc" || true
-          _cid=$(KUBECONFIG="$_kc" kubectl -n kube-system get cm cilium-config \
+          _cid=$(KUBECONFIG="$_kc" bash "$KUBECTL_READ_RETRY" 90 get cm cilium-config -n kube-system \
                    -o jsonpath='{.data.cluster-id}' 2>/dev/null || echo "?")
-          _cn=$(KUBECONFIG="$_kc" kubectl -n kube-system get cm cilium-config \
+          _cn=$(KUBECONFIG="$_kc" bash "$KUBECTL_READ_RETRY" 90 get cm cilium-config -n kube-system \
                   -o jsonpath='{.data.cluster-name}' 2>/dev/null || echo "?")
           # The Fleet member name (e.g., "mesh-1") is what cluster-name
           # SHOULD be set to. Anything else flags one of two bug modes:
@@ -1228,7 +1228,7 @@ steps:
             for _row in $(echo "$clusters" | jq -c '.[]'); do
               _role=$(echo "$_row" | jq -r '.role')
               _kc="$HOME/.kube/${_role}.config"
-              _cid=$(KUBECONFIG="$_kc" kubectl -n kube-system get cm cilium-config \
+              _cid=$(KUBECONFIG="$_kc" bash "$KUBECTL_READ_RETRY" 90 get cm cilium-config -n kube-system \
                        -o jsonpath='{.data.cluster-id}' 2>/dev/null || echo "")
               if [ "$_cid" = "0" ]; then
                 round_skip=$((round_skip + 1))
@@ -1510,19 +1510,22 @@ steps:
         done
 
         echo "--- cilium agent pods ---"
-        kubectl -n kube-system get pods -l k8s-app=cilium -o wide
-        kubectl -n kube-system rollout status ds/cilium --timeout=5m
+        bash "$KUBECTL_READ_RETRY" 90 get pods -n kube-system -l k8s-app=cilium -o wide
+        bash "$KUBECTL_READ_RETRY" 300 rollout status ds/cilium -n kube-system
 
         echo "--- clustermesh-apiserver pod ---"
-        kubectl -n kube-system get pods -l k8s-app=clustermesh-apiserver -o wide || true
+        if ! bash "$KUBECTL_READ_RETRY" 60 get pods -n kube-system \
+            -l k8s-app=clustermesh-apiserver -o wide; then
+          echo "##vso[task.logissue type=warning;] $role: mesh-apiserver pod diagnostic unavailable; the all-agent peer gate remains mandatory."
+        fi
 
         # Surface the apiserver/kvstoremesh container ports so we can confirm
         # the PodMonitor scrape targets (expected: apiserver=9963, kvstoremesh=9964)
         # without needing to drop into a pod. Informational only — does not gate.
         echo "--- clustermesh-apiserver exposed ports ---"
-        kubectl -n kube-system get pod -l k8s-app=clustermesh-apiserver \
+        bash "$KUBECTL_READ_RETRY" 60 get pod -n kube-system -l k8s-app=clustermesh-apiserver \
           -o jsonpath='{range .items[*].spec.containers[*]}{.name}:{range .ports[*]}{.name}={.containerPort} {end}{"\n"}{end}' \
-          2>/dev/null || true
+          || echo "$role: mesh-apiserver port diagnostic unavailable"
         echo
 
         echo "--- cilium-dbg status (ClusterMesh section) ---"
@@ -1624,6 +1627,7 @@ steps:
     displayName: "Validate Cilium + ClusterMesh on every cluster"
     env:
       CILIUM_AGENT_HEALTH_PROBE: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/cilium_agent_health.py
+      KUBECTL_READ_RETRY: $(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/kubectl-read-retry.sh
 
   - script: |
       bash "$(Pipeline.Workspace)/s/steps/topology/clustermesh-scale/cross-cluster-smoke.sh"
