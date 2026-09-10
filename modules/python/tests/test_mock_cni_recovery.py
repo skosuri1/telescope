@@ -1424,6 +1424,53 @@ def test_daemonset_convergence_requires_every_desired_pod_ready():
     assert summary["unhealthy"][0]["ready"] == 2
 
 
+def test_inactive_daemonset_accepts_omitted_zero_updated_count():
+    payload = _daemonsets()
+    status = payload["items"][0]["status"]
+    status.update(
+        desiredNumberScheduled=0,
+        currentNumberScheduled=0,
+        numberReady=0,
+        numberUnavailable=0,
+    )
+    status.pop("updatedNumberScheduled")
+
+    assert recovery._daemonset_convergence(payload)["converged"] is True
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("currentNumberScheduled", 1),
+        ("numberReady", 1),
+        ("numberUnavailable", 1),
+        ("updatedNumberScheduled", 1),
+        ("updatedNumberScheduled", None),
+        ("observedGeneration", 1),
+    ],
+)
+def test_inactive_daemonset_still_rejects_unconverged_state(field, value):
+    payload = _daemonsets()
+    status = payload["items"][0]["status"]
+    status.update(
+        desiredNumberScheduled=0,
+        currentNumberScheduled=0,
+        numberReady=0,
+        numberUnavailable=0,
+    )
+    status.pop("updatedNumberScheduled")
+    status[field] = value
+
+    assert recovery._daemonset_convergence(payload)["converged"] is False
+
+
+def test_active_daemonset_requires_updated_count():
+    payload = _daemonsets()
+    payload["items"][0]["status"].pop("updatedNumberScheduled")
+
+    assert recovery._daemonset_convergence(payload)["converged"] is False
+
+
 def test_capacity_snapshot_reads_daemonsets_before_nodes_and_pods(
     monkeypatch,
 ):

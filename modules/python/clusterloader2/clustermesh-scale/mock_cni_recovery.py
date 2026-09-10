@@ -1162,7 +1162,8 @@ def _daemonset_convergence(payload: dict) -> dict:
         desired = status.get("desiredNumberScheduled")
         current = status.get("currentNumberScheduled")
         ready = status.get("numberReady")
-        updated = status.get("updatedNumberScheduled")
+        # Kubernetes omits this optional zero counter on inactive DaemonSets.
+        updated = status.get("updatedNumberScheduled", 0)
         unavailable = status.get("numberUnavailable") or 0
         healthy = (
             isinstance(generation, int)
