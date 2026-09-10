@@ -74,6 +74,9 @@ HEALTH_RECOVERY_PATH = (
 MOCK_RECONCILE_WRAPPER_PATH = HEALTH_RECOVERY_PATH.with_name(
     "run-mock-layer-reconcile.sh"
 )
+HOST_LIFECYCLE_PATH = HEALTH_RECOVERY_PATH.with_name(
+    "scenario-host-lifecycle.sh"
+)
 AZURE_LOGIN_TEMPLATE_PATH = (
     REPOSITORY_ROOT / "steps" / "cloud" / "azure" / "login.yml"
 )
@@ -537,6 +540,7 @@ def test_configure_control_plane_metrics_passes_build_id():
 def test_mock_mode_is_normalized_for_shell_gates():
     execute = EXECUTE_TEMPLATE_PATH.read_text(encoding="utf-8")
     mock_wrapper = MOCK_RECONCILE_WRAPPER_PATH.read_text(encoding="utf-8")
+    host_lifecycle = HOST_LIFECYCLE_PATH.read_text(encoding="utf-8")
 
     assert 'export CL2_MOCK_MODE="${cl2_mock_mode_raw,,}"' in execute
     assert (
@@ -550,13 +554,13 @@ def test_mock_mode_is_normalized_for_shell_gates():
         in execute
     )
     assert "cleanup_recovered: $cleanup_recovered" in execute
-    assert "NODE_CHURNER_WAIT_RC" in execute
+    assert "NODE_CHURNER_WAIT_RC" in host_lifecycle
     assert (
         'export CL2_NODE_CHURN_TARGET_NODEPOOL='
         '"${NODE_CHURN_TARGET_NODEPOOL:-default}"'
     ) in execute
-    assert '"$CL2_NODE_CHURN_TARGET_NODEPOOL"' in execute
-    assert "cleanup completion is unverifiable" in execute
+    assert '"$CL2_NODE_CHURN_TARGET_NODEPOOL"' in host_lifecycle
+    assert "cleanup completion is unverifiable" in host_lifecycle
     assert "ado_set_variable SHARE_INFRA_META" in execute
     assert "ado_complete_with_issues" in execute
     assert "scenario_policy.py" in execute
@@ -799,8 +803,15 @@ def test_cilium_policy_guard_runs_before_each_scenario():
         text=True,
         check=False,
     )
+    host_syntax = subprocess.run(
+        ["bash", "-n", str(HOST_LIFECYCLE_PATH)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
     assert syntax.returncode == 0, syntax.stderr
+    assert host_syntax.returncode == 0, host_syntax.stderr
     guard_call = "if ! run_cilium_policy_guard"
     mock_reconcile = 'run_mock_layer_reconcile "before"'
     scenario_banner = 'echo "Scenario [${scenario_idx}/${#SCENARIO_LIST[@]}]: ${SCENARIO}"'
@@ -817,6 +828,8 @@ def test_cilium_policy_guard_runs_before_each_scenario():
     assert "scenario-health-recovery.sh" in execute
     assert "SCENARIO_HEALTH_RECOVERY:" in execute
     assert "MOCK_RECONCILE_WRAPPER:" in execute
+    assert "SCENARIO_HOST_LIFECYCLE_LIB:" in execute
+    assert 'source "$SCENARIO_HOST_LIFECYCLE_LIB"' in execute
     assert 'SCENARIO="$SCENARIO" bash "$MOCK_RECONCILE_WRAPPER"' in execute
     assert "--max-cycles" in health_recovery
     assert "scenario-health-gate-observation.json" in health_recovery
@@ -986,7 +999,8 @@ def test_node_churn_false_cleanup_value_is_not_defaulted_to_true():
 
     assert '.cleanup_failed // true' not in execute
     assert 'if has("cleanup_failed") then .cleanup_failed else true end' in execute
-    assert "CL2_NODE_CHURN_READY_TIMEOUT_SECONDS +" in execute
+    host_lifecycle = HOST_LIFECYCLE_PATH.read_text(encoding="utf-8")
+    assert "CL2_NODE_CHURN_READY_TIMEOUT_SECONDS +" in host_lifecycle
     assert "CL2_NODE_CHURN_FINALIZER_TIMEOUT_SECONDS +" in execute
     assert "CL2_NODE_CHURN_RECOVERY_GRACE_SECONDS +" in execute
     for config_name in (

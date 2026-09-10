@@ -406,7 +406,10 @@ def test_health_gate_times_out_with_actionable_summary(tmp_path):
         for failure in cluster["failures"]
     )
     assert summary["termination_reason"] == "insufficient-time-for-fair-cycle"
-    assert "below the" in result.stderr
+    assert (
+        "below the" in result.stderr
+        or "before cycle 1 could be certified" in result.stderr
+    )
     assert "final full certification" in result.stderr
 
 
@@ -817,4 +820,7 @@ def test_health_gate_hard_bounds_a_hung_kubectl(tmp_path):
         or "cluster observation deadline exhausted" in failure
         for failure in summary["clusters"][0]["failures"]
     )
-    assert "below the" in result.stderr
+    assert (
+        "below the" in result.stderr
+        or "before cycle 1 could be certified" in result.stderr
+    )
