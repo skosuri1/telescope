@@ -2492,6 +2492,9 @@ PRESERVED_WORKER_WRAPPER_PATH = (
     / "config"
     / "run-preserved-worker-reconcile.sh"
 )
+MOCK_RECONCILE_WRAPPER_PATH = PRESERVED_WORKER_WRAPPER_PATH.with_name(
+    "run-mock-layer-reconcile.sh"
+)
 
 
 def _extract_bash_function(script_text, func_name):
@@ -2619,15 +2622,21 @@ def test_run_mock_layer_reconcile_timeout_fallback_is_syntactically_wired():
     `python3`/`timeout` subprocess, so it is validated statically here rather
     than executed end-to-end (that behavior is exercised by the Python-side
     _build_summary/on_result tests above, which cover the same JSON shape)."""
-    script_text = _load_execute_yml_script()
-    function_src = _extract_bash_function(script_text, "run_mock_layer_reconcile")
+    function_src = MOCK_RECONCILE_WRAPPER_PATH.read_text(encoding="utf-8")
+    syntax = subprocess.run(
+        ["bash", "-n", str(MOCK_RECONCILE_WRAPPER_PATH)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
-    assert '"$_rc" -eq 124' in function_src
-    assert '"$_rc" -eq 137' in function_src
+    assert syntax.returncode == 0, syntax.stderr
+    assert '"$rc" -eq 124' in function_src
+    assert '"$rc" -eq 137' in function_src
     assert ".success = false" in function_src or "success: false" in function_src
     assert ".timed_out = true" in function_src or "timed_out: true" in function_src
     assert "phase" in function_src
-    assert "mock-layer-reconcile[<role>] phase:" in function_src
+    assert "mock reconcile produced no summary before timeout" in function_src
     assert 'CL2_MOCK_RECONCILE_ATTEMPTS:-15' in function_src
     assert 'CL2_MOCK_RECONCILE_SETTLE_SECONDS:-45' in function_src
 

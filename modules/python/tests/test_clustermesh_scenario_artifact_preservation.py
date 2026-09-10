@@ -771,6 +771,9 @@ def test_lifecycle_only_mode_success(tmp_path):
     (scenario_dir / "scenario-health-repair-clusters.json").write_text(
         '[{"role": "mesh-1"}]\n', encoding="utf-8"
     )
+    (scenario_dir / "scenario-health-recovery.json").write_text(
+        '{"success": true}\n', encoding="utf-8"
+    )
     (scenario_dir / "mock-layer-reconcile-before.json").write_text(
         '{"success": true}\n', encoding="utf-8"
     )
@@ -825,7 +828,7 @@ def test_lifecycle_only_mode_success(tmp_path):
     assert summary["infrastructure_failure"] is False
     assert summary["scenario_incomplete"] is False
     assert summary["uploaded_snapshot_count"] == 0
-    assert summary["uploaded_lifecycle_count"] == 10
+    assert summary["uploaded_lifecycle_count"] == 11
 
     assert not (tmp_path / "relabel-log.json").exists()
     calls = _az_calls(tmp_path / "az-log.jsonl")
@@ -842,6 +845,8 @@ def test_lifecycle_only_mode_success(tmp_path):
         "scenario-health-gate-observation.json",
         "feature-branch/lifecycle/share-infra-1/run-123/"
         "scenario-health-repair-clusters.json",
+        "feature-branch/lifecycle/share-infra-1/run-123/"
+        "scenario-health-recovery.json",
         "feature-branch/lifecycle/share-infra-1/run-123/"
         "mock-layer-reconcile-before.json",
         "feature-branch/lifecycle/share-infra-1/run-123/"

@@ -1,6 +1,7 @@
 """Static checks for the isolated full-telemetry pipeline stage."""
 
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -60,6 +61,18 @@ EXECUTE_TEMPLATE_PATH = (
     / "clusterloader2"
     / "clustermesh-scale"
     / "execute.yml"
+)
+HEALTH_RECOVERY_PATH = (
+    REPOSITORY_ROOT
+    / "modules"
+    / "python"
+    / "clusterloader2"
+    / "clustermesh-scale"
+    / "config"
+    / "scenario-health-recovery.sh"
+)
+MOCK_RECONCILE_WRAPPER_PATH = HEALTH_RECOVERY_PATH.with_name(
+    "run-mock-layer-reconcile.sh"
 )
 AZURE_LOGIN_TEMPLATE_PATH = (
     REPOSITORY_ROOT / "steps" / "cloud" / "azure" / "login.yml"
@@ -523,6 +536,7 @@ def test_configure_control_plane_metrics_passes_build_id():
 
 def test_mock_mode_is_normalized_for_shell_gates():
     execute = EXECUTE_TEMPLATE_PATH.read_text(encoding="utf-8")
+    mock_wrapper = MOCK_RECONCILE_WRAPPER_PATH.read_text(encoding="utf-8")
 
     assert 'export CL2_MOCK_MODE="${cl2_mock_mode_raw,,}"' in execute
     assert (
@@ -555,8 +569,8 @@ def test_mock_mode_is_normalized_for_shell_gates():
     assert "start_logged_process_group" in execute
     assert "terminate_process_group" in execute
     assert "IsolationChurnTimings_" in execute
-    assert '--arg reconcile_label "$_label"' in execute
-    assert "label: $reconcile_label" in execute
+    assert '--arg reconcile_label "$label"' in mock_wrapper
+    assert "label: $reconcile_label" in mock_wrapper
 
 
 def test_mock_layer_is_deployed_after_managed_telemetry_configuration():
@@ -777,7 +791,16 @@ def test_n100_resume_bounds_pre_telemetry_reconcile_concurrency():
 
 def test_cilium_policy_guard_runs_before_each_scenario():
     execute = EXECUTE_TEMPLATE_PATH.read_text(encoding="utf-8")
+    health_recovery = HEALTH_RECOVERY_PATH.read_text(encoding="utf-8")
+    mock_wrapper = MOCK_RECONCILE_WRAPPER_PATH.read_text(encoding="utf-8")
+    syntax = subprocess.run(
+        ["bash", "-n", str(HEALTH_RECOVERY_PATH)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
+    assert syntax.returncode == 0, syntax.stderr
     guard_call = "if ! run_cilium_policy_guard"
     mock_reconcile = 'run_mock_layer_reconcile "before"'
     scenario_banner = 'echo "Scenario [${scenario_idx}/${#SCENARIO_LIST[@]}]: ${SCENARIO}"'
@@ -791,27 +814,30 @@ def test_cilium_policy_guard_runs_before_each_scenario():
     assert 'CL2_HEALTH_GATE_CLUSTER_TIMEOUT_SECONDS:-180' in execute
     assert 'CL2_HEALTH_GATE_COMPLETION_MARGIN_SECONDS="${' in execute
     assert 'CL2_HEALTH_GATE_REPAIR_ENABLED="${' in execute
-    assert "--max-cycles" in execute
-    assert "scenario-health-gate-observation.json" in execute
-    assert "scenario-health-repair-clusters.json" in execute
-    assert "run_preserved_worker_reconcile" in execute
-    assert "preserved-worker-reconcile-health-repair.json" in execute
-    assert "mock-layer-reconcile-health-repair.json" in execute
-    assert "health_gate_deadline_epoch" in execute
-    assert "health_final_reserve_seconds" in execute
-    assert "health_worker_required_seconds" in execute
-    assert "health_mock_required_seconds" in execute
+    assert "scenario-health-recovery.sh" in execute
+    assert "SCENARIO_HEALTH_RECOVERY:" in execute
+    assert "MOCK_RECONCILE_WRAPPER:" in execute
+    assert 'SCENARIO="$SCENARIO" bash "$MOCK_RECONCILE_WRAPPER"' in execute
+    assert "--max-cycles" in health_recovery
+    assert "scenario-health-gate-observation.json" in health_recovery
+    assert "scenario-health-repair-clusters.json" in health_recovery
+    assert "PRESERVED_WORKER_RECONCILE_WRAPPER" in health_recovery
+    assert "preserved-worker-reconcile-health-repair.json" in health_recovery
+    assert "mock-layer-reconcile-health-repair.json" in health_recovery
+    assert "deadline=" in health_recovery
+    assert "final_reserve=" in health_recovery
+    assert "worker_required=" in health_recovery
+    assert "mock_required=" in health_recovery
     assert (
-        'if [ "$_target_count" -eq "$cluster_count" ] && '
+        'if [ "$target_count" -eq "$cluster_count" ] && '
         '[ "$cluster_count" -lt 50 ]; then'
-        in execute
+        in mock_wrapper
     )
-    final_health_gate = 'if [ "$health_gate_complete" != "true" ]; then'
     assert (
-        execute.index("scenario-health-gate-observation.json")
-        < execute.index("preserved-worker-reconcile-health-repair.json")
-        < execute.index("mock-layer-reconcile-health-repair.json")
-        < execute.index(final_health_gate)
+        health_recovery.index("scenario-health-gate-observation.json")
+        < health_recovery.index("preserved-worker-reconcile-health-repair.json")
+        < health_recovery.index("mock-layer-reconcile-health-repair.json")
+        < health_recovery.index('if [ "$gate_complete" != "true" ]; then')
     )
     assert "cleanup_concurrency=12" in execute
 
