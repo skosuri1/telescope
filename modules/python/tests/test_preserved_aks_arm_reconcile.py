@@ -171,6 +171,163 @@ def test_inventory_rejects_active_operations_and_excess_failures():
         )
 
 
+def quiescence_args(tmp_path):
+    return arm.parse_args([
+        "--resource-group", "12345-deadbeef",
+        "--expected-subscription", "s",
+        "--expected-region", "eastus2euap",
+        "--expected-count", "2",
+        "--expected-tfvars-sha", "expected-sha",
+        "--summary-file", str(tmp_path / "summary.json"),
+        "--quiescence-timeout-seconds", "10",
+        "--poll-seconds", "4",
+        "--inventory-retry-seconds", "1",
+    ])
+
+
+def fake_clock(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(arm.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        arm.time, "sleep",
+        lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+    return now
+
+
+@pytest.mark.parametrize("pool_state", sorted(arm.BUSY_POOL_STATES))
+def test_pool_quiescence_waits_read_only_and_preserves_evidence(
+    tmp_path, monkeypatch, pool_state,
+):
+    fake_clock(monkeypatch)
+    calls = []
+
+    def runner(command, timeout):
+        calls.append((command, timeout))
+        state = pool_state if len(calls) == 1 else "Succeeded"
+        return arm.json.dumps([cluster_row(1), cluster_row(2, pool_state=state)])
+
+    summary = {}
+    clusters, failed = arm.read_quiescent_inventory(
+        quiescence_args(tmp_path), summary, "initial", runner,
+    )
+
+    assert len(clusters) == 2 and failed == []
+    assert len(calls) == 2
+    assert all(command[:3] == ["az", "aks", "list"] for command, _ in calls)
+    assert len(summary["initial_quiescence_observations"]) == 1
+    reason = summary["initial_quiescence_observations"][0]["reason"]
+    assert "mesh-2" in reason and "default" in reason and pool_state in reason
+    saved = arm.json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert saved["initial_pool_states"][1]["pools"][0]["provisioningState"] == "Succeeded"
+
+
+@pytest.mark.parametrize("pool_state", ["Failed", "Canceled", "Deleting", "Unknown"])
+def test_terminal_or_unknown_pool_states_never_become_waitable(
+    tmp_path, monkeypatch, pool_state,
+):
+    now = fake_clock(monkeypatch)
+    calls = []
+
+    def runner(command, _timeout):
+        calls.append(command)
+        return arm.json.dumps([cluster_row(1), cluster_row(2, pool_state=pool_state)])
+
+    summary = {}
+    with pytest.raises(arm.ReconcileError, match=pool_state) as failure:
+        arm.read_quiescent_inventory(quiescence_args(tmp_path), summary, "initial", runner)
+    assert not isinstance(failure.value, arm.InventoryBusyError)
+    assert len(calls) == 1 and now[0] == 0
+    assert summary["initial_quiescence_observations"] == []
+
+
+def test_stopped_pool_does_not_wait_or_start_itself(tmp_path, monkeypatch):
+    now = fake_clock(monkeypatch)
+    payload = [cluster_row(1), cluster_row(2, pool_state="Updating")]
+    payload[1]["agentPoolProfiles"][0]["powerState"] = {"code": "Stopped"}
+
+    with pytest.raises(arm.ReconcileError, match="Stopped") as failure:
+        arm.read_quiescent_inventory(
+            quiescence_args(tmp_path), {}, "initial",
+            lambda _command, _timeout: arm.json.dumps(payload),
+        )
+    assert not isinstance(failure.value, arm.InventoryBusyError)
+    assert now[0] == 0
+
+
+def test_quiescence_deadline_is_shared_by_reads_and_sleeps(tmp_path, monkeypatch):
+    now = fake_clock(monkeypatch)
+    limits = []
+
+    def runner(_command, timeout):
+        limits.append(timeout)
+        return arm.json.dumps([cluster_row(1), cluster_row(2, pool_state="Updating")])
+
+    with pytest.raises(arm.ReconcileError, match="within 10s"):
+        arm.read_quiescent_inventory(quiescence_args(tmp_path), {}, "initial", runner)
+    assert limits == [10, 6, 2]
+    assert now[0] == 10
+
+
+def test_quiescence_does_not_accept_success_after_deadline(tmp_path, monkeypatch):
+    now = fake_clock(monkeypatch)
+
+    def runner(_command, _timeout):
+        now[0] = 11
+        return arm.json.dumps([cluster_row(1), cluster_row(2)])
+
+    with pytest.raises(arm.ReconcileError, match="after its deadline"):
+        arm.read_quiescent_inventory(quiescence_args(tmp_path), {}, "initial", runner)
+
+
+def test_quiescence_authorization_failure_is_immediate(tmp_path, monkeypatch):
+    now = fake_clock(monkeypatch)
+    calls = []
+
+    def runner(command, _timeout):
+        calls.append(command)
+        raise arm.ReconcileError("AuthorizationFailed")
+
+    with pytest.raises(arm.ReconcileError, match="AuthorizationFailed"):
+        arm.read_quiescent_inventory(quiescence_args(tmp_path), {}, "initial", runner)
+    assert len(calls) == 1 and now[0] == 0
+
+
+def test_cluster_update_is_observed_before_quiescence(tmp_path, monkeypatch):
+    fake_clock(monkeypatch)
+    calls = []
+
+    def runner(command, _timeout):
+        calls.append(command)
+        state = "Updating" if len(calls) == 1 else "Succeeded"
+        return arm.json.dumps([cluster_row(1), cluster_row(2, state)])
+
+    clusters, failed = arm.read_quiescent_inventory(
+        quiescence_args(tmp_path), {}, "initial", runner,
+    )
+    assert len(clusters) == 2 and failed == [] and len(calls) == 2
+
+
+def test_job_publishes_diagnostics_without_masking_reconcile_failure():
+    template = (
+        MODULE_PATH.parents[4] / "jobs/clustermesh-debug-resume.yml"
+    ).read_text(encoding="utf-8")
+    start = template.index('      summary_dir="$(Build.ArtifactStagingDirectory)/n100-aks-arm-reconcile"')
+    end = template.index('  - task: PublishPipelineArtifact@1', start)
+    script = template[start:end]
+
+    assert 'reconcile_rc=0' in script
+    assert '--summary-file "$summary_dir/aks-arm-reconcile.json" || reconcile_rc=$?' in script
+    assert 'if [ -s "$summary_dir/aks-arm-reconcile.json" ]; then' in script
+    assert script.index("task.uploadfile") < script.index('exit "$reconcile_rc"')
+    assert "AKS_ARM_RECONCILE_DIAGNOSTICS_READY]true" in script
+    assert (
+        "condition: and(succeededOrFailed(), "
+        "eq(variables['AKS_ARM_RECONCILE_DIAGNOSTICS_READY'], 'true'))"
+    ) in template
+    assert 'artifact: "n100-aks-arm-reconcile-$(Build.BuildId)-$(System.JobAttempt)"' in template
+
+
 def test_fleet_members_must_be_exactly_connected():
     clusters, _ = arm.validate_cluster_inventory(
         [cluster_row(1), cluster_row(2, "Failed")],

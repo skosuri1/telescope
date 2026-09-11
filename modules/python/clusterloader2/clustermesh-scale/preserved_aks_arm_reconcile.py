@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import math
 import os
 import re
 import subprocess
@@ -19,6 +20,10 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 class ReconcileError(Exception):
     """Expected fail-closed reconciliation error."""
+
+
+class InventoryBusyError(ReconcileError):
+    """A recognized in-flight operation that may only be observed."""
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,7 @@ TRANSIENT_READ_RE = re.compile(
     re.IGNORECASE,
 )
 ROLE_RE = re.compile(r"^mesh-(?P<number>[1-9][0-9]*)$")
+BUSY_POOL_STATES = {"Updating", "Scaling", "Upgrading", "DeletingMachines"}
 
 
 def utc_now() -> str:
@@ -225,14 +231,16 @@ def validate_cluster_inventory(
                 f"{role}: cluster does not use Cilium dataplane and policy"
             )
         state = str(row.get("provisioningState") or "Unknown")
-        if state not in ("Succeeded", "Failed"):
-            raise ReconcileError(f"{role}: unsafe provisioningState={state}")
         power = row.get("powerState")
         power_state = str(
             power.get("code") if isinstance(power, dict) else power or ""
         )
         if power_state not in ("", "Running"):
             raise ReconcileError(f"{role}: unsafe powerState={power_state}")
+        if state == "Updating":
+            raise InventoryBusyError(f"{role}: unsafe provisioningState={state}")
+        if state not in ("Succeeded", "Failed"):
+            raise ReconcileError(f"{role}: unsafe provisioningState={state}")
         resource_id = row.get("id")
         resource_group = row.get("resourceGroup")
         node_resource_group = row.get("nodeResourceGroup")
@@ -243,12 +251,41 @@ def validate_cluster_inventory(
         if not isinstance(node_resource_group, str) or not node_resource_group:
             raise ReconcileError(f"{role}: node resource group is missing")
         pools = row.get("agentPoolProfiles")
-        if not isinstance(pools, list) or not pools or not all(
-            _pool_is_quiescent(pool, allow_failed=state == "Failed")
-            for pool in pools
-        ):
+        if not isinstance(pools, list) or not pools:
             raise ReconcileError(
-                f"{role}: one or more node pools are not safely quiescent"
+                f"{role}: node pool inventory is missing or malformed"
+            )
+        unsafe_pools = [
+            pool for pool in pools
+            if not _pool_is_quiescent(pool, allow_failed=state == "Failed")
+        ]
+        if unsafe_pools:
+            details = []
+            busy_only = True
+            for pool in unsafe_pools:
+                if not isinstance(pool, dict):
+                    details.append({"pool": "malformed"})
+                    busy_only = False
+                    continue
+                pool_power = pool.get("powerState")
+                pool_power = (
+                    pool_power.get("code")
+                    if isinstance(pool_power, dict) else pool_power
+                )
+                pool_state = pool.get("provisioningState")
+                details.append({
+                    "pool": pool.get("name"),
+                    "provisioning_state": pool_state,
+                    "power_state": pool_power,
+                })
+                busy_only = busy_only and (
+                    pool_state in BUSY_POOL_STATES
+                    and pool_power in (None, "", "Running")
+                )
+            error_type = InventoryBusyError if busy_only else ReconcileError
+            raise error_type(
+                f"{role}: one or more node pools are not safely quiescent: "
+                + json.dumps(details, sort_keys=True)
             )
         seen_names.add(name)
         role_numbers.append(number)
@@ -548,6 +585,78 @@ def write_json_atomic(path: str, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+def read_quiescent_inventory(
+    args: argparse.Namespace,
+    summary: Dict[str, object],
+    phase: str,
+    runner: Runner,
+) -> Tuple[List[Cluster], List[Cluster]]:
+    """Observe known in-flight operations without mutating or resetting budgets."""
+
+    deadline = time.monotonic() + args.quiescence_timeout_seconds
+    observations = []
+    summary[f"{phase}_quiescence_observations"] = observations
+    read_failures = 0
+    command = [
+        "az", "aks", "list", "--resource-group", args.resource_group,
+        "--output", "json", "--only-show-errors",
+    ]
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReconcileError(
+                f"{phase} inventory did not become safely quiescent within "
+                f"{args.quiescence_timeout_seconds}s"
+            )
+        try:
+            payload = parse_json(
+                runner(command, min(args.inventory_timeout_seconds, math.ceil(remaining))),
+                f"{phase} AKS inventory",
+            )
+        except ReconcileError as error:
+            read_failures += 1
+            if (
+                read_failures >= args.inventory_attempts
+                or TRANSIENT_READ_RE.search(str(error)) is None
+            ):
+                raise
+            print(f"{phase} inventory read retry: {error}", file=sys.stderr, flush=True)
+            pause = args.inventory_retry_seconds
+        else:
+            read_failures = 0
+            summary[f"{phase}_pool_states"] = [
+                {
+                    "name": row.get("name"),
+                    "role": (row.get("tags") or {}).get("role"),
+                    "provisioning_state": row.get("provisioningState"),
+                    "power_state": row.get("powerState"),
+                    "pools": row.get("agentPoolProfiles"),
+                }
+                for row in payload if isinstance(row, dict)
+            ] if isinstance(payload, list) else []
+            write_json_atomic(args.summary_file, summary)
+            try:
+                result = validate_cluster_inventory(
+                    payload, expected_count=args.expected_count,
+                    region=args.expected_region,
+                    max_repair_clusters=args.max_repair_clusters,
+                )
+            except InventoryBusyError as error:
+                observations.append({"observed_at": utc_now(), "reason": str(error)})
+                write_json_atomic(args.summary_file, summary)
+                print(f"Waiting for {phase} inventory quiescence: {error}", flush=True)
+                pause = args.poll_seconds
+            else:
+                if time.monotonic() >= deadline:
+                    raise ReconcileError(
+                        f"{phase} inventory observation completed after its deadline"
+                    )
+                return result
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(pause, remaining))
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse command-line arguments."""
 
@@ -566,6 +675,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--inventory-timeout-seconds", type=int, default=600)
     parser.add_argument("--inventory-attempts", type=int, default=3)
     parser.add_argument("--inventory-retry-seconds", type=int, default=15)
+    parser.add_argument("--quiescence-timeout-seconds", type=int, default=900)
     parser.add_argument("--mutation-timeout-seconds", type=int, default=1800)
     parser.add_argument("--recovery-timeout-seconds", type=int, default=1800)
     parser.add_argument("--poll-seconds", type=int, default=30)
@@ -579,6 +689,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "inventory_timeout_seconds",
         "inventory_attempts",
         "inventory_retry_seconds",
+        "quiescence_timeout_seconds",
         "mutation_timeout_seconds",
         "recovery_timeout_seconds",
         "poll_seconds",
@@ -634,30 +745,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.expected_tfvars_sha,
         )
 
-        initial_payload = parse_json(
-            run_read_with_retries(
-                [
-                    "az",
-                    "aks",
-                    "list",
-                    "--resource-group",
-                    args.resource_group,
-                    "--output",
-                    "json",
-                    "--only-show-errors",
-                ],
-                run_command,
-                timeout_seconds=args.inventory_timeout_seconds,
-                attempts=args.inventory_attempts,
-                retry_seconds=args.inventory_retry_seconds,
-            ),
-            "AKS inventory",
-        )
-        clusters, failed = validate_cluster_inventory(
-            initial_payload,
-            expected_count=args.expected_count,
-            region=args.expected_region,
-            max_repair_clusters=args.max_repair_clusters,
+        clusters, failed = read_quiescent_inventory(
+            args, summary, "initial", run_command,
         )
         summary["initial_failed_roles"] = [cluster.role for cluster in failed]
 
@@ -764,30 +853,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             )
 
-        final_payload = parse_json(
-            run_read_with_retries(
-                [
-                    "az",
-                    "aks",
-                    "list",
-                    "--resource-group",
-                    args.resource_group,
-                    "--output",
-                    "json",
-                    "--only-show-errors",
-                ],
-                run_command,
-                timeout_seconds=args.inventory_timeout_seconds,
-                attempts=args.inventory_attempts,
-                retry_seconds=args.inventory_retry_seconds,
-            ),
-            "final AKS inventory",
-        )
-        final_clusters, final_failed = validate_cluster_inventory(
-            final_payload,
-            expected_count=args.expected_count,
-            region=args.expected_region,
-            max_repair_clusters=args.max_repair_clusters,
+        final_clusters, final_failed = read_quiescent_inventory(
+            args, summary, "final", run_command,
         )
         if final_failed:
             raise ReconcileError(
