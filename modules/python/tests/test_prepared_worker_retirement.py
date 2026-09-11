@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -473,3 +474,24 @@ def test_pipeline_wires_retirement_before_arm_recovery():
     assert retirement_jobs[0]["template"] == (
         "/jobs/clustermesh-prepared-worker-retirement.yml"
     )
+
+
+def test_maintenance_bootstrap_resolves_vendored_fleet_wheel():
+    repository = MODULE_DIR.parents[3]
+    maintenance = yaml.safe_load(
+        (repository / "jobs/clustermesh-prepared-worker-retirement.yml")
+        .read_text(encoding="utf-8")
+    )
+    setup = yaml.safe_load(
+        (repository / "steps/setup-tests.yml").read_text(encoding="utf-8")
+    )
+    installer = next(
+        step for step in setup["steps"]
+        if step.get("displayName") == "Install Fleet preview CLI (clustermesh scenarios)"
+    )
+    wheel = re.search(r'^whl="([^"]+)"$', installer["script"], re.MULTILINE)
+    assert wheel is not None
+    scenario = maintenance["jobs"][0]["variables"]["SCENARIO_NAME"]
+    resolved = wheel.group(1).replace("$(Pipeline.Workspace)/s", str(repository))
+    resolved = resolved.replace("$(SCENARIO_NAME)", scenario)
+    assert Path(resolved).is_file()

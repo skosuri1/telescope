@@ -20,7 +20,7 @@ jobs:
   - job: prepared_worker_retirement
     displayName: "Finish one prepared n100 worker retirement"
     variables:
-      SCENARIO_NAME: clustermesh-scale-mock
+      SCENARIO_NAME: clustermesh-scale
       CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
       CLUSTERMESH_JOB_TIMEOUT_MINUTES: "120"
       CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "30"
