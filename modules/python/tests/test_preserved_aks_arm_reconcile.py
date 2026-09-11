@@ -337,6 +337,38 @@ def test_pool_reconcile_never_accepts_config_drift_or_failed_update(
         )
 
 
+def test_upgrade_surge_is_temporary_and_bounded_by_existing_settings():
+    before = pool_payload()
+    before["count"] = 2
+    before["upgradeSettings"] = {"maxSurge": "10%"}
+    current = copy.deepcopy(before)
+    current.update(provisioningState="Updating", count=3)
+    assert arm.pool_configuration_matches(before, current) is True
+    current["count"] = 4
+    assert arm.pool_configuration_matches(before, current) is False
+    current["count"] = 1
+    assert arm.pool_configuration_matches(before, current) is False
+    current["count"] = 3
+    current["provisioningState"] = "Succeeded"
+    assert arm.pool_configuration_matches(before, current) is False
+    current["count"] = 2
+    assert arm.pool_configuration_matches(before, current) is True
+    current.update(provisioningState="Scaling", count=3)
+    assert arm.pool_configuration_matches(before, current) is False
+
+
+def test_upgrade_surge_never_allows_other_configuration_drift():
+    before = pool_payload()
+    before["count"] = 2
+    before["upgradeSettings"] = {"maxSurge": "10%"}
+    current = copy.deepcopy(before)
+    current.update(provisioningState="Updating", count=3, vmSize="Standard_D16_v3")
+    assert arm.pool_configuration_matches(before, current) is False
+    current["vmSize"] = before["vmSize"]
+    current["upgradeSettings"]["maxSurge"] = "50%"
+    assert arm.pool_configuration_matches(before, current) is False
+
+
 def test_final_inventory_never_accepts_remaining_failed_pool(tmp_path, monkeypatch):
     fake_clock(monkeypatch)
     args = quiescence_args(tmp_path)

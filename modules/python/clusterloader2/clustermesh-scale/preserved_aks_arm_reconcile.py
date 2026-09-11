@@ -77,6 +77,7 @@ POOL_CONFIG_FIELDS = (
     "maxPods", "vnetSubnetId", "podSubnetId", "availabilityZones",
     "enableAutoScaling", "minCount", "maxCount", "nodeLabels", "nodeTaints",
     "orchestratorVersion", "kubeletConfig", "linuxOSConfig",
+    "upgradeSettings",
 )
 
 
@@ -610,6 +611,38 @@ def pool_configuration(pool: dict) -> dict:
     return {name: pool.get(name) for name in POOL_CONFIG_FIELDS}
 
 
+def pool_configuration_matches(before: dict, current: dict) -> bool:
+    """Allow only the existing upgrade surge while busy; require exact final count."""
+
+    expected = pool_configuration(before)
+    observed = pool_configuration(current)
+    if expected == observed:
+        return True
+    if current.get("provisioningState") not in ("Updating", "Upgrading"):
+        return False
+    expected_count = expected.pop("count")
+    observed_count = observed.pop("count")
+    if expected != observed or not isinstance(observed_count, int) or isinstance(observed_count, bool):
+        return False
+    settings = before.get("upgradeSettings") or {}
+    surge = settings.get("maxSurge")
+    if surge is None:
+        maximum_extra = 1
+    elif isinstance(surge, int) and not isinstance(surge, bool) and surge >= 0:
+        maximum_extra = surge
+    elif isinstance(surge, str) and re.fullmatch(r"\d+%?", surge):
+        if surge.endswith("%"):
+            percentage = int(surge[:-1])
+            if percentage > 100:
+                return False
+            maximum_extra = math.ceil(expected_count * percentage / 100)
+        else:
+            maximum_extra = int(surge)
+    else:
+        return False
+    return expected_count <= observed_count <= expected_count + maximum_extra
+
+
 def read_pool(cluster: Cluster, pool_name: str, runner: Runner, timeout: int) -> dict:
     payload = parse_json(
         runner(
@@ -767,7 +800,7 @@ def reconcile_failed_pool(
         state = current.get("provisioningState")
         evidence["observed_states"].append(state)
         evidence["configuration_after"] = pool_configuration(current)
-        if pool_configuration(current) != pool_configuration(pool):
+        if not pool_configuration_matches(pool, current):
             raise ReconcileError(f"{cluster.role}/{pool_name}: no-option update changed pool configuration")
         if state == "Succeeded":
             if time.monotonic() >= deadline:
