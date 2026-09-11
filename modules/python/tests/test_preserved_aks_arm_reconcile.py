@@ -395,6 +395,122 @@ def test_pool_identity_inventory_uses_exact_fleet_assignments(tmp_path):
         arm.write_pool_repair_identities(str(path), members + [members[0]], clusters)
 
 
+@pytest.mark.parametrize("command_fails,reported_healthy", [(True, False), (True, True), (False, False)])
+def test_failed_cilium_probe_preserves_current_detailed_evidence(
+    tmp_path, command_fails, reported_healthy,
+):
+    health = {
+        "healthy": reported_healthy,
+        "agents": [{
+            "pod_name": "cilium-a", "node_name": "node-a",
+            "healthy": reported_healthy, "ready_remote_count": 0, "remote_count": 1,
+            "not_ready_remote_names": ["mesh-11"], "missing_remote_names": [],
+            "unexpected_remote_names": [], "duplicate_remote_names": [],
+        }],
+    }
+
+    def runner(command, _timeout):
+        if command[:3] == ["az", "aks", "get-credentials"]:
+            return ""
+        if "--raw=/readyz" in command:
+            return "ok"
+        if "deployment" in command:
+            return '{"status":{"conditions":[{"type":"Available","status":"True"}]}}'
+        summary_path = Path(command[command.index("--summary-file") + 1])
+        summary_path.write_text(arm.json.dumps(health), encoding="utf-8")
+        if command_fails:
+            raise arm.ReconcileError("probe exited 1")
+        return ""
+
+    with pytest.raises(arm.ReconcileError, match="mesh-11") as failure:
+        arm.validate_cluster_data_plane(
+            pool_cluster(), str(tmp_path / "cluster.config"), 1, runner, 5,
+            identity_inventory="/identities.json",
+        )
+    assert failure.value.evidence["cilium_health"] == health
+    assert failure.value.evidence["command_error"] == (
+        "probe exited 1" if command_fails else None
+    )
+
+
+def test_failed_cilium_probe_cannot_reuse_old_success_summary(tmp_path):
+    kubeconfig = str(tmp_path / "cluster.config")
+    Path(f"{kubeconfig}.cilium-health.json").write_text('{"healthy":true}', encoding="utf-8")
+
+    def runner(command, _timeout):
+        if command[:3] == ["az", "aks", "get-credentials"]:
+            return ""
+        if "--raw=/readyz" in command:
+            return "ok"
+        if "deployment" in command:
+            return '{"status":{"conditions":[{"type":"Available","status":"True"}]}}'
+        raise arm.ReconcileError("probe failed without a summary")
+
+    with pytest.raises(arm.ReconcileError, match="proof is unavailable") as failure:
+        arm.validate_cluster_data_plane(
+            pool_cluster(), kubeconfig, 1, runner, 5,
+            identity_inventory="/identities.json",
+        )
+    assert failure.value.evidence["command_error"] == "probe failed without a summary"
+
+
+@pytest.mark.parametrize("mutation_started", [False, True])
+def test_independent_pool_repair_continues_only_after_read_only_failure(
+    tmp_path, monkeypatch, mutation_started,
+):
+    args = quiescence_args(tmp_path)
+    args.failed_pool_repair_enabled = True
+    clusters, failed = arm.validate_cluster_inventory(
+        [cluster_row(1, pool_state="Failed"), cluster_row(2, pool_state="Failed")],
+        expected_count=2, region="eastus2euap", max_repair_clusters=1,
+        allow_failed_pool_repair=True,
+    )
+    members = [
+        {"name": f"mesh-{number}", "meshProperties": {
+            "status": {"state": "Connected"},
+            "ciliumProperties": {"id": number, "name": f"mesh-{number}{number}"},
+        }}
+        for number in (1, 2)
+    ]
+    monkeypatch.setattr(arm, "parse_args", lambda _argv: args)
+    monkeypatch.setattr(arm, "validate_resource_group", lambda *_args: None)
+
+    def inventory(_args, _summary, phase, _runner):
+        assert phase == "initial", "final certification cannot run after a failed pool guard"
+        return clusters, failed
+
+    def runner(command, _timeout):
+        if command[:3] == ["az", "account", "show"]:
+            return "s"
+        if command[:3] == ["az", "group", "show"]:
+            return "{}"
+        return arm.json.dumps(members)
+
+    calls = []
+
+    def repair(cluster, pool, _config, _identities, _count, _runner, _args, evidence):
+        calls.append(cluster.role)
+        evidence.update({
+            "role": cluster.role, "pool": pool,
+            "status": "reconciling" if mutation_started else "validating",
+        })
+        if cluster.role == "mesh-1":
+            raise arm.ReconcileError("Cilium not healthy", evidence={"cilium_health": {"healthy": False}})
+        evidence["status"] = "repaired"
+
+    monkeypatch.setattr(arm, "read_quiescent_inventory", inventory)
+    monkeypatch.setattr(arm, "run_command", runner)
+    monkeypatch.setattr(arm, "reconcile_failed_pool", repair)
+    assert arm.main([]) == 1
+    assert calls == (["mesh-1"] if mutation_started else ["mesh-1", "mesh-2"])
+    summary = arm.json.loads(Path(args.summary_file).read_text(encoding="utf-8"))
+    assert summary["healthy"] is False
+    assert summary["pool_repairs"][0]["failure_evidence"]["cilium_health"]["healthy"] is False
+    assert summary["pool_repairs"][0]["mutation_started"] is mutation_started
+    if not mutation_started:
+        assert summary["pool_repairs"][1]["status"] == "repaired"
+
+
 def test_inventory_rejects_active_operations_and_excess_failures():
     with pytest.raises(arm.ReconcileError, match="unsafe provisioningState"):
         arm.validate_cluster_inventory(

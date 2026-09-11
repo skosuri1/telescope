@@ -23,6 +23,10 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 class ReconcileError(Exception):
     """Expected fail-closed reconciliation error."""
 
+    def __init__(self, message: str, *, evidence: Optional[dict] = None):
+        super().__init__(message)
+        self.evidence = evidence or {}
+
 
 class InventoryBusyError(ReconcileError):
     """A recognized in-flight operation that may only be observed."""
@@ -469,28 +473,57 @@ def validate_cluster_data_plane(
         summary_path = f"{kubeconfig}.cilium-health.json"
         if os.path.exists(summary_path):
             os.remove(summary_path)
-        runner(
-            [
-                sys.executable,
-                os.path.join(os.path.dirname(__file__), "cilium_agent_health.py"),
-                "--role", cluster.role,
-                "--kubeconfig", kubeconfig,
-                "--expected-remote-count", str(expected_remote_count),
-                "--identity-inventory", identity_inventory,
-                "--attempts", "3",
-                "--retry-seconds", "5",
-                "--command-timeout-seconds", "20",
-                "--summary-file", summary_path,
-            ],
-            max(query_timeout_seconds, 300),
-        )
+        command_error = None
+        try:
+            runner(
+                [
+                    sys.executable,
+                    os.path.join(os.path.dirname(__file__), "cilium_agent_health.py"),
+                    "--role", cluster.role,
+                    "--kubeconfig", kubeconfig,
+                    "--expected-remote-count", str(expected_remote_count),
+                    "--identity-inventory", identity_inventory,
+                    "--attempts", "3",
+                    "--retry-seconds", "5",
+                    "--command-timeout-seconds", "20",
+                    "--summary-file", summary_path,
+                ],
+                max(query_timeout_seconds, 300),
+            )
+        except ReconcileError as error:
+            command_error = str(error)
         try:
             with open(summary_path, encoding="utf-8") as handle:
                 summary = json.load(handle)
         except (OSError, json.JSONDecodeError) as error:
-            raise ReconcileError(f"{cluster.role}: Cilium proof is unavailable: {error}") from error
-        if not isinstance(summary, dict) or summary.get("healthy") is not True:
-            raise ReconcileError(f"{cluster.role}: all-agent Cilium identity/peer proof failed")
+            raise ReconcileError(
+                f"{cluster.role}: Cilium proof is unavailable: {error}",
+                evidence={"command_error": command_error},
+            ) from error
+        if not isinstance(summary, dict):
+            raise ReconcileError(
+                f"{cluster.role}: Cilium proof is not an object",
+                evidence={"command_error": command_error},
+            )
+        if command_error is not None or summary.get("healthy") is not True:
+            details = [
+                {
+                    "pod": agent.get("pod_name"),
+                    "node": agent.get("node_name"),
+                    "ready": agent.get("ready_remote_count"),
+                    "total": agent.get("remote_count"),
+                    "not_ready": agent.get("not_ready_remote_names", [])[:10],
+                    "missing": agent.get("missing_remote_names", [])[:10],
+                    "unexpected": agent.get("unexpected_remote_names", [])[:10],
+                    "duplicates": agent.get("duplicate_remote_names", [])[:10],
+                }
+                for agent in summary.get("agents", []) if isinstance(agent, dict)
+            ]
+            raise ReconcileError(
+                f"{cluster.role}: all-agent Cilium identity/peer proof failed: "
+                + json.dumps({"agents": details, "fatal_error": summary.get("fatal_error")}),
+                evidence={"cilium_health": summary, "command_error": command_error},
+            )
         return summary
 
     status = parse_json(
@@ -1155,6 +1188,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             with tempfile.TemporaryDirectory(prefix="aks-pool-reconcile-") as temp_dir:
                 identities = os.path.join(temp_dir, "cilium-identities.json")
                 write_pool_repair_identities(identities, identity_members, clusters)
+                pool_failures = []
                 for cluster in clusters:
                     for pool_name in cluster.failed_pools:
                         evidence = {}
@@ -1166,8 +1200,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 identities, args.expected_count - 1,
                                 run_command, args, evidence,
                             )
+                        except ReconcileError as error:
+                            mutation_started = evidence.get("status") == "reconciling"
+                            evidence.update({
+                                "status": "failed", "error": str(error),
+                                "failure_evidence": error.evidence,
+                                "mutation_started": mutation_started,
+                            })
+                            pool_failures.append(f"{cluster.role}/{pool_name}")
+                            print(
+                                f"Pool repair blocked: {error}",
+                                file=sys.stderr, flush=True,
+                            )
+                            if mutation_started:
+                                raise
                         finally:
                             write_json_atomic(args.summary_file, summary)
+                if pool_failures:
+                    raise ReconcileError(
+                        "Guarded pool repair did not complete: " + ", ".join(pool_failures)
+                    )
 
         final_clusters, final_failed = read_quiescent_inventory(
             args, summary, "final", run_command,
