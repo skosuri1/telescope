@@ -1,0 +1,103 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: tfvars_path
+    type: string
+  - name: source_role
+    type: string
+  - name: source_node
+    type: string
+  - name: source_uid
+    type: string
+  - name: source_provider_id
+    type: string
+  - name: source_network_container_id
+    type: string
+
+steps:
+  - script: |
+      set -euo pipefail
+      umask 077
+      if [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
+        [ -z "$RUN_ID" ] ||
+        [ "$CONFIRM_RESUME" != "$RUN_ID" ] ||
+        ! [[ "$SOURCE_ROLE" =~ ^mesh-[1-9][0-9]*$ ]] ||
+        [ -z "$SOURCE_NODE" ] ||
+        [ -z "$SOURCE_UID" ] ||
+        [ -z "$SOURCE_PROVIDER_ID" ] ||
+        [ -z "$SOURCE_NETWORK_CONTAINER_ID" ]; then
+        echo "CNI maintenance requires exact preserved n100 confirmation and a complete source identity." >&2
+        exit 1
+      fi
+      summary_dir="$ARTIFACT_STAGING_DIRECTORY/n100-cni-worker-maintenance"
+      mkdir -p "$summary_dir"
+      echo "##vso[task.setvariable variable=CNI_WORKER_MAINTENANCE_DIAGNOSTICS_READY]true"
+      expected_tfvars_sha=$(sha256sum "$SOURCE_ROOT/$TFVARS_PATH" | awk '{print $1}')
+      az aks list --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-group "$RUN_ID" --output json --only-show-errors \
+        > "$summary_dir/clusters.json"
+      cluster_name=$(jq -er --arg role "$SOURCE_ROLE" '
+        [.[] | select(.tags.role == $role)] |
+        if length == 1 and (.[0].name | type == "string") and
+          (.[0].name | length > 0)
+        then .[0].name
+        else error("Expected exactly one AKS cluster for the requested role")
+        end' "$summary_dir/clusters.json")
+      credentials_dir=$(mktemp -d "$PRIVATE_TEMP_ROOT/cni-worker-maintenance.XXXXXX")
+      kubeconfig="$credentials_dir/cluster.config"
+      cleanup_credentials() {
+        rm -f -- "$kubeconfig"
+        rmdir -- "$credentials_dir"
+      }
+      trap cleanup_credentials EXIT
+      az aks get-credentials --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-group "$RUN_ID" --name "$cluster_name" \
+        --file "$kubeconfig" --only-show-errors
+      chmod 600 "$kubeconfig"
+      helper="$SOURCE_ROOT/modules/python/clusterloader2/clustermesh-scale/cni_worker_maintenance.py"
+      common=(
+        --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
+        --expected-subscription "$EXPECTED_SUBSCRIPTION_ID"
+        --expected-region "$EXPECTED_REGION"
+        --expected-tfvars-sha "$expected_tfvars_sha"
+        --role "$SOURCE_ROLE" --node-name "$SOURCE_NODE" --node-uid "$SOURCE_UID"
+        --source-provider-id "$SOURCE_PROVIDER_ID"
+        --source-network-container-id "$SOURCE_NETWORK_CONTAINER_ID"
+        --kubeconfig "$kubeconfig" --context "$cluster_name"
+      )
+      echo "Qualifying the explicit source with the read-only maintenance plan."
+      python3 -u "$helper" "${common[@]}" --summary-file "$summary_dir/plan.json"
+      echo "Executing the same bounded single-source maintenance with fresh live proof."
+      python3 -u "$helper" "${common[@]}" \
+        --summary-file "$summary_dir/maintenance.json" --execute
+    displayName: "Qualify and maintain one CNI-broken worker"
+    env:
+      RUN_ID: ${{ parameters.target_run_id }}
+      CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
+      EXPECTED_SUBSCRIPTION_ID: ${{ parameters.expected_subscription_id }}
+      EXPECTED_REGION: ${{ parameters.expected_region }}
+      EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      SOURCE_ROLE: ${{ parameters.source_role }}
+      SOURCE_NODE: ${{ parameters.source_node }}
+      SOURCE_UID: ${{ parameters.source_uid }}
+      SOURCE_PROVIDER_ID: ${{ parameters.source_provider_id }}
+      SOURCE_NETWORK_CONTAINER_ID: ${{ parameters.source_network_container_id }}
+      SOURCE_ROOT: $(Pipeline.Workspace)/s
+      TFVARS_PATH: ${{ parameters.tfvars_path }}
+      ARTIFACT_STAGING_DIRECTORY: $(Build.ArtifactStagingDirectory)
+      PRIVATE_TEMP_ROOT: $(Agent.TempDirectory)
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish single-worker CNI maintenance diagnostics"
+    condition: >-
+      and(always(),
+      eq(variables['CNI_WORKER_MAINTENANCE_DIAGNOSTICS_READY'], 'true'))
+    inputs:
+      targetPath: "$(Build.ArtifactStagingDirectory)/n100-cni-worker-maintenance"
+      artifact: "n100-cni-worker-maintenance-$(Build.BuildId)-$(System.JobAttempt)"

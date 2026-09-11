@@ -30,6 +30,7 @@ jobs:
           if [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
             [ "$OVERLAY_MODE" != "resume-existing" ] ||
             [ "${RETIREMENT_ONLY,,}" = "true" ] ||
+            [ "${CNI_MAINTENANCE_ONLY,,}" = "true" ] ||
             [ "${CLUSTERMESH_PRESERVED_AKS_ARM_RECONCILE_ENABLED:-false}" != "true" ]; then
             echo "ARM repair-only mode requires enabled existing-n100 repair and no other maintenance mode." >&2
             exit 1
@@ -39,6 +40,7 @@ jobs:
           EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
           OVERLAY_MODE: ${{ parameters.overlay_mode }}
           RETIREMENT_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_ONLY)
+          CNI_MAINTENANCE_ONLY: $(CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY)
 
       - template: /steps/setup-tests.yml
         parameters:

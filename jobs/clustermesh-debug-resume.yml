@@ -91,7 +91,8 @@ jobs:
   condition: >-
     and(succeeded(),
     ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'),
-    ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'))
+    ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'),
+    ne(variables['CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY'], 'true'))
   variables:
     CLUSTERMESH_JOB_TIMEOUT_MINUTES: ${{ parameters.timeout_in_minutes }}
     CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: ${{ parameters.cancel_timeout_in_minutes }}

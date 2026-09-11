@@ -33,6 +33,7 @@ jobs:
           set -euo pipefail
           if [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
             [ "${ARM_REPAIR_ONLY,,}" = "true" ] ||
+            [ "${CNI_MAINTENANCE_ONLY,,}" = "true" ] ||
             [ -z "$RETIREMENT_ROLE" ] ||
             [ -z "$RETIREMENT_NODE" ] ||
             [ -z "$RETIREMENT_UID" ]; then
@@ -43,6 +44,7 @@ jobs:
         env:
           EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
           ARM_REPAIR_ONLY: $(CLUSTERMESH_ARM_REPAIR_ONLY)
+          CNI_MAINTENANCE_ONLY: $(CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY)
           RETIREMENT_ROLE: ${{ parameters.retirement_role }}
           RETIREMENT_NODE: ${{ parameters.retirement_node }}
           RETIREMENT_UID: ${{ parameters.retirement_uid }}

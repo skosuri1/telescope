@@ -73,6 +73,24 @@ parameters:
   - name: scaleDebugArmRepairOnly
     type: boolean
     default: false
+  - name: scaleDebugCniWorkerMaintenanceOnly
+    type: boolean
+    default: false
+  - name: scaleDebugCniWorkerRole
+    type: string
+    default: ""
+  - name: scaleDebugCniWorkerNode
+    type: string
+    default: ""
+  - name: scaleDebugCniWorkerUid
+    type: string
+    default: ""
+  - name: scaleDebugCniWorkerProviderId
+    type: string
+    default: ""
+  - name: scaleDebugCniWorkerNetworkContainerId
+    type: string
+    default: ""
   - name: scaleDebugLeaseExtensionHours
     type: number
     default: 168
@@ -2941,6 +2959,7 @@ stages:
     variables:
       CLUSTERMESH_PREPARED_RETIREMENT_ONLY: ${{ parameters.scaleDebugPreparedRetirementOnly }}
       CLUSTERMESH_ARM_REPAIR_ONLY: ${{ parameters.scaleDebugArmRepairOnly }}
+      CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY: ${{ parameters.scaleDebugCniWorkerMaintenanceOnly }}
       AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       MOCK_ACR_HOST: mockmeshshared11225.azurecr.io
@@ -3065,6 +3084,21 @@ stages:
               expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
               tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
               overlay_mode: ${{ parameters.debugMode }}
+      - ${{ if eq(parameters.scaleDebugCniWorkerMaintenanceOnly, true) }}:
+          - template: /jobs/clustermesh-cni-worker-maintenance.yml
+            parameters:
+              target_run_id: ${{ parameters.debugTargetRunId }}
+              expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
+              expected_region: ${{ parameters.scaleDebugRegion }}
+              expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
+              tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
+              overlay_mode: ${{ parameters.debugMode }}
+              run_workload: ${{ parameters.scaleDebugRunWorkload }}
+              source_role: ${{ parameters.scaleDebugCniWorkerRole }}
+              source_node: ${{ parameters.scaleDebugCniWorkerNode }}
+              source_uid: ${{ parameters.scaleDebugCniWorkerUid }}
+              source_provider_id: ${{ parameters.scaleDebugCniWorkerProviderId }}
+              source_network_container_id: ${{ parameters.scaleDebugCniWorkerNetworkContainerId }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}

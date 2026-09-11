@@ -154,6 +154,23 @@ success. It refuses multiple broken sources, image/operation drift, unknown
 workloads and larger healthy-source evacuations. It does not raise the generic
 mock-reconciliation guard or automatic capacity-repair limit.
 
+When local Azure permissions are unavailable, the same helper can run through
+the existing service connection in the preserved n100 resume stage. Select
+`debugMode=resume-existing`, `scaleDebugCniWorkerMaintenanceOnly=true`, and
+`scaleDebugRunWorkload=false`; leave the other maintenance-only modes disabled.
+Supply `scaleDebugCniWorkerRole`, `scaleDebugCniWorkerNode`,
+`scaleDebugCniWorkerUid`, `scaleDebugCniWorkerProviderId`, and
+`scaleDebugCniWorkerNetworkContainerId` from the explicit source plan.
+
+The maintenance-only job obtains private, job-local credentials, runs the
+read-only plan, then invokes the same helper with `--execute` and fresh proof.
+Credentials are removed on exit and are never included in the
+`n100-cni-worker-maintenance-<build>-<attempt>` diagnostic artifact. No CL2,
+Fleet rejoin, or separate failed-pool reconciliation runs in this mode.
+Completion still requires the helper's exact final count, workload, peer, and
+cleanup gates; it is not scenario success or permission to skip normal resume
+preflight.
+
 ## Running via the telescope pipeline
 
 Add a stage to `pipelines/perf-eval/Network Benchmark/clustermesh-scale.yml` that

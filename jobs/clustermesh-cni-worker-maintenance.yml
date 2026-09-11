@@ -1,0 +1,87 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: tfvars_path
+    type: string
+  - name: overlay_mode
+    type: string
+  - name: run_workload
+    type: boolean
+  - name: source_role
+    type: string
+  - name: source_node
+    type: string
+  - name: source_uid
+    type: string
+  - name: source_provider_id
+    type: string
+  - name: source_network_container_id
+    type: string
+
+jobs:
+  - job: cni_worker_maintenance
+    displayName: "Replace one explicitly selected CNI-broken worker"
+    variables:
+      SCENARIO_NAME: clustermesh-scale
+      CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "120"
+      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "30"
+      SUITE_TOTAL_BUDGET_SECONDS: "0"
+      AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
+    timeoutInMinutes: 120
+    cancelTimeoutInMinutes: 30
+    steps:
+      - script: |
+          set -euo pipefail
+          if [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
+            [ "$OVERLAY_MODE" != "resume-existing" ] ||
+            [ "${RUN_WORKLOAD,,}" != "false" ] ||
+            [ "${ARM_REPAIR_ONLY,,}" = "true" ] ||
+            [ "${RETIREMENT_ONLY,,}" = "true" ] ||
+            [ -z "$SOURCE_ROLE" ] ||
+            [ -z "$SOURCE_NODE" ] ||
+            [ -z "$SOURCE_UID" ] ||
+            [ -z "$SOURCE_PROVIDER_ID" ] ||
+            [ -z "$SOURCE_NETWORK_CONTAINER_ID" ]; then
+            echo "CNI maintenance requires existing n100, no workload/other maintenance mode, and one complete source plan." >&2
+            exit 1
+          fi
+        displayName: "Require one explicit existing-n100 CNI source"
+        env:
+          EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+          OVERLAY_MODE: ${{ parameters.overlay_mode }}
+          RUN_WORKLOAD: "${{ parameters.run_workload }}"
+          ARM_REPAIR_ONLY: $(CLUSTERMESH_ARM_REPAIR_ONLY)
+          RETIREMENT_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_ONLY)
+          SOURCE_ROLE: ${{ parameters.source_role }}
+          SOURCE_NODE: ${{ parameters.source_node }}
+          SOURCE_UID: ${{ parameters.source_uid }}
+          SOURCE_PROVIDER_ID: ${{ parameters.source_provider_id }}
+          SOURCE_NETWORK_CONTAINER_ID: ${{ parameters.source_network_container_id }}
+
+      - template: /steps/setup-tests.yml
+        parameters:
+          cloud: azure
+          region: ${{ parameters.expected_region }}
+          run_id: ${{ parameters.target_run_id }}
+          credential_type: service_connection
+          ssh_key_enabled: false
+
+      - template: /steps/topology/clustermesh-scale/reuse/maintain-cni-worker.yml
+        parameters:
+          target_run_id: ${{ parameters.target_run_id }}
+          expected_subscription_id: ${{ parameters.expected_subscription_id }}
+          expected_region: ${{ parameters.expected_region }}
+          expected_cluster_count: ${{ parameters.expected_cluster_count }}
+          tfvars_path: ${{ parameters.tfvars_path }}
+          source_role: ${{ parameters.source_role }}
+          source_node: ${{ parameters.source_node }}
+          source_uid: ${{ parameters.source_uid }}
+          source_provider_id: ${{ parameters.source_provider_id }}
+          source_network_container_id: ${{ parameters.source_network_container_id }}

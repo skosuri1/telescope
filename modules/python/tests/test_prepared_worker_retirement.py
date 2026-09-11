@@ -508,7 +508,8 @@ def test_pipeline_wires_retirement_before_arm_recovery():
     assert job["jobs"][0]["condition"] == (
         "and(succeeded(), "
         "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'), "
-        "ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'))"
+        "ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'), "
+        "ne(variables['CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY'], 'true'))"
     )
     retirement_jobs = stage["jobs"][0][
         "${{ if eq(parameters.scaleDebugPreparedRetirementOnly, true) }}"
@@ -521,6 +522,7 @@ def test_pipeline_wires_retirement_before_arm_recovery():
 @pytest.mark.parametrize("job_name", [
     "clustermesh-prepared-worker-retirement.yml",
     "clustermesh-arm-repair.yml",
+    "clustermesh-cni-worker-maintenance.yml",
 ])
 def test_maintenance_bootstrap_resolves_vendored_fleet_wheel(job_name):
     repository = MODULE_DIR.parents[3]
