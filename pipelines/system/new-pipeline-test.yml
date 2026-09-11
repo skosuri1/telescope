@@ -58,6 +58,18 @@ parameters:
   - name: scaleDebugMockCniRecoveryRoles
     type: string
     default: ""
+  - name: scaleDebugPreparedRetirementRole
+    type: string
+    default: ""
+  - name: scaleDebugPreparedRetirementNode
+    type: string
+    default: ""
+  - name: scaleDebugPreparedRetirementUid
+    type: string
+    default: ""
+  - name: scaleDebugPreparedRetirementOnly
+    type: boolean
+    default: false
   - name: scaleDebugLeaseExtensionHours
     type: number
     default: 168
@@ -2924,6 +2936,7 @@ stages:
       eq(variables['CLUSTERMESH_DEBUG_MODE'], 'resume-existing')))
     displayName: "DEBUG scale resume preserved AKS clusters"
     variables:
+      CLUSTERMESH_PREPARED_RETIREMENT_ONLY: ${{ parameters.scaleDebugPreparedRetirementOnly }}
       AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       MOCK_ACR_HOST: mockmeshshared11225.azurecr.io
@@ -3028,6 +3041,17 @@ stages:
       CL2_PROBE_WINDOW_DURATION: "60m"
       CL2_PROBE_PREWAIT_S: "600"
     jobs:
+      - ${{ if eq(parameters.scaleDebugPreparedRetirementOnly, true) }}:
+          - template: /jobs/clustermesh-prepared-worker-retirement.yml
+            parameters:
+              target_run_id: ${{ parameters.debugTargetRunId }}
+              expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
+              expected_region: ${{ parameters.scaleDebugRegion }}
+              expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
+              tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
+              retirement_role: ${{ parameters.scaleDebugPreparedRetirementRole }}
+              retirement_node: ${{ parameters.scaleDebugPreparedRetirementNode }}
+              retirement_uid: ${{ parameters.scaleDebugPreparedRetirementUid }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}
@@ -3037,6 +3061,9 @@ stages:
             install: false
             operation_timeout: 90m
           topology: ${{ parameters.scaleDebugTopology }}
+          prepared_retirement_role: ${{ parameters.scaleDebugPreparedRetirementRole }}
+          prepared_retirement_node: ${{ parameters.scaleDebugPreparedRetirementNode }}
+          prepared_retirement_uid: ${{ parameters.scaleDebugPreparedRetirementUid }}
           matrix:
             n100_debug_resume:
               cl2_prom_snapshot_enabled: "true"

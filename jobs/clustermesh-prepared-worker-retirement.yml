@@ -1,0 +1,65 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: tfvars_path
+    type: string
+  - name: retirement_role
+    type: string
+  - name: retirement_node
+    type: string
+  - name: retirement_uid
+    type: string
+
+jobs:
+  - job: prepared_worker_retirement
+    displayName: "Finish one prepared n100 worker retirement"
+    variables:
+      SCENARIO_NAME: clustermesh-scale-mock
+      CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "120"
+      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "30"
+      SUITE_TOTAL_BUDGET_SECONDS: "0"
+      AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
+    timeoutInMinutes: 120
+    cancelTimeoutInMinutes: 30
+    steps:
+      - script: |
+          set -euo pipefail
+          if [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
+            [ -z "$RETIREMENT_ROLE" ] ||
+            [ -z "$RETIREMENT_NODE" ] ||
+            [ -z "$RETIREMENT_UID" ]; then
+            echo "Retirement-only mode requires n100 and an explicit role/node/UID plan." >&2
+            exit 1
+          fi
+        displayName: "Require an explicit prepared worker plan"
+        env:
+          EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+          RETIREMENT_ROLE: ${{ parameters.retirement_role }}
+          RETIREMENT_NODE: ${{ parameters.retirement_node }}
+          RETIREMENT_UID: ${{ parameters.retirement_uid }}
+
+      - template: /steps/setup-tests.yml
+        parameters:
+          cloud: azure
+          region: ${{ parameters.expected_region }}
+          run_id: ${{ parameters.target_run_id }}
+          credential_type: service_connection
+          ssh_key_enabled: false
+
+      - template: /steps/topology/clustermesh-scale/reuse/retire-prepared-worker.yml
+        parameters:
+          target_run_id: ${{ parameters.target_run_id }}
+          expected_subscription_id: ${{ parameters.expected_subscription_id }}
+          expected_region: ${{ parameters.expected_region }}
+          expected_cluster_count: ${{ parameters.expected_cluster_count }}
+          tfvars_path: ${{ parameters.tfvars_path }}
+          retirement_role: ${{ parameters.retirement_role }}
+          retirement_node: ${{ parameters.retirement_node }}
+          retirement_uid: ${{ parameters.retirement_uid }}

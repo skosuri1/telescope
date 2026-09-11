@@ -76,9 +76,19 @@ parameters:
 - name: mock_preservation_verification_resume_build_id
   type: number
   default: 0
+- name: prepared_retirement_role
+  type: string
+  default: ""
+- name: prepared_retirement_node
+  type: string
+  default: ""
+- name: prepared_retirement_uid
+  type: string
+  default: ""
 
 jobs:
 - job: azure
+  condition: and(succeeded(), ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'))
   variables:
     CLUSTERMESH_JOB_TIMEOUT_MINUTES: ${{ parameters.timeout_in_minutes }}
     CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: ${{ parameters.cancel_timeout_in_minutes }}
@@ -196,6 +206,17 @@ jobs:
       env:
         RUN_ID: ${{ parameters.target_run_id }}
         BASELINE_BUILD_ID: "${{ parameters.mock_preservation_baseline_build_id }}"
+
+  - template: /steps/topology/clustermesh-scale/reuse/retire-prepared-worker.yml
+    parameters:
+      target_run_id: ${{ parameters.target_run_id }}
+      expected_subscription_id: ${{ parameters.expected_subscription_id }}
+      expected_region: ${{ parameters.region }}
+      expected_cluster_count: ${{ parameters.expected_cluster_count }}
+      tfvars_path: ${{ parameters.tfvars_path }}
+      retirement_role: ${{ parameters.prepared_retirement_role }}
+      retirement_node: ${{ parameters.prepared_retirement_node }}
+      retirement_uid: ${{ parameters.prepared_retirement_uid }}
 
   - script: |
       set -euo pipefail

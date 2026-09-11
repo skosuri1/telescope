@@ -80,6 +80,45 @@ The full `CL2_MOCK_MODE` flow: a matrix var `mock_mode: true` auto-exports as
 --mock-mode` writes `CL2_MOCK_MODE: true` into the overrides → the config templates
 gate kwok-targeting + the mock PodMonitor.
 
+### Finishing an already prepared worker replacement
+
+`prepared_worker_retirement.py` completes one deliberately prepared n100
+maintenance operation: remove a UID-pinned, drained `default` worker and return
+the pool from four workers to three. It does not choose a worker, drain it,
+restart Pods, change disruption budgets, or increase the generic recovery limits.
+The source must already have its explicit CNI repair-hold record, and contain
+only verified `kube-system` DaemonSet Pods.
+
+The helper requires the preserved subscription, region, tfvars fingerprint,
+unexpired parent/node-group leases, exact 100-member Fleet identities, healthy
+VMSS state, all 100 owned mock agents and KWOK Nodes Ready, and strict real-agent
+peer proof. It submits at most one retirement request, preserves failure
+diagnostics, and requires the exact final count and unchanged workload identities.
+An authorization failure is not retried through another identity or API.
+
+The local CLI is read-only unless `--execute` is supplied:
+
+```bash
+python3 modules/python/clusterloader2/clustermesh-scale/prepared_worker_retirement.py \
+  --resource-group "$RUN_ID" --confirm-resource-group "$RUN_ID" \
+  --expected-subscription "$SUBSCRIPTION_ID" --expected-region "$REGION" \
+  --expected-tfvars-sha "$(sha256sum "$TFVARS_PATH" | awk '{print $1}')" \
+  --role "$ROLE" --node-name "$NODE_NAME" --node-uid "$NODE_UID" \
+  --summary-file "$OUTPUT_DIR/retirement.json"
+```
+
+For the `new-pipeline-test.yml` preserved n100 resume stage, set
+`scaleDebugPreparedRetirementRole`, `scaleDebugPreparedRetirementNode`, and
+`scaleDebugPreparedRetirementUid` to the explicit prepared plan. The same helper
+then runs through the existing service connection before ordinary resume gates.
+All three parameters default to empty, which disables retirement.
+
+Set `scaleDebugPreparedRetirementOnly=true` to run only this maintenance job,
+without Fleet/pool reconciliation, CL2, or scenario telemetry setup. This is
+useful when local permissions prevent finishing an already drained replacement.
+It does not count as a workload run. Diagnostics are published as
+`n100-prepared-worker-retirement-<build>-<attempt>`.
+
 ## Running via the telescope pipeline
 
 Add a stage to `pipelines/perf-eval/Network Benchmark/clustermesh-scale.yml` that
