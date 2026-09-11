@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,6 +45,7 @@ RETIREMENT_PHASE_BUDGET_SECONDS = 300
 RETIREMENT_MINIMUM_SECONDS = 180
 DRAIN_PHASE_BUDGET_SECONDS = 900
 KWOK_READY_WAIT_SECONDS = 300
+SURGE_READY_WAIT_SECONDS = 300
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -81,6 +83,10 @@ Runner = Callable[[Sequence[str], int], str]
 
 class MaintenanceInterrupted(workers.ReconcileError):
     """The bounded maintenance workflow was interrupted."""
+
+
+class FreshWorkersNotReady(workers.ReconcileError):
+    """Only expected fresh-worker registration or Ready convergence is pending."""
 
 
 def require(condition: bool, message: str) -> None:
@@ -351,6 +357,30 @@ def _validate_cluster_state(
         ),
         "Default pool is not fixed-count, quiescent, and image-stable",
     )
+    initial = _validate_source_workload(
+        args, selected_cluster, default_pool, nodes_payload, pods_payload,
+        events_payload, controller_payload, nnc_payload, source_held=False,
+    )
+    initial.update({
+        "initial_pool_count": default_pool.desired_count,
+        "expected_fresh_nodes": SURGE_POOL_COUNT - default_pool.desired_count,
+        "initial_pool_configuration": _pool_configuration(pool_payload),
+    })
+    return initial
+
+
+def _validate_source_workload(
+    args,
+    selected_cluster: dict,
+    default_pool: workers.PoolState,
+    nodes_payload: dict,
+    pods_payload: dict,
+    events_payload: dict,
+    controller_payload: dict,
+    nnc_payload: dict,
+    *,
+    source_held: bool,
+) -> dict:
     controller_uid, pod_template = mocks._controller_details(controller_payload)
     require(controller_payload.get("spec", {}).get("replicas") == 100, "Unexpected mock-agent StatefulSet replica count")
     kwok_nodes = _require_exact_kwok_nodes(nodes_payload)
@@ -385,8 +415,8 @@ def _validate_cluster_state(
     require(
         workers.node_is_ready(source)
         and not (source.get("metadata") or {}).get("deletionTimestamp")
-        and not (source.get("spec") or {}).get("unschedulable"),
-        "The explicit source worker is not a Ready schedulable source",
+        and bool((source.get("spec") or {}).get("unschedulable")) == source_held,
+        "The explicit source worker is not Ready with the expected scheduling state",
     )
     source_nnc = _nnc_map(nnc_payload).get(args.node_name)
     require(source_nnc is not None, "The explicit source NodeNetworkConfig is missing")
@@ -429,11 +459,12 @@ def _validate_cluster_state(
         f"Healthy source mock-agent count exceeds the safety cap {MAX_HEALTHY_SOURCE_AGENTS}",
     )
     return {
-        "initial_pool_count": default_pool.desired_count,
-        "expected_fresh_nodes": SURGE_POOL_COUNT - default_pool.desired_count,
-        "initial_pool_configuration": _pool_configuration(pool_payload),
         "controller_uid": controller_uid,
         "pod_template": pod_template,
+        "agent_uids": {
+            name: str((pod.get("metadata") or {}).get("uid") or "")
+            for name, pod in agents.items()
+        },
         "kwok_uids": {
             name: str((node.get("metadata") or {}).get("uid") or "")
             for name, node in kwok_nodes.items()
@@ -537,6 +568,292 @@ def _validate_pre_scale_state(
         args.node_name in real_nodes,
         "The explicit source worker disappeared before surge submission",
     )
+
+
+def _resume_options(args) -> bool:
+    values = (
+        getattr(args, "resume_build_id", 0),
+        getattr(args, "resume_summary", ""),
+        getattr(args, "resume_manifest", ""),
+    )
+    require(
+        not any(values) or (
+            all(values) and isinstance(values[0], int)
+            and not isinstance(values[0], bool) and values[0] > 0
+        ),
+        "--resume-build-id, --resume-summary and --resume-manifest require all three, with a positive build ID",
+    )
+    return bool(values[0])
+
+
+def _require_resume_paths(args) -> None:
+    inputs = [os.path.realpath(args.resume_summary), os.path.realpath(args.resume_manifest)]
+    require(
+        len(set(inputs)) == 2
+        and os.path.realpath(args.summary_file) not in inputs
+        and os.path.realpath(f"{args.summary_file}.retirement.json") not in inputs,
+        "Resume inputs and output summaries must be distinct files",
+    )
+
+
+def _read_resume_json(path: str) -> Tuple[dict, str]:
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, f"Duplicate resume artifact key: {key}")
+            result[key] = value
+        return result
+
+    with open(path, "rb") as stream:
+        data = stream.read()
+    try:
+        value = json.loads(data, object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError) as error:
+        raise workers.ReconcileError(f"Malformed resume artifact: {path}") from error
+    require(isinstance(value, dict), "Resume artifact must contain an object")
+    return value, hashlib.sha256(data).hexdigest()
+
+
+def _identity_map(value: object, description: str, names: Optional[Set[str]] = None) -> dict:
+    require(
+        isinstance(value, dict) and bool(value)
+        and all(isinstance(name, str) and name and isinstance(uid, str) and uid for name, uid in value.items()),
+        f"{description}: explicit nonempty identity map is required",
+    )
+    require(len(set(value.values())) == len(value), f"{description}: duplicate identities")
+    if names is not None:
+        require(set(value) == names, f"{description}: identity names are not exact")
+    return value
+
+
+def _load_resume(args) -> Optional[dict]:
+    if not _resume_options(args):
+        return None
+    _require_resume_paths(args)
+    prior, summary_sha = _read_resume_json(args.resume_summary)
+    manifest, manifest_sha = _read_resume_json(args.resume_manifest)
+    require(
+        isinstance(manifest.get("schema_version"), int)
+        and not isinstance(manifest["schema_version"], bool) and manifest["schema_version"] == 1
+        and isinstance(manifest.get("source_build_id"), int)
+        and not isinstance(manifest["source_build_id"], bool)
+        and manifest["source_build_id"] == args.resume_build_id,
+        "Resume manifest schema or source build ID does not match",
+    )
+    for key, expected in (
+        ("resource_group", args.resource_group), ("role", args.role),
+        ("source_worker", args.node_name), ("source_worker_uid", args.node_uid),
+    ):
+        require(prior.get(key) == expected and manifest.get(key) == expected, f"Resume {key} does not match the explicit scope")
+    require(
+        prior.get("scope") == "single-source-real-worker-cni-maintenance"
+        and prior.get("source_provider_id") == args.source_provider_id
+        and prior.get("source_network_container_id") == args.source_network_container_id,
+        "Resume prior scope, source providerID or network container does not match",
+    )
+    for key, expected in (
+        ("source_build_id", args.resume_build_id),
+        ("expected_subscription", args.expected_subscription),
+        ("expected_region", args.expected_region),
+        ("expected_tfvars_sha", args.expected_tfvars_sha),
+    ):
+        require(key not in prior or prior[key] == expected, f"Resume prior {key} does not match")
+    require(
+        prior.get("execute") is True and prior.get("success") is False
+        and prior.get("mutation_started") is True
+        and prior.get("surge_request_accepted") is True
+        and prior.get("source_quarantined") is True
+        and prior.get("status") == "waiting-for-surge"
+        and isinstance(prior.get("initial_pool_count"), int)
+        and not isinstance(prior["initial_pool_count"], bool)
+        and prior["initial_pool_count"] in (MIN_INITIAL_POOL_COUNT, STEADY_POOL_COUNT),
+        "Resume requires a failed executed, quarantined, accepted pre-probe surge from count 2 or 3",
+    )
+    forbidden_prefixes = ("pending_", "healthy_", "probe_", "fresh_ip_", "retirement", "source_pre_drain", "destination_memory")
+    for key, value in prior.items():
+        if key.startswith(forbidden_prefixes) or key in ("temporary_exclusions", "cleanup_errors", "cilium_final"):
+            require(not value, f"Resume refuses prior mutation or unclean evidence: {key}")
+    original = _identity_map(manifest.get("original_real_node_uids"), "Original real workers")
+    fresh = _identity_map(manifest.get("fresh_node_uids"), "Fresh real workers")
+    require(
+        original.get(args.node_name) == args.node_uid
+        and not set(original) & set(fresh)
+        and not set(original.values()) & set(fresh.values())
+        and len(fresh) == SURGE_POOL_COUNT - prior["initial_pool_count"],
+        "Resume original and fresh worker identities overlap or counts differ",
+    )
+    _identity_map(manifest.get("fresh_network_container_ids"), "Fresh network containers", set(fresh))
+    _identity_map(manifest.get("original_kwok_node_uids"), "Original KWOK Nodes", EXPECTED_AGENT_NAMES)
+    _identity_map(manifest.get("agent_uids"), "Original mock agents", EXPECTED_AGENT_NAMES)
+    require(isinstance(manifest.get("controller_uid"), str) and manifest["controller_uid"], "Original controller UID is required")
+    for key in ("original_real_node_uids", "original_kwok_node_uids", "agent_uids", "controller_uid"):
+        require(key not in prior or prior[key] == manifest[key], f"Resume manifest differs from persisted {key}")
+    require(
+        isinstance(prior.get("initial_pool_configuration"), dict)
+        and prior["initial_pool_configuration"]
+        and isinstance(prior.get("pod_template"), dict) and prior["pod_template"]
+        and isinstance(prior.get("initial_worker_state"), dict) and prior["initial_worker_state"],
+        "Resume requires the original worker state, pool configuration and Pod template",
+    )
+    _require_cilium_proof(prior.get("cilium_before") or {}, sorted(original))
+    return {
+        "prior": prior, "manifest": manifest,
+        "provenance": {
+            "source_build_id": args.resume_build_id,
+            "summary_sha256": summary_sha, "manifest_sha256": manifest_sha,
+            "prior_status": prior["status"], "prior_error": prior.get("error", ""),
+            "prior_source_quarantined": True, "prior_surge_request_accepted": True,
+        },
+    }
+
+
+def _require_resume_hold(args, nodes: dict) -> None:
+    hold = {"key": HOLD_ANNOTATION, "value": HOLD_REASON, "effect": "NoSchedule"}
+    cordon = {"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}
+    for name, node in nodes.items():
+        annotations = _annotations(node)
+        taints = _taints(node)
+        if name == args.node_name:
+            require(
+                annotations.get(HOLD_ANNOTATION)
+                == f"bounded-worker-retirement role={args.role} node={args.node_name} uid={args.node_uid}"
+                and taints.count(hold) == 1
+                and all(
+                    taint == hold or (
+                        isinstance(taint, dict)
+                        and {key: value for key, value in taint.items() if key != "timeAdded"}
+                        in (cordon, {**cordon, "value": ""})
+                    )
+                    for taint in taints
+                ),
+                "Resume source hold annotation or taint is not the exact original quarantine",
+            )
+        else:
+            require(not taints and HOLD_ANNOTATION not in annotations, f"{name}: unexpected hold or taint during resume")
+        require(
+            not any(key.startswith("mock-clustermesh/") and key != HOLD_ANNOTATION for key in annotations),
+            f"{name}: unclean maintenance annotation during resume",
+        )
+
+
+def _validate_resume_state(
+    args, selected, cluster_state, pool_payload, nodes_payload, pods_payload,
+    events_payload, controller_payload, nnc_payload, resume,
+) -> dict:
+    prior, manifest = resume["prior"], resume["manifest"]
+    original = manifest["original_real_node_uids"]
+    fresh = manifest["fresh_node_uids"]
+    union = {**original, **fresh}
+    _validate_pre_scale_state(
+        args, selected, cluster_state, pool_payload, nodes_payload,
+        SURGE_POOL_COUNT, prior["initial_pool_configuration"], union,
+    )
+    real = _real_node_map(nodes_payload)
+    require(
+        len(_items(nodes_payload, "Node inventory")) == len(real) + 100,
+        "Resume Node inventory contains unexpected identities",
+    )
+    _require_resume_hold(args, real)
+    for name, node in real.items():
+        require(
+            workers.node_is_ready(node)
+            and not (node.get("metadata") or {}).get("deletionTimestamp")
+            and bool((node.get("spec") or {}).get("unschedulable")) == (name == args.node_name),
+            f"{name}: resume real worker health or scheduling state changed",
+        )
+    default_pool = _pool_from_state(cluster_state, DEFAULT_POOL_NAME)
+    original_state = prior.get("initial_worker_state") or {}
+    require(
+        original_state.get("role") == args.role
+        and original_state.get("resource_group") == args.resource_group
+        and original_state.get("cluster_name") == selected["name"]
+        and original_state.get("healthy") is True,
+        "Resume original worker state scope or health is invalid",
+    )
+    old_pools = original_state.get("pools") or []
+    require(
+        isinstance(old_pools, list) and all(isinstance(pool, dict) for pool in old_pools)
+        and len(old_pools) == len(cluster_state.pools)
+        and len({pool.get("pool_name") for pool in old_pools}) == len(old_pools)
+        and {pool.get("pool_name") for pool in old_pools} == {pool.pool_name for pool in cluster_state.pools},
+        "Resume real pool inventory differs from the original",
+    )
+    old_by_pool = {pool["pool_name"]: pool for pool in old_pools}
+    for pool in cluster_state.pools:
+        old = old_by_pool[pool.pool_name]
+        original_nodes = [real[name] for name in original if mocks._node_pool_name(real[name]) == pool.pool_name]
+        current_nodes = [row for row in real.values() if mocks._node_pool_name(row) == pool.pool_name]
+        original_ids = sorted(workers.provider_identity(row)[1] for row in original_nodes)
+        current_ids = sorted(workers.provider_identity(row)[1] for row in current_nodes)
+        expected_old_count = prior["initial_pool_count"] if pool.pool_name == DEFAULT_POOL_NAME else pool.desired_count
+        require(
+            all(old.get(key) == getattr(pool, key) for key in ("role", "cluster_name", "resource_group", "node_resource_group", "vmss_name"))
+            and old.get("healthy") is True
+            and old.get("pool_provisioning_state") == old.get("vmss_provisioning_state") == "Succeeded"
+            and old.get("pool_power_state") == "Running"
+            and old.get("desired_count") == old.get("vmss_capacity") == expected_old_count
+            and len(original_ids) == len(set(original_ids)) == expected_old_count
+            and all(old.get(key) == original_ids for key in ("instance_ids", "node_instance_ids", "ready_instance_ids"))
+            and not any(old.get(key) for key in ("failed_instance_ids", "stale_instance_ids", "unsafe_reasons", "unschedulable_nodes"))
+            and not pool.failed_instance_ids
+            and len(current_ids) == len(set(current_ids)) == pool.desired_count
+            and pool.instance_ids == pool.node_instance_ids == pool.ready_instance_ids == current_ids
+            and all(workers.provider_identity(row)[0] == pool.vmss_name.lower() for row in current_nodes),
+            f"{pool.pool_name}: resume original/current VMSS instance identities or configuration changed",
+        )
+    require(all(mocks._node_pool_name(real[name]) == DEFAULT_POOL_NAME for name in fresh), "Resume fresh workers must belong to the original default pool")
+    if "original_real_node_identities" in prior:
+        require(
+            prior["original_real_node_identities"] == {name: _node_identity(real[name]) for name in original},
+            "Resume original real worker provider, pool, or image identity changed",
+        )
+    initial = _validate_source_workload(
+        args, selected, default_pool, nodes_payload, pods_payload, events_payload,
+        controller_payload, nnc_payload, source_held=True,
+    )
+    require(
+        initial["controller_uid"] == manifest["controller_uid"]
+        and initial["agent_uids"] == manifest["agent_uids"]
+        and initial["kwok_uids"] == manifest["original_kwok_node_uids"]
+        and initial["pod_template"] == prior["pod_template"],
+        "Resume original agent, KWOK, controller UID or template changed",
+    )
+    for kind in ("pending", "healthy"):
+        names = [row["name"] for row in initial[f"{kind}_source_agents"]]
+        old_names = prior.get(f"initial_{kind}_source_agents")
+        require(
+            isinstance(old_names, list) and all(isinstance(name, str) for name in old_names)
+            and len(old_names) == len(set(old_names))
+            and sorted(old_names) == sorted(names),
+            f"Resume original {kind} source agent set changed",
+        )
+    agents = _agent_map(pods_payload)
+    require(
+        all((pod.get("spec") or {}).get("nodeName") in original for pod in agents.values()),
+        "Resume agents have already moved to non-original workers",
+    )
+    nncs = _nnc_map(nnc_payload)
+    require(
+        len({row["network_container_id"] for row in nncs.values()}) == len(nncs),
+        "Resume network container identities are not unique",
+    )
+    for name, uid in fresh.items():
+        require(
+            name in nncs and nncs[name]["node_uid"] == uid
+            and nncs[name]["network_container_id"] == manifest["fresh_network_container_ids"][name],
+            f"{name}: resume fresh network container identity changed",
+        )
+    initial.update({
+        "initial_pool_count": prior["initial_pool_count"],
+        "expected_fresh_nodes": SURGE_POOL_COUNT - prior["initial_pool_count"],
+        "initial_pool_configuration": prior["initial_pool_configuration"],
+        "all_real_node_uids": original,
+        "initial_real_node_uids": {
+            name: uid for name, uid in original.items()
+            if mocks._node_pool_name(real[name]) == DEFAULT_POOL_NAME
+        },
+    })
+    return initial
 
 
 class ClusterOperator:
@@ -785,6 +1102,11 @@ def _fresh_nodes_after_scale(
     expected_fresh_nodes: int,
 ) -> List[dict]:
     all_real_nodes = _real_node_map(nodes_payload)
+    require(
+        len(_items(nodes_payload, "Node inventory"))
+        == len(all_real_nodes) + len(_kwok_map(nodes_payload)),
+        "Unexpected or ambiguous Node inventory during the surge",
+    )
     for name, uid in initial_all_real_node_uids.items():
         node = all_real_nodes.get(name)
         require(node is not None, f"{name}: an existing real worker disappeared during the surge")
@@ -798,7 +1120,15 @@ def _fresh_nodes_after_scale(
         subscription=args.expected_subscription,
         node_resource_group=str(selected_cluster["nodeResourceGroup"]),
     )
-    require(len(current) == SURGE_POOL_COUNT, "The default pool did not reach exactly four real workers")
+    require(
+        set(all_real_nodes) - set(current)
+        == set(initial_all_real_node_uids) - set(initial_real_node_uids),
+        "Unexpected non-default real worker during the surge",
+    )
+    require(
+        len(initial_real_node_uids) <= len(current) <= SURGE_POOL_COUNT,
+        "The default pool drifted outside the exact bounded worker count",
+    )
     for name, uid in initial_real_node_uids.items():
         node = current.get(name)
         require(node is not None, f"{name}: an existing default worker disappeared during the surge")
@@ -811,19 +1141,176 @@ def _fresh_nodes_after_scale(
         if name not in initial_real_node_uids
     ]
     require(
-        len(fresh) == expected_fresh_nodes,
-        f"Expected exactly {expected_fresh_nodes} fresh default worker(s)",
+        len(fresh) <= expected_fresh_nodes,
+        f"Expected at most {expected_fresh_nodes} fresh default worker(s)",
     )
-    require(
-        all(
-            workers.node_is_ready(node)
+    pending = len(fresh) != expected_fresh_nodes
+    startup_taints = [
+        {"key": "node.kubernetes.io/not-ready", "effect": effect}
+        for effect in ("NoSchedule", "NoExecute")
+    ]
+    expected_vmss = workers.provider_identity(current[args.node_name])[0]
+    for node in fresh:
+        require(
+            (node.get("metadata") or {}).get("uid")
             and not (node.get("metadata") or {}).get("deletionTimestamp")
             and not (node.get("spec") or {}).get("unschedulable")
-            for node in fresh
-        ),
-        "Fresh default workers are not all Ready and schedulable",
-    )
+            and workers.provider_identity(node)[0] == expected_vmss,
+            "Fresh default worker identity, VMSS, deletion, or scheduling state is unsafe",
+        )
+        taints = [
+            {key: value for key, value in taint.items() if key != "timeAdded" and value != ""}
+            for taint in _taints(node) if isinstance(taint, dict)
+        ]
+        require(
+            len(taints) == len(_taints(node))
+            and all(taint in startup_taints for taint in taints),
+            "Unexpected fresh worker taint during the surge",
+        )
+        pending = pending or not workers.node_is_ready(node) or bool(taints)
+    if pending:
+        raise FreshWorkersNotReady("Fresh default workers have not all registered Ready and schedulable")
     return fresh
+
+
+def _node_identity(node: dict) -> dict:
+    return {
+        "uid": (node.get("metadata") or {}).get("uid"),
+        "provider_id": _normalize_provider_id(str((node.get("spec") or {}).get("providerID") or "")),
+        "pool": mocks._node_pool_name(node),
+        "image": ((node.get("metadata") or {}).get("labels") or {}).get("kubernetes.azure.com/node-image-version"),
+    }
+
+
+def _startup_operator(operator: ClusterOperator) -> ClusterOperator:
+    budget = _phase_budget(
+        operator,
+        maximum_seconds=SURGE_READY_WAIT_SECONDS,
+        reserve_after_seconds=RETIREMENT_MINIMUM_SECONDS + FINAL_QUALIFICATION_RESERVE_SECONDS,
+        minimum_seconds=1,
+        description="fresh worker startup, retirement and final qualification",
+    )
+    return ClusterOperator(
+        operator.args, operator.cluster_name, operator.runner,
+        time.monotonic() + budget, operator.cleanup_deadline,
+    )
+
+
+def _wait_for_fresh_nodes(
+    operator: ClusterOperator,
+    args,
+    selected: dict,
+    initial: dict,
+    original_nodes: dict,
+) -> Tuple[dict, List[dict]]:
+    original = _real_node_map(original_nodes)
+    seen = {}
+    while time.monotonic() < operator.work_deadline:
+        pool = _current_pool_payload(operator, args, operator.cluster_name)
+        require(
+            pool.get("count") == SURGE_POOL_COUNT
+            and pool.get("provisioningState") == "Succeeded"
+            and (pool.get("powerState") or {}).get("code") == "Running"
+            and pool.get("enableAutoScaling") is False
+            and _pool_configuration(pool) == initial["initial_pool_configuration"],
+            "Default pool drifted after accepted surge",
+        )
+        state = workers.probe_cluster(
+            workers.Cluster(operator.cluster_name, args.resource_group, args.role, args.kubeconfig),
+            lambda command, timeout: operator.run(command, timeout),
+            args.request_timeout_seconds,
+        )
+        for observed_pool in state.pools:
+            if observed_pool.pool_name != DEFAULT_POOL_NAME:
+                require(observed_pool.healthy and not observed_pool.failed_instance_ids, "Unrelated real pool drifted during startup")
+                continue
+            original_instances = {
+                workers.provider_identity(original[name])[1]
+                for name in initial["initial_real_node_uids"]
+            }
+            require(
+                observed_pool.desired_count == observed_pool.vmss_capacity == SURGE_POOL_COUNT
+                and observed_pool.pool_provisioning_state == observed_pool.vmss_provisioning_state == "Succeeded"
+                and observed_pool.pool_power_state == "Running"
+                and len(observed_pool.instance_ids) == len(set(observed_pool.instance_ids)) == SURGE_POOL_COUNT
+                and not observed_pool.failed_instance_ids
+                and set(observed_pool.stale_instance_ids) <= set(observed_pool.instance_ids) - original_instances
+                and original_instances <= set(observed_pool.ready_instance_ids)
+                and set(observed_pool.ready_instance_ids) <= set(observed_pool.node_instance_ids) <= set(observed_pool.instance_ids)
+                and not observed_pool.unsafe_reasons
+                and observed_pool.unschedulable_nodes == [args.node_name]
+                and original_instances <= set(observed_pool.instance_ids),
+                "Default VMSS identity, health or count drifted during startup",
+            )
+        _pool_from_state(state, DEFAULT_POOL_NAME)
+        nodes = operator.kubectl_json(
+            ["get", "nodes", "-o", "json"], timeout_seconds=args.request_timeout_seconds,
+        )
+        current = _real_node_map(nodes)
+        _require_resume_hold(args, {name: current[name] for name in original if name in current})
+        for name, old in original.items():
+            observed = current.get(name) or {}
+            require(
+                _node_identity(observed) == _node_identity(old)
+                and workers.node_is_ready(observed)
+                and not (observed.get("metadata") or {}).get("deletionTimestamp")
+                and bool((observed.get("spec") or {}).get("unschedulable")) == (name == args.node_name),
+                f"{name}: original real worker identity or health drifted during startup",
+            )
+        for name, identity in seen.items():
+            require(
+                name in current and _node_identity(current[name]) == identity,
+                f"{name}: fresh worker identity drifted during startup",
+            )
+        for name, observed in current.items():
+            if name not in original:
+                require(
+                    _node_identity(observed)["image"] == pool.get("nodeImageVersion"),
+                    f"{name}: fresh worker image drifted during startup",
+                )
+                seen[name] = _node_identity(observed)
+        try:
+            fresh = _fresh_nodes_after_scale(
+                args, selected, nodes, initial["all_real_node_uids"],
+                initial["initial_real_node_uids"], initial["expected_fresh_nodes"],
+            )
+        except FreshWorkersNotReady:
+            time.sleep(min(args.poll_seconds, operator.remaining_seconds(args.poll_seconds)))
+            continue
+        return nodes, fresh
+    raise workers.ReconcileError("Fresh default worker readiness deadline expired")
+
+
+def _requalify_surge(operator, args, selected, initial, pinned_nodes, resume) -> None:
+    nodes = operator.kubectl_json(
+        ["get", "nodes", "-o", "json"], timeout_seconds=args.request_timeout_seconds,
+    )
+    expected = {name: _node_identity(row) for name, row in _real_node_map(pinned_nodes).items()}
+    require(
+        {name: _node_identity(row) for name, row in _real_node_map(nodes).items()} == expected,
+        "Pinned post-surge real worker identities changed before probing",
+    )
+    pool = _current_pool_payload(operator, args, operator.cluster_name)
+    state = workers.probe_cluster(
+        workers.Cluster(operator.cluster_name, args.resource_group, args.role, args.kubeconfig),
+        lambda command, timeout: operator.run(command, timeout),
+        args.request_timeout_seconds,
+    )
+    if resume:
+        _validate_resume_state(
+            args, selected, state, pool, nodes,
+            operator.kubectl_json(["-n", DEFAULT_NAMESPACE, "get", "pods", "-l", mocks.AGENT_SELECTOR, "-o", "json"]),
+            operator.kubectl_json(["-n", DEFAULT_NAMESPACE, "get", "events", "-o", "json"]),
+            operator.kubectl_json(["-n", DEFAULT_NAMESPACE, "get", "statefulset", "kwok-node", "-o", "json"]),
+            operator.kubectl_json(["get", "nnc", "-A", "-o", "json"]),
+            resume,
+        )
+    else:
+        _validate_pre_scale_state(
+            args, selected, state, pool, nodes, SURGE_POOL_COUNT,
+            initial["initial_pool_configuration"], {name: row["uid"] for name, row in expected.items()},
+        )
+        _require_resume_hold(args, _real_node_map(nodes))
 
 
 def _daemonset_tuple(pod: dict) -> Tuple[str, str, str]:
@@ -1073,6 +1560,11 @@ def _prove_fresh_ip_growth(
             timeout_seconds=args.request_timeout_seconds,
         )
     )
+    for name, nc_id in summary.get("resume_fresh_network_container_ids", {}).items():
+        require(
+            name in before_nnc and before_nnc[name]["network_container_id"] == nc_id,
+            f"{name}: resume fresh network container changed before probing",
+        )
     summary["fresh_ip_growth"] = {}
     summary["probe_cleanup_pending"] = []
     _save(args.summary_file, summary)
@@ -2103,7 +2595,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--probe-pod-count", type=int, default=20)
     parser.add_argument("--memory-threshold-percent", type=int, default=85)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--resume-build-id", type=int, default=0)
+    parser.add_argument("--resume-summary", default="")
+    parser.add_argument("--resume-manifest", default="")
     args = parser.parse_args(argv)
+    try:
+        if _resume_options(args):
+            _require_resume_paths(args)
+    except workers.ReconcileError as error:
+        parser.error(str(error))
     if args.confirm_resource_group != args.resource_group:
         parser.error("--confirm-resource-group must exactly match --resource-group")
     if ROLE_RE.fullmatch(args.role) is None:
@@ -2136,6 +2636,7 @@ def execute_maintenance(
 ) -> None:
     """Run one bounded single-source CNI worker replacement."""
 
+    resume = _load_resume(args)
     total_deadline = time.monotonic() + args.timeout_seconds
     cleanup_reserve = min(120, max(30, args.timeout_seconds // 5))
     work_deadline = total_deadline - cleanup_reserve
@@ -2144,7 +2645,22 @@ def execute_maintenance(
         "started_at": utc_now(),
         "status": "starting",
         "cleanup_reserve_seconds": cleanup_reserve,
+        "scope": "single-source-real-worker-cni-maintenance",
+        "resource_group": args.resource_group,
+        "role": args.role,
+        "source_worker": args.node_name,
+        "source_worker_uid": args.node_uid,
+        "source_provider_id": args.source_provider_id,
+        "source_network_container_id": args.source_network_container_id,
+        "expected_subscription": args.expected_subscription,
+        "expected_region": args.expected_region,
+        "expected_tfvars_sha": args.expected_tfvars_sha,
+        "execute": args.execute,
+        "mutation_started": False,
+        "success": False,
     })
+    if resume:
+        summary["resume_provenance"] = resume["provenance"]
     _save(args.summary_file, summary)
     cleanup_errors: List[str] = summary.setdefault("cleanup_errors", [])
     interrupted = {"raised": None}
@@ -2212,8 +2728,12 @@ def execute_maintenance(
             lambda command, timeout: operator.run(command, timeout),
             args.request_timeout_seconds,
         )
-        summary["initial_worker_state"] = workers.state_to_dict(cluster_state)
-        summary["initial_pool_configuration"] = _pool_configuration(pool_payload)
+        summary["initial_worker_state"] = (
+            resume["prior"]["initial_worker_state"] if resume else workers.state_to_dict(cluster_state)
+        )
+        summary["initial_pool_configuration"] = (
+            resume["prior"]["initial_pool_configuration"] if resume else _pool_configuration(pool_payload)
+        )
         _save(args.summary_file, summary)
         nodes_payload = operator.kubectl_json(
             ["get", "nodes", "-o", "json"],
@@ -2235,16 +2755,13 @@ def execute_maintenance(
             ["get", "nnc", "-A", "-o", "json"],
             timeout_seconds=args.request_timeout_seconds,
         )
-        initial = _validate_cluster_state(
-            args,
-            selected,
-            cluster_state,
-            pool_payload,
-            nodes_payload,
-            pods_payload,
-            events_payload,
-            controller_payload,
-            nnc_payload,
+        validation_args = (
+            args, selected, cluster_state, pool_payload, nodes_payload,
+            pods_payload, events_payload, controller_payload, nnc_payload,
+        )
+        initial = (
+            _validate_resume_state(*validation_args, resume)
+            if resume else _validate_cluster_state(*validation_args)
         )
         summary["initial_pool_count"] = initial["initial_pool_count"]
         summary["initial_pending_source_agents"] = [
@@ -2254,7 +2771,50 @@ def execute_maintenance(
             row["name"] for row in initial["healthy_source_agents"]
         ]
         summary["pod_template"] = initial["pod_template"]
-        summary["cilium_before"] = _read_cilium_proof(operator, args, identities)
+        summary["original_real_node_uids"] = initial["all_real_node_uids"]
+        summary["original_real_node_identities"] = {
+            name: _node_identity(_real_node_map(nodes_payload)[name])
+            for name in initial["all_real_node_uids"]
+        }
+        summary["original_kwok_node_uids"] = initial["kwok_uids"]
+        summary["agent_uids"] = initial["agent_uids"]
+        summary["controller_uid"] = initial["controller_uid"]
+        if resume:
+            summary["source_quarantined"] = True
+            summary["surge_request_accepted"] = True
+            summary["resume_worker_state"] = workers.state_to_dict(cluster_state)
+            summary["resume_fresh_network_container_ids"] = resume["manifest"]["fresh_network_container_ids"]
+            system_pods = operator.kubectl_json(
+                ["get", "pods", "-A", "-o", "json"], timeout_seconds=args.request_timeout_seconds,
+            )
+            require(
+                not any(
+                    PROBE_LABEL_KEY in ((pod.get("metadata") or {}).get("labels") or {})
+                    or str((pod.get("metadata") or {}).get("name") or "").startswith("cni-maint-probe")
+                    for pod in _items(system_pods, "Pod inventory")
+                ),
+                "Resume refuses existing maintenance probe Pods",
+            )
+            summary["resume_source_pre_drain"] = _validate_pre_drain_source_pods(
+                [
+                    pod for pod in _items(system_pods, "Pod inventory")
+                    if (pod.get("spec") or {}).get("nodeName") == args.node_name
+                    and not (
+                        (pod.get("metadata") or {}).get("namespace") == DEFAULT_NAMESPACE
+                        and (pod.get("metadata") or {}).get("name") in EXPECTED_AGENT_NAMES
+                    )
+                ],
+                operator.kubectl_json(["-n", "kube-system", "get", "daemonsets", "-o", "json"]),
+                operator.kubectl_json(["get", "replicasets", "-A", "-o", "json"]),
+                operator.kubectl_json(["get", "deployments", "-A", "-o", "json"]),
+                operator.kubectl_json(["get", "statefulsets", "-A", "-o", "json"]),
+            )
+            startup = _startup_operator(operator)
+            applicable = _derive_applicable_daemonsets(
+                system_pods, sorted(name for name in initial["initial_real_node_uids"] if name != args.node_name),
+            )
+            _wait_for_fresh_daemonsets(startup, args, applicable, sorted(resume["manifest"]["fresh_node_uids"]))
+        summary["cilium_before"] = _read_cilium_proof(startup if resume else operator, args, identities)
         _save(args.summary_file, summary)
         _require_cilium_proof(summary["cilium_before"], sorted(_real_node_map(nodes_payload)))
         if not args.execute:
@@ -2263,81 +2823,56 @@ def execute_maintenance(
             _save(args.summary_file, summary)
             return
 
-        summary["mutation_started"] = True
-        _add_source_hold(operator, args, summary)
-        current_pool = _current_pool_payload(operator, args, cluster_name)
-        current_state = workers.probe_cluster(
-            workers.Cluster(cluster_name, args.resource_group, args.role, args.kubeconfig),
-            lambda command, timeout: operator.run(command, timeout),
-            args.request_timeout_seconds,
-        )
-        current_nodes = operator.kubectl_json(
-            ["get", "nodes", "-o", "json"],
-            timeout_seconds=args.request_timeout_seconds,
-        )
-        _validate_pre_scale_state(
-            args,
-            selected,
-            current_state,
-            current_pool,
-            current_nodes,
-            initial["initial_pool_count"],
-            initial["initial_pool_configuration"],
-            initial["all_real_node_uids"],
-        )
         baseline_config = initial["initial_pool_configuration"]
-        operator.run(
-            [
-                "az",
-                "aks",
-                "nodepool",
-                "scale",
-                "--resource-group",
-                args.resource_group,
-                "--cluster-name",
-                cluster_name,
-                "--name",
-                DEFAULT_POOL_NAME,
-                "--node-count",
-                str(SURGE_POOL_COUNT),
-                "--no-wait",
-                "--output",
-                "none",
-                "--only-show-errors",
-            ],
-            args.request_timeout_seconds,
-        )
-        summary["surge_request_accepted"] = True
-        summary["status"] = "waiting-for-surge"
-        _save(args.summary_file, summary)
-        surge_pool = _wait_for_surge(
-            operator,
-            args,
-            cluster_name,
-            baseline_config,
-            initial["initial_pool_count"],
-        )
-        surge_nodes = operator.kubectl_json(
-            ["get", "nodes", "-o", "json"],
-            timeout_seconds=args.request_timeout_seconds,
-        )
-        fresh_nodes = _fresh_nodes_after_scale(
-            args,
-            selected,
-            surge_nodes,
-            initial["all_real_node_uids"],
-            initial["initial_real_node_uids"],
-            initial["expected_fresh_nodes"],
-        )
+        if resume:
+            surge_pool, surge_nodes = pool_payload, nodes_payload
+            fresh_nodes = [_real_node_map(nodes_payload)[name] for name in sorted(resume["manifest"]["fresh_node_uids"])]
+        else:
+            summary["mutation_started"] = True
+            _add_source_hold(operator, args, summary)
+            current_pool = _current_pool_payload(operator, args, cluster_name)
+            current_state = workers.probe_cluster(
+                workers.Cluster(cluster_name, args.resource_group, args.role, args.kubeconfig),
+                lambda command, timeout: operator.run(command, timeout),
+                args.request_timeout_seconds,
+            )
+            current_nodes = operator.kubectl_json(
+                ["get", "nodes", "-o", "json"], timeout_seconds=args.request_timeout_seconds,
+            )
+            require(
+                {name: _node_identity(row) for name, row in _real_node_map(current_nodes).items()}
+                == summary["original_real_node_identities"],
+                "Original real worker provider, pool or image identity changed before surge",
+            )
+            _validate_pre_scale_state(
+                args, selected, current_state, current_pool, current_nodes,
+                initial["initial_pool_count"], baseline_config, initial["all_real_node_uids"],
+            )
+            operator.run(
+                [
+                    "az", "aks", "nodepool", "scale",
+                    "--resource-group", args.resource_group, "--cluster-name", cluster_name,
+                    "--name", DEFAULT_POOL_NAME, "--node-count", str(SURGE_POOL_COUNT),
+                    "--no-wait", "--output", "none", "--only-show-errors",
+                ],
+                args.request_timeout_seconds,
+            )
+            summary["surge_request_accepted"] = True
+            summary["status"] = "waiting-for-surge"
+            _save(args.summary_file, summary)
+            surge_pool = _wait_for_surge(
+                operator, args, cluster_name, baseline_config, initial["initial_pool_count"],
+            )
+            startup = _startup_operator(operator)
+            surge_nodes, fresh_nodes = _wait_for_fresh_nodes(
+                startup, args, selected, initial, current_nodes,
+            )
         fresh_node_names = [
             str((node.get("metadata") or {}).get("name") or "")
             for node in fresh_nodes
         ]
         summary["fresh_nodes"] = fresh_node_names
         summary["pool_configuration_after_surge"] = _pool_configuration(surge_pool)
-        summary["cilium_after_surge"] = _read_cilium_proof(operator, args, identities)
-        _save(args.summary_file, summary)
-        _require_cilium_proof(summary["cilium_after_surge"], sorted(_real_node_map(surge_nodes)))
         system_pods = operator.kubectl_json(
             ["get", "pods", "-A", "-o", "json"],
             timeout_seconds=args.request_timeout_seconds,
@@ -2347,7 +2882,14 @@ def execute_maintenance(
             if name != args.node_name
         )
         applicable_daemonsets = _derive_applicable_daemonsets(system_pods, existing_non_source)
-        _wait_for_fresh_daemonsets(operator, args, applicable_daemonsets, fresh_node_names)
+        _wait_for_fresh_daemonsets(startup, args, applicable_daemonsets, fresh_node_names)
+        summary["cilium_after_surge"] = _read_cilium_proof(startup, args, identities)
+        _save(args.summary_file, summary)
+        _require_cilium_proof(summary["cilium_after_surge"], sorted(_real_node_map(surge_nodes)))
+        _requalify_surge(operator, args, selected, initial, surge_nodes, resume)
+        summary["status"] = "proving-fresh-ip-growth"
+        summary["mutation_started"] = True
+        _save(args.summary_file, summary)
         _prove_fresh_ip_growth(operator, args, cluster, fresh_nodes, summary)
         require(
             not mocks._tolerates(
@@ -2510,8 +3052,14 @@ def execute_maintenance(
             minimum_seconds=RETIREMENT_MINIMUM_SECONDS,
             description="prepared retirement",
         )
-        retirement.execute_retirement(retirement_args, retirement_summary, runner)
         summary["retirement"] = retirement_summary
+        summary["status"] = "retiring-source"
+        _save(args.summary_file, summary)
+        try:
+            retirement.execute_retirement(retirement_args, retirement_summary, runner)
+        finally:
+            _save(args.summary_file, summary)
+        require(retirement_summary.get("success") is True, "Prepared source retirement did not succeed")
         summary["status"] = "final-qualification"
         _save(args.summary_file, summary)
         final_nodes = operator.kubectl_json(

@@ -154,6 +154,77 @@ success. It refuses multiple broken sources, image/operation drift, unknown
 workloads and larger healthy-source evacuations. It does not raise the generic
 mock-reconciliation guard or automatic capacity-repair limit.
 
+After ARM accepts the surge and reports four/Succeeded/Running, the helper
+observes expected new-worker registration and readiness for at most 300 seconds
+(less if needed to preserve cleanup, retirement and final-proof budgets). Only
+expected fresh-worker not-Ready observations are retried; original UID/provider,
+pool configuration/image, unexpected Node/taint, or VMSS/count drift fails
+immediately. Applicable fresh system DaemonSets must become Ready before strict
+99-peer proof on **every** real Cilium agent. This is read-only convergence, not
+another scale request or automatic rollback.
+
+#### Continuing an accepted, pre-probe surge
+
+Continuation is explicitly opt-in. Append **all three** arguments to the same
+local command above, still read-only unless `--execute` is included:
+
+```bash
+  --resume-build-id "$ORIGINAL_BUILD_ID" \
+  --resume-summary "$INPUT_DIR/maintenance.json" \
+  --resume-manifest "$INPUT_DIR/resume-manifest.json"
+```
+
+`--resume-build-id` is a positive integer (default `0`); both paths default to
+empty. Keep the original summary and manifest immutable and use a **different**
+`--summary-file` for this invocation. The caller must obtain the original
+`maintenance.json` artifact from the **same project, pipeline definition and
+specified build**; the helper makes no ADO calls and cannot attest artifact
+origin itself. The supplemental operator manifest must be pinned to genuine
+pre-operation snapshots, not reconstructed from today's workloads:
+
+```json
+{
+  "schema_version": 1,
+  "source_build_id": 79797,
+  "resource_group": "78751-f36f3d5a",
+  "role": "mesh-89",
+  "source_worker": "<original source Node name>",
+  "source_worker_uid": "<original source Node UID>",
+  "original_real_node_uids": {"<each original real Node, including prompool>": "<UID>"},
+  "original_kwok_node_uids": {"<each of the exact 100 kwok-node-N names>": "<original Node UID>"},
+  "agent_uids": {"<each of the exact 100 kwok-node-N names>": "<original Pod UID>"},
+  "controller_uid": "<original kwok-node StatefulSet UID>",
+  "fresh_node_uids": {"<each explicitly identified new default Node>": "<UID>"},
+  "fresh_network_container_ids": {"<same new Node names>": "<network-container ID>"}
+}
+```
+
+The map placeholders above must be expanded completely. Fresh Nodes number two
+after an original count of two, or one after an original count of three.
+New regular summaries persist original real/KWOK/agent/controller identities;
+manifests must agree with those records. Legacy summaries require the same full
+manifest; missing original identities are never inferred or silently accepted.
+
+Only a failed, executed `waiting-for-surge` summary with an accepted scale and
+the exact source quarantine is eligible. Any prior probe/growth or Pod-move
+intent/completion, retirement, or unclean cleanup/exclusion evidence is refused.
+Fresh validation repeats full 100-cluster ownership, authoritative Fleet
+identities and lease checks, node-resource-group ownership, actual fixed
+four-worker ARM/VMSS health, original configuration and instance sets, the exact
+original-plus-new Node UID union, original 100 agent/KWOK/controller/template
+identities, unchanged Pending/healthy source sets with UID-matched CNI events,
+new Node-owned network containers and the unchanged drain allowlist.
+
+A resumed plan leaves the existing hold untouched and reports
+`mutation_started=false` for this invocation. Resumed execution never re-adds
+the hold or submits scale/update: it requalifies system DaemonSets and all-agent
+99-peer identity proof, demands genuine **new** IP-batch growth on the pinned
+workers, then uses the unchanged bounded evacuation, memory/PDB/drain, single
+prepared retirement to three, final proof and cleanup flow. Provenance includes
+the source build, input hashes and original failure/quarantine evidence. A
+failed continuation retains its hold and failure evidence; it is not permission
+to resume partially moved workloads or perform arbitrary rollback.
+
 When local Azure permissions are unavailable, the same helper can run through
 the existing service connection in the preserved n100 resume stage. Select
 `debugMode=resume-existing`, `scaleDebugCniWorkerMaintenanceOnly=true`, and
@@ -161,6 +232,16 @@ the existing service connection in the preserved n100 resume stage. Select
 Supply `scaleDebugCniWorkerRole`, `scaleDebugCniWorkerNode`,
 `scaleDebugCniWorkerUid`, `scaleDebugCniWorkerProviderId`, and
 `scaleDebugCniWorkerNetworkContainerId` from the explicit source plan.
+
+For the narrowly scoped pre-probe continuation above, also set
+`scaleDebugCniWorkerResumeBuildId` to the original positive build ID and
+`scaleDebugCniWorkerResumeManifestJson` to the pinned schema-1 manifest JSON
+(at most 32,768 bytes). Both are required together; defaults `0` and empty leave
+normal maintenance unchanged. The job downloads
+`n100-cni-worker-maintenance-<build>-1` from that exact build in the same project
+and pipeline definition. It preserves the input summary and manifest in the new
+diagnostics and passes the same three resume CLI arguments to both the read-only
+plan and the explicit execution.
 
 The maintenance-only job obtains private, job-local credentials, runs the
 read-only plan, then invokes the same helper with `--execute` and fresh proof.

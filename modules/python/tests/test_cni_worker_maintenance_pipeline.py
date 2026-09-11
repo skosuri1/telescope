@@ -28,6 +28,16 @@ SOURCE_ENV = {
         "aks-default-test-vmss/virtualMachines/0"
     ),
     "SOURCE_NETWORK_CONTAINER_ID": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "RESUME_BUILD_ID": "0",
+    "RESUME_MANIFEST_JSON": "",
+}
+RESUME_MANIFEST = {
+    "schema_version": 1,
+    "source_build_id": 42,
+    "resource_group": "preserved-run",
+    "role": SOURCE_ENV["SOURCE_ROLE"],
+    "source_worker": SOURCE_ENV["SOURCE_NODE"],
+    "source_worker_uid": SOURCE_ENV["SOURCE_UID"],
 }
 
 
@@ -49,6 +59,12 @@ def template(path):
     ({"SOURCE_UID": ""}, 1),
     ({"SOURCE_PROVIDER_ID": ""}, 1),
     ({"SOURCE_NETWORK_CONTAINER_ID": ""}, 1),
+    ({"RESUME_BUILD_ID": "-1"}, 1),
+    ({"RESUME_BUILD_ID": "01"}, 1),
+    ({"RESUME_BUILD_ID": "42"}, 1),
+    ({"RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST)}, 1),
+    ({"RESUME_BUILD_ID": "43", "RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST)}, 1),
+    ({"RESUME_BUILD_ID": "42", "RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST)}, 0),
 ])
 def test_job_guard_rejects_incomplete_or_conflicting_modes(overrides, expected):
     script = template(JOB)["jobs"][0]["steps"][0]["script"]
@@ -87,6 +103,8 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
     pipeline = template("pipelines/system/new-pipeline-test.yml")
     parameters = {item["name"]: item for item in pipeline["parameters"]}
     assert parameters["scaleDebugCniWorkerMaintenanceOnly"]["default"] is False
+    assert parameters["scaleDebugCniWorkerResumeBuildId"]["default"] == 0
+    assert parameters["scaleDebugCniWorkerResumeManifestJson"]["default"] == ""
     source_parameters = {
         "source_role": "scaleDebugCniWorkerRole",
         "source_node": "scaleDebugCniWorkerNode",
@@ -106,17 +124,28 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
         assert invocation["parameters"][name] == "${{ parameters." + parameter + " }}"
     assert invocation["parameters"]["overlay_mode"] == "${{ parameters.debugMode }}"
     assert invocation["parameters"]["run_workload"] == "${{ parameters.scaleDebugRunWorkload }}"
+    assert invocation["parameters"]["resume_build_id"] == "${{ parameters.scaleDebugCniWorkerResumeBuildId }}"
+    assert invocation["parameters"]["resume_manifest_json"] == "${{ parameters.scaleDebugCniWorkerResumeManifestJson }}"
     assert stage["variables"]["CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY"] == (
         "${{ parameters.scaleDebugCniWorkerMaintenanceOnly }}"
     )
     normal = template("jobs/clustermesh-debug-resume.yml")["jobs"][0]
     assert "ne(variables['CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY'], 'true')" in normal["condition"]
     job = template(JOB)["jobs"][0]
-    setup, operation = job["steps"][1:]
+    setup, operation = [step for step in job["steps"] if "template" in step]
     assert setup["template"] == "/steps/setup-tests.yml"
     assert setup["parameters"]["credential_type"] == "service_connection"
     assert operation["template"] == f"/{STEP}"
+    assert operation["parameters"]["resume_build_id"] == "${{ parameters.resume_build_id }}"
+    assert operation["parameters"]["resume_manifest_json"] == "${{ parameters.resume_manifest_json }}"
     assert job["variables"]["SCENARIO_NAME"] == "clustermesh-scale"
+    download_condition = "${{ if gt(parameters.resume_build_id, 0) }}"
+    download = next(step[download_condition][0] for step in job["steps"] if download_condition in step)
+    assert download["task"] == "DownloadPipelineArtifact@2"
+    assert download["inputs"]["project"] == "$(System.TeamProjectId)"
+    assert download["inputs"]["definition"] == "$(System.DefinitionId)"
+    assert download["inputs"]["pipelineId"] == "${{ parameters.resume_build_id }}"
+    assert download["inputs"]["artifactName"] == "n100-cni-worker-maintenance-${{ parameters.resume_build_id }}-1"
     publication = template(STEP)["steps"][1]
     assert "always()" in publication["condition"]
     assert publication["inputs"]["targetPath"].endswith("/n100-cni-worker-maintenance")
@@ -130,8 +159,9 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
     ("empty-inventory", 5, 0),
     ("ambiguous-inventory", 5, 0),
 ])
+@pytest.mark.parametrize("continuation", [False, True])
 def test_real_step_plans_then_executes_with_private_credentials(
-    tmp_path, failure, expected, helper_calls,
+    tmp_path, failure, expected, helper_calls, continuation,
 ):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -141,6 +171,10 @@ def test_real_step_plans_then_executes_with_private_credentials(
     source.mkdir()
     artifacts = tmp_path / "artifacts"
     trace = tmp_path / "helper-calls.jsonl"
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    if continuation:
+        (checkpoint / "maintenance.json").write_text('{"checkpoint":"original"}', encoding="utf-8")
     (source / "test.tfvars").write_text("cluster_count = 100\n", encoding="utf-8")
     fake_az = bin_dir / "az"
     fake_az.write_text(textwrap.dedent("""\
@@ -196,6 +230,14 @@ def test_real_step_plans_then_executes_with_private_credentials(
         path = Path(args[args.index("--kubeconfig") + 1])
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert path.read_text(encoding="utf-8") == "fake-private-credentials"
+        if os.environ["RESUME_BUILD_ID"] != "0":
+            assert args[args.index("--resume-build-id") + 1] == os.environ["RESUME_BUILD_ID"]
+            original = Path(args[args.index("--resume-summary") + 1])
+            manifest = Path(args[args.index("--resume-manifest") + 1])
+            assert json.loads(original.read_text(encoding="utf-8")) == {"checkpoint": "original"}
+            assert json.loads(manifest.read_text(encoding="utf-8")) == json.loads(os.environ["RESUME_MANIFEST_JSON"])
+        else:
+            assert not any(flag in args for flag in ("--resume-build-id", "--resume-summary", "--resume-manifest"))
         with open(os.environ["FAKE_TRACE"], "a", encoding="utf-8") as handle:
             handle.write(json.dumps(args) + "\\n")
         summary = Path(args[args.index("--summary-file") + 1])
@@ -219,6 +261,9 @@ def test_real_step_plans_then_executes_with_private_credentials(
         "PRIVATE_TEMP_ROOT": str(private),
         "FAKE_TRACE": str(trace),
         "FAKE_FAILURE": failure,
+        "RESUME_BUILD_ID": "42" if continuation else "0",
+        "RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST) if continuation else "",
+        "RESUME_INPUT_DIRECTORY": str(checkpoint),
     }
     result = subprocess.run(
         ["bash", "-c", template(STEP)["steps"][0]["script"]],
@@ -241,3 +286,44 @@ def test_real_step_plans_then_executes_with_private_credentials(
         "fake-private-credentials" not in path.read_text(encoding="utf-8")
         for path in artifacts.rglob("*") if path.is_file()
     )
+    if continuation:
+        assert json.loads((checkpoint / "maintenance.json").read_text(encoding="utf-8")) == {
+            "checkpoint": "original",
+        }
+
+
+@pytest.mark.parametrize("build_id,manifest", [
+    ("0", json.dumps(RESUME_MANIFEST)),
+    ("42", ""),
+    ("-1", json.dumps(RESUME_MANIFEST)),
+    ("01", json.dumps(RESUME_MANIFEST)),
+    ("42", "{invalid"),
+    ("43", json.dumps(RESUME_MANIFEST)),
+    ("42", json.dumps({**RESUME_MANIFEST, "source_worker_uid": "different"})),
+    ("42", json.dumps(RESUME_MANIFEST)),
+    ("42", "{" * 32769),
+])
+def test_step_rejects_partial_or_unbound_continuation_before_azure(tmp_path, build_id, manifest):
+    fake_az = tmp_path / "az"
+    fake_az.write_text(
+        "#!/bin/sh\nprintf '%s\\n' 'Azure must not be reached' >&2\nexit 97\n",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", template(STEP)["steps"][0]["script"]],
+        env={
+            **os.environ, **SOURCE_ENV,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "RUN_ID": "preserved-run",
+            "CONFIRM_RESUME": "preserved-run",
+            "RESUME_BUILD_ID": build_id,
+            "RESUME_MANIFEST_JSON": manifest,
+            "RESUME_INPUT_DIRECTORY": str(tmp_path / "missing-checkpoint"),
+            "ARTIFACT_STAGING_DIRECTORY": str(tmp_path / "artifacts"),
+        },
+        capture_output=True, text=True, check=False, timeout=10,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "Azure must not be reached" not in result.stderr
+    assert "unbound variable" not in result.stderr

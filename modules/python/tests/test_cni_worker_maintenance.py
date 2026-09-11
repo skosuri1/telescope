@@ -1164,6 +1164,581 @@ def test_parse_args_validates_role_uuid_sha_and_bounds():
         )
 
 
+def prepare_resume(args, monkeypatch, *, initial_pool_count=2, legacy=False):
+    """Capture a genuine fake pre-operation manifest and accepted-surge failure."""
+    backend = make_backend(args, monkeypatch, initial_pool_count=initial_pool_count)
+    original = backend.build_nodes()
+    manifest = {
+        "schema_version": 1,
+        "source_build_id": 79797,
+        "resource_group": RESOURCE_GROUP,
+        "role": ROLE,
+        "source_worker": SOURCE,
+        "source_worker_uid": SOURCE_UID,
+        "original_real_node_uids": {
+            name: row["metadata"]["uid"]
+            for name, row in maintenance._real_node_map(original).items()
+        },
+        "original_kwok_node_uids": {
+            name: row["metadata"]["uid"]
+            for name, row in maintenance._kwok_map(original).items()
+        },
+        "agent_uids": dict(backend.agent_uids),
+        "controller_uid": "controller-uid",
+    }
+    prior = {}
+    with monkeypatch.context() as patch:
+        def fail_after_accepted_surge(*_args):
+            raise maintenance.workers.ReconcileError("Fresh default workers are not all Ready and schedulable")
+        patch.setattr(maintenance, "_wait_for_fresh_nodes", fail_after_accepted_surge)
+        with pytest.raises(maintenance.workers.ReconcileError, match="Fresh default"):
+            maintenance.execute_maintenance(args, prior, backend.run)
+    assert prior["status"] == "waiting-for-surge"
+    assert prior["surge_request_accepted"] is True
+    assert backend.scale_calls == 1
+    assert not backend.deleted_agents
+    prior["error"] = "Fresh default workers are not all Ready and schedulable"
+    if legacy:
+        for key in (
+            "original_real_node_uids", "original_real_node_identities",
+            "original_kwok_node_uids", "agent_uids", "controller_uid",
+            "expected_subscription", "expected_region", "expected_tfvars_sha",
+        ):
+            prior.pop(key)
+    manifest["fresh_node_uids"] = {
+        name: backend.nodes[name]["metadata"]["uid"]
+        for name in backend.expected_new_nodes()
+    }
+    manifest["fresh_network_container_ids"] = {
+        name: backend.nnc[name]["id"] for name in backend.expected_new_nodes()
+    }
+    args.resume_build_id = 79797
+    args.resume_summary = str(Path(args.summary_file).with_name("prior-maintenance.json"))
+    args.resume_manifest = str(Path(args.summary_file).with_name("resume-manifest.json"))
+    Path(args.resume_summary).write_text(json.dumps(prior), encoding="utf-8")
+    Path(args.resume_manifest).write_text(json.dumps(manifest), encoding="utf-8")
+    backend.calls.clear()
+    backend.scale_calls = 0
+    backend.scale_progress_reads = 0
+    return backend, prior, manifest
+
+
+def assert_no_mutations(backend):
+    assert backend.scale_calls == backend.retirement_calls == 0
+    assert not backend.deleted_agents and not backend.probes
+    assert not any(
+        token in command for command in backend.calls
+        for token in ("scale", "update", "patch", "drain", "run", "delete", "apply")
+    )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_resume_plan_is_read_only_with_original_hold(args, monkeypatch, legacy):
+    backend, _, _ = prepare_resume(args, monkeypatch, legacy=legacy)
+    source_before = copy.deepcopy(backend.nodes[SOURCE])
+    args.execute = False
+    summary = {}
+    maintenance.execute_maintenance(args, summary, backend.run)
+    assert summary["status"] == "planned" and summary["success"] is True
+    assert summary["mutation_started"] is False
+    assert summary["resume_provenance"]["source_build_id"] == 79797
+    assert len(summary["original_kwok_node_uids"]) == len(summary["agent_uids"]) == 100
+    assert len(summary["cilium_before"]["covered_node_names"]) == 5
+    assert source_before == backend.nodes[SOURCE]
+    assert_no_mutations(backend)
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_resume_accepts_timestamped_controller_cordon(args, monkeypatch, execute):
+    backend, _, _ = prepare_resume(args, monkeypatch, legacy=True)
+    backend.nodes[SOURCE]["spec"]["taints"].append({
+        "key": "node.kubernetes.io/unschedulable",
+        "effect": "NoSchedule",
+        "timeAdded": "2026-09-11T13:27:33Z",
+    })
+    source_before = copy.deepcopy(backend.nodes[SOURCE])
+    args.execute = execute
+    summary = {}
+    maintenance.execute_maintenance(args, summary, backend.run)
+    assert summary["success"] is True
+    assert backend.scale_calls == 0
+    if not execute:
+        assert backend.nodes[SOURCE] == source_before
+        assert_no_mutations(backend)
+
+
+def test_normal_startup_accepts_timestamped_controller_cordon(args, monkeypatch):
+    backend = make_backend(args, monkeypatch, initial_pool_count=2)
+    original_nodes = backend.build_nodes
+
+    def timestamped_nodes():
+        payload = original_nodes()
+        for row in payload["items"]:
+            if row["metadata"]["name"] == SOURCE and row["spec"].get("unschedulable"):
+                row["spec"]["taints"].append({
+                    "key": "node.kubernetes.io/unschedulable",
+                    "effect": "NoSchedule",
+                    "timeAdded": "2026-09-11T13:27:33Z",
+                })
+        return payload
+
+    monkeypatch.setattr(backend, "build_nodes", timestamped_nodes)
+    summary = {}
+    maintenance.execute_maintenance(args, summary, backend.run)
+    assert summary["success"] is True and backend.scale_calls == 1
+
+
+@pytest.mark.parametrize("initial_pool_count,legacy", [(2, True), (2, False), (3, False)])
+def test_resume_executes_existing_surge_without_scale_or_hold(
+    args, monkeypatch, initial_pool_count, legacy
+):
+    backend, _, manifest = prepare_resume(
+        args, monkeypatch, initial_pool_count=initial_pool_count, legacy=legacy,
+    )
+    summary = {}
+    maintenance.execute_maintenance(args, summary, backend.run)
+    assert summary["success"] is True and summary["status"] == "completed"
+    assert summary["initial_pool_count"] == initial_pool_count
+    assert backend.scale_calls == 0 and backend.retirement_calls == 1
+    assert not any("scale" in command or "update" in command for command in backend.calls)
+    source_patches = [command for command in backend.calls if "patch" in command and SOURCE in command]
+    assert source_patches == []
+    assert SOURCE not in backend.nodes and SOURCE not in backend.nnc
+    assert len(backend.nodes) == 3 and all(backend.agent_ready.values())
+    assert summary["probe_cleanup_pending"] == summary["temporary_exclusions"] == summary["cleanup_errors"] == []
+    assert len(summary["cilium_after_surge"]["covered_node_names"]) == 5
+    assert len(summary["cilium_final"]["covered_node_names"]) == 4
+    for name, uid in manifest["fresh_node_uids"].items():
+        growth = summary["fresh_ip_growth"][name]
+        assert growth["node_uid"] == uid
+        assert growth["network_container_id"] == manifest["fresh_network_container_ids"][name]
+        assert growth["initial_assigned"] == 16
+        assert backend.nnc[name]["assigned"] == 32
+    assert summary["pending_moved_count"] == 2 and summary["healthy_moved_count"] == 16
+
+
+@pytest.mark.parametrize("field", [
+    "resource_group", "role", "source_worker", "source_worker_uid",
+    "schema_version", "source_build_id", "original_real_node_uids",
+    "original_kwok_node_uids", "agent_uids", "controller_uid",
+    "fresh_node_uids", "fresh_network_container_ids",
+])
+def test_resume_refuses_missing_manifest_fields_before_mutation(args, monkeypatch, field):
+    backend, _, manifest = prepare_resume(args, monkeypatch, legacy=True)
+    manifest.pop(field)
+    Path(args.resume_manifest).write_text(json.dumps(manifest), encoding="utf-8")
+    summary = {"success": False, "mutation_started": False}
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, summary, backend.run)
+    assert_no_mutations(backend)
+    assert not summary["success"] and not summary["mutation_started"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("scope", "foreign"), ("resource_group", "foreign"), ("role", "mesh-88"),
+    ("source_worker", OLD_A), ("source_worker_uid", "foreign"),
+    ("source_provider_id", SOURCE_PROVIDER + "9"), ("source_network_container_id", "foreign"),
+    ("source_build_id", 1), ("initial_pool_count", 4), ("initial_worker_state", {}),
+    ("initial_pool_configuration", {"vmSize": "Standard_D32_v3"}),
+    ("execute", False), ("success", True), ("mutation_started", False),
+    ("source_quarantined", False), ("surge_request_accepted", False),
+    ("status", "moving-pending"), ("pending_moves", [{"name": "kwok-node-0"}]),
+    ("healthy_moves", [{"name": "kwok-node-3"}]), ("pending_move_intents", ["intent"]),
+    ("pending_moved_count", 1), ("healthy_moved_count", 1),
+    ("probe_cleanup_pending", [{"name": "probe"}]), ("probe_intents", ["intent"]),
+    ("fresh_ip_growth", {"node": {"initial_assigned": 16}}),
+    ("retirement", {"request_accepted": True}), ("source_pre_drain", ["pod"]),
+    ("temporary_exclusions", [{"name": OLD_A}]), ("cleanup_errors", ["unclean"]),
+    ("initial_pending_source_agents", ["kwok-node-1"]),
+    ("initial_healthy_source_agents", []),
+    ("pod_template", {"containers": []}),
+])
+def test_resume_rejects_prior_scope_phase_or_mutation(args, monkeypatch, field, value):
+    backend, prior, _ = prepare_resume(args, monkeypatch, legacy=True)
+    prior[field] = value
+    Path(args.resume_summary).write_text(json.dumps(prior), encoding="utf-8")
+    summary = {"success": False, "mutation_started": False}
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, summary, backend.run)
+    assert_no_mutations(backend)
+    assert summary["success"] is False and summary["mutation_started"] is False
+
+
+@pytest.mark.parametrize("field,key", [
+    ("original_real_node_uids", OLD_A), ("original_real_node_uids", "aks-prompool-vmss000000"),
+    ("fresh_node_uids", FRESH_A), ("fresh_network_container_ids", FRESH_B),
+    ("agent_uids", "kwok-node-90"), ("original_kwok_node_uids", "kwok-node-90"),
+])
+def test_resume_rejects_manifest_identity_drift(args, monkeypatch, field, key):
+    backend, _, manifest = prepare_resume(args, monkeypatch, legacy=True)
+    manifest[field][key] = "changed-identity"
+    Path(args.resume_manifest).write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, {}, backend.run)
+    assert_no_mutations(backend)
+
+
+@pytest.mark.parametrize("drift", [
+    "build", "controller", "agent", "kwok", "source-hold", "source-taint",
+    "foreign-taint", "fresh-nc", "fresh-owner", "source-nc", "vmss", "original-provider",
+    "extra-node", "missing-node", "probe", "events", "config",
+])
+def test_resume_rejects_fresh_live_drift(args, monkeypatch, drift):
+    backend, _, manifest = prepare_resume(args, monkeypatch, legacy=True)
+    if drift == "build":
+        args.resume_build_id += 1
+    elif drift == "controller":
+        manifest["controller_uid"] = "changed-controller"
+        Path(args.resume_manifest).write_text(json.dumps(manifest), encoding="utf-8")
+    elif drift == "agent":
+        backend.agent_uids["kwok-node-90"] = "changed-agent"
+    elif drift == "kwok":
+        backend.kwok_wait_reads = 1
+        backend.kwok_uid_change_on_wait = True
+    elif drift == "source-hold":
+        backend.nodes[SOURCE]["metadata"]["annotations"][maintenance.HOLD_ANNOTATION] += " foreign"
+    elif drift in ("source-taint", "foreign-taint"):
+        backend.nodes[SOURCE if drift == "source-taint" else OLD_A]["spec"]["taints"].append(
+            {"key": maintenance.EXCLUSION_KEY, "value": "foreign", "effect": "NoSchedule"}
+        )
+    elif drift == "fresh-nc":
+        backend.nnc[FRESH_A]["id"] = "changed"
+    elif drift == "fresh-owner":
+        backend.nnc[FRESH_A]["uid"] = "changed"
+    elif drift == "source-nc":
+        backend.nnc[SOURCE]["id"] = "changed"
+    elif drift == "vmss":
+        backend.vmss_updating_before_write = True
+    elif drift == "original-provider":
+        backend.nodes[OLD_A]["spec"]["providerID"] += "9"
+    elif drift == "extra-node":
+        backend.nodes[OLD_B] = node(OLD_B, "unexpected-uid", 1)
+    elif drift == "missing-node":
+        del backend.nodes[FRESH_A]
+    elif drift == "probe":
+        original_pods = backend.build_all_pods
+        monkeypatch.setattr(backend, "build_all_pods", lambda: {
+            "items": original_pods()["items"] + [{
+                "metadata": {"name": "cni-maint-probe-leftover", "labels": {maintenance.PROBE_LABEL_KEY: "old"}}
+            }],
+        })
+    elif drift == "events":
+        monkeypatch.setattr(backend, "build_events", lambda: {"items": []})
+    elif drift == "config":
+        backend.change_pool_config_before_write = True
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, {}, backend.run)
+    assert_no_mutations(backend)
+
+
+@pytest.mark.parametrize("options", [
+    {"resume_build_id": 79797}, {"resume_summary": "prior.json"},
+    {"resume_manifest": "manifest.json"},
+    {"resume_build_id": 79797, "resume_summary": "prior.json"},
+    {"resume_build_id": -1, "resume_summary": "prior.json", "resume_manifest": "manifest.json"},
+])
+def test_resume_options_require_all_three_positive_build(args, options):
+    for key, value in options.items():
+        setattr(args, key, value)
+    with pytest.raises(maintenance.workers.ReconcileError, match="all three"):
+        maintenance.execute_maintenance(args, {}, lambda *_: pytest.fail("No reads allowed"))
+
+
+def test_resume_refuses_overwriting_original_summary(args, monkeypatch):
+    backend, _, _ = prepare_resume(args, monkeypatch)
+    args.summary_file = args.resume_summary
+    before = Path(args.resume_summary).read_bytes()
+    with pytest.raises(maintenance.workers.ReconcileError, match="distinct files"):
+        maintenance.execute_maintenance(args, {}, backend.run)
+    assert Path(args.resume_summary).read_bytes() == before
+    assert_no_mutations(backend)
+
+
+@pytest.mark.parametrize("failure", ["retirement", "cleanup"])
+def test_resumed_retirement_or_cleanup_failure_is_not_success(args, monkeypatch, failure):
+    backend, _, _ = prepare_resume(args, monkeypatch)
+    if failure == "retirement":
+        def failed_retirement(_args, summary, _runner):
+            summary["request_accepted"] = True
+            summary["error"] = "Retirement did not converge"
+            raise maintenance.workers.ReconcileError(summary["error"])
+        monkeypatch.setattr(maintenance.retirement, "execute_retirement", failed_retirement)
+    else:
+        backend.probe_delete_error = True
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, summary, backend.run)
+    saved = json.loads(Path(args.summary_file).read_text(encoding="utf-8"))
+    assert saved["success"] is False and backend.scale_calls == 0
+    assert SOURCE in backend.nodes and saved["source_quarantined"] is True
+    if failure == "retirement":
+        assert saved["retirement"]["request_accepted"] is True
+    else:
+        assert saved["probe_cleanup_pending"] and saved["cleanup_errors"]
+
+
+def delayed_fresh_nodes(backend, monkeypatch, *, ready_after=3, drift=None):
+    original_nodes = backend.build_nodes
+    reads = {"count": 0}
+
+    def observations():
+        payload = original_nodes()
+        if backend.scale_calls and not backend.retired:
+            reads["count"] += 1
+            if reads["count"] <= ready_after:
+                for row in payload["items"]:
+                    if row["metadata"]["name"] == FRESH_A:
+                        row["status"]["conditions"][0]["status"] = "False"
+            if drift and reads["count"] == 2:
+                for row in payload["items"]:
+                    if row["metadata"]["name"] == (FRESH_A if drift == "fresh-uid" else OLD_A):
+                        row["metadata"]["uid"] = "drifted-uid"
+        return payload
+
+    monkeypatch.setattr(backend, "build_nodes", observations)
+    return reads
+
+
+def test_accepted_surge_waits_read_only_for_new_worker_ready(args, monkeypatch):
+    backend = make_backend(args, monkeypatch, initial_pool_count=2)
+    reads = delayed_fresh_nodes(backend, monkeypatch)
+    summary = {}
+    maintenance.execute_maintenance(args, summary, backend.run)
+    assert summary["success"] is True and backend.scale_calls == 1
+    assert reads["count"] > 3 and backend.clock >= 3
+
+
+@pytest.mark.parametrize("drift", ["fresh-uid", "original-uid"])
+def test_startup_does_not_retry_structural_uid_drift(args, monkeypatch, drift):
+    backend = make_backend(args, monkeypatch, initial_pool_count=2)
+    delayed_fresh_nodes(backend, monkeypatch, ready_after=20, drift=drift)
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError, match="identity.*drifted"):
+        maintenance.execute_maintenance(args, summary, backend.run)
+    assert backend.scale_calls == 1 and backend.clock < 10
+    assert not backend.deleted_agents and not backend.probes
+    assert summary["source_quarantined"] is True and summary["success"] is False
+
+
+def test_startup_readiness_deadline_is_bounded_with_retirement_reserve(args, monkeypatch):
+    backend = make_backend(args, monkeypatch, initial_pool_count=2)
+    delayed_fresh_nodes(backend, monkeypatch, ready_after=10000)
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError, match="deadline expired"):
+        maintenance.execute_maintenance(args, summary, backend.run)
+    assert backend.scale_calls == 1 and backend.retirement_calls == 0
+    assert backend.clock <= maintenance.SURGE_READY_WAIT_SECONDS + 1
+    assert not backend.deleted_agents and not backend.probes
+    assert summary["success"] is False and summary["status"] == "waiting-for-surge"
+
+
+def test_surge_waits_for_registration_with_only_new_stale_instances(args, monkeypatch):
+    backend = make_backend(args, monkeypatch, initial_pool_count=2)
+    original_nodes, original_state = backend.build_nodes, backend.build_cluster_state
+    observations = {"missing": 3}
+
+    def missing_registration():
+        payload = original_nodes()
+        if backend.scale_calls and observations["missing"]:
+            observations["missing"] -= 1
+            payload["items"] = [row for row in payload["items"] if row["metadata"]["name"] != FRESH_A]
+        return payload
+
+    def pending_state():
+        state = original_state()
+        if backend.scale_calls and observations["missing"]:
+            state.pools[0].node_instance_ids.remove("3")
+            state.pools[0].ready_instance_ids.remove("3")
+            state.pools[0].stale_instance_ids = ["3"]
+        return state
+
+    monkeypatch.setattr(backend, "build_nodes", missing_registration)
+    monkeypatch.setattr(backend, "build_cluster_state", pending_state)
+    summary = {}
+    maintenance.execute_maintenance(args, summary, backend.run)
+    assert summary["success"] is True and backend.scale_calls == 1
+    assert observations["missing"] == 0 and backend.clock >= 3
+
+
+@pytest.mark.parametrize("drift", ["count", "config", "taint", "source-not-ready", "fresh-image", "provider"])
+def test_startup_structural_drift_is_fatal_without_retry(args, monkeypatch, drift):
+    backend = make_backend(args, monkeypatch, initial_pool_count=2)
+    original_pool, original_nodes = backend.build_pool, backend.build_nodes
+
+    def changed_pool():
+        payload = original_pool()
+        if backend.scale_calls and backend.saw_scaling_state and payload["provisioningState"] == "Succeeded":
+            if drift == "count":
+                payload["count"] = 5
+            if drift == "config":
+                payload["vmSize"] = "changed-size"
+        return payload
+
+    def changed_nodes():
+        payload = original_nodes()
+        if backend.scale_calls:
+            mapping = maintenance._real_node_map(payload)
+            if drift == "taint":
+                mapping[FRESH_A]["spec"]["taints"] = [{"key": "unexpected", "effect": "NoSchedule"}]
+            elif drift == "source-not-ready":
+                mapping[SOURCE]["status"]["conditions"][0]["status"] = "False"
+            elif drift == "fresh-image":
+                mapping[FRESH_A]["metadata"]["labels"]["kubernetes.azure.com/node-image-version"] = "changed-image"
+            elif drift == "provider":
+                mapping[OLD_A]["spec"]["providerID"] += "9"
+        return payload
+
+    monkeypatch.setattr(backend, "build_pool", changed_pool)
+    monkeypatch.setattr(backend, "build_nodes", changed_nodes)
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, summary, backend.run)
+    assert backend.scale_calls == 1 and backend.clock <= 1
+    assert not backend.deleted_agents and not backend.probes
+
+
+def test_normal_four_worker_state_never_implies_resume(args, monkeypatch):
+    backend = make_backend(args, monkeypatch, initial_pool_count=2)
+    backend.add_fresh_nodes()
+    with pytest.raises(maintenance.workers.ReconcileError, match="exactly 2 or 3"):
+        maintenance.execute_maintenance(args, {}, backend.run)
+    assert_no_mutations(backend)
+
+
+def test_resume_plan_requires_every_real_cilium_agent(args, monkeypatch):
+    backend, _, _ = prepare_resume(args, monkeypatch)
+    args.execute = False
+    original_proof = backend.cilium_probe
+
+    def missing_agent(**kwargs):
+        proof = original_proof(**kwargs)
+        proof["agents"] = [agent for agent in proof["agents"] if agent["node_name"] != FRESH_B]
+        return proof
+
+    monkeypatch.setattr(maintenance.cilium, "probe", missing_agent)
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError, match="99-peer"):
+        maintenance.execute_maintenance(args, summary, backend.run)
+    assert summary["success"] is False and summary["mutation_started"] is False
+    assert_no_mutations(backend)
+
+
+@pytest.mark.parametrize("drift", ["lease", "fleet", "node-group", "unknown-source-pod"])
+def test_resume_requires_fresh_scope_and_unchanged_drain_allowlist(args, monkeypatch, drift):
+    backend, _, _ = prepare_resume(args, monkeypatch)
+    original_run = backend.run
+
+    def unsafe_observation(command, timeout):
+        result = original_run(command, timeout)
+        if drift == "lease" and command[:3] == ["az", "group", "show"]:
+            payload = json.loads(result)
+            payload["tags"]["deletion_due_time"] = (NOW - timedelta(hours=1)).isoformat()
+            return json.dumps(payload)
+        if drift == "fleet" and command[:4] == ["az", "fleet", "member", "list"]:
+            return json.dumps(json.loads(result)[:-1])
+        if drift == "node-group" and command[:3] == ["az", "group", "show"] and NODE_RESOURCE_GROUP in command:
+            payload = json.loads(result)
+            payload["managedBy"] = "foreign-cluster"
+            return json.dumps(payload)
+        if drift == "unknown-source-pod" and command[0] == "kubectl" and "pods" in command and "-A" in command:
+            payload = json.loads(result)
+            unknown = cilium_operator_pod(SOURCE)
+            unknown["metadata"]["namespace"] = "mock-clustermesh"
+            unknown["metadata"]["name"] = "unknown-owner-pod"
+            payload["items"].append(unknown)
+            return json.dumps(payload)
+        return result
+
+    args.execute = False
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, {}, unsafe_observation)
+    assert_no_mutations(backend)
+
+
+@pytest.mark.parametrize("payload", ['{"schema_version":1,"schema_version":1}', "{invalid", "[]"])
+def test_resume_refuses_malformed_or_ambiguous_artifacts(args, monkeypatch, payload):
+    backend, _, _ = prepare_resume(args, monkeypatch)
+    Path(args.resume_manifest).write_text(payload, encoding="utf-8")
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, {}, backend.run)
+    assert_no_mutations(backend)
+
+
+def test_resume_preserves_persisted_identity_manifest_crosscheck(args, monkeypatch):
+    backend, prior, _ = prepare_resume(args, monkeypatch)
+    prior["agent_uids"]["kwok-node-90"] = "different-pre-operation-pod"
+    Path(args.resume_summary).write_text(json.dumps(prior), encoding="utf-8")
+    with pytest.raises(maintenance.workers.ReconcileError, match="persisted agent_uids"):
+        maintenance.execute_maintenance(args, {}, backend.run)
+    assert_no_mutations(backend)
+
+
+def test_resume_rejects_false_retirement_result(args, monkeypatch):
+    backend, _, _ = prepare_resume(args, monkeypatch)
+    monkeypatch.setattr(maintenance.retirement, "execute_retirement", lambda *_: None)
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError, match="retirement did not succeed"):
+        maintenance.execute_maintenance(args, summary, backend.run)
+    assert summary["success"] is False and summary["retirement"]["success"] is False
+    assert backend.scale_calls == 0
+
+
+def test_resume_cli_defaults_and_exact_flags(args):
+    argv = []
+    for key in (
+        "resource_group", "confirm_resource_group", "expected_subscription",
+        "expected_region", "expected_tfvars_sha", "role", "node_name", "node_uid",
+        "source_provider_id", "source_network_container_id", "kubeconfig", "summary_file",
+    ):
+        argv.extend(["--" + key.replace("_", "-"), str(getattr(args, key))])
+    parsed = maintenance.parse_args(argv)
+    assert parsed.resume_build_id == 0
+    assert parsed.resume_summary == parsed.resume_manifest == ""
+    assert parsed.execute is False
+    parsed = maintenance.parse_args(argv + [
+        "--resume-build-id", "79797", "--resume-summary", "prior.json",
+        "--resume-manifest", "manifest.json",
+    ])
+    assert parsed.resume_build_id == 79797 and parsed.execute is False
+    for extra in (
+        ["--resume-build-id", "79797"],
+        ["--resume-build-id", "0", "--resume-summary", "prior.json", "--resume-manifest", "manifest.json"],
+        ["--resume-build-id", "79797", "--resume-summary", args.summary_file, "--resume-manifest", "manifest.json"],
+    ):
+        with pytest.raises(SystemExit):
+            maintenance.parse_args(argv + extra)
+
+
+def test_fresh_daemonsets_ready_before_post_surge_peer_proof(args, monkeypatch):
+    backend = make_backend(args, monkeypatch, initial_pool_count=2)
+    original_pods = backend.build_all_pods
+    original_proof = backend.cilium_probe
+    observations = {"pending": 3}
+
+    def system_pods():
+        payload = original_pods()
+        if backend.scale_calls and observations["pending"]:
+            observations["pending"] -= 1
+            for pod in payload["items"]:
+                if pod.get("spec", {}).get("nodeName") == FRESH_A and pod["metadata"].get("namespace") == "kube-system":
+                    pod["status"]["conditions"][0]["status"] = "False"
+                    pod["status"]["containerStatuses"][0]["ready"] = False
+        return payload
+
+    def peer_proof(**kwargs):
+        assert kwargs["expected_remote_count"] == 99
+        assert len(kwargs["expected_remote_names"]) == 99
+        if backend.scale_calls:
+            assert observations["pending"] == 0
+        return original_proof(**kwargs)
+
+    monkeypatch.setattr(backend, "build_all_pods", system_pods)
+    monkeypatch.setattr(maintenance.cilium, "probe", peer_proof)
+    summary = {}
+    maintenance.execute_maintenance(args, summary, backend.run)
+    assert summary["success"] is True and backend.scale_calls == 1
+
+
 @pytest.mark.parametrize("initial_pool_count,expected_fresh", [(2, [FRESH_A, FRESH_B]), (3, [FRESH_A])])
 def test_execute_successful_workflow_supports_initial_two_or_three(
     args, monkeypatch, initial_pool_count, expected_fresh
@@ -1465,7 +2040,7 @@ def test_final_failure_after_retirement_keeps_overall_success_false(args, monkey
     assert saved["retirement"]["success"] is True
 
 
-def test_small_budget_blocks_healthy_mutation_before_retirement(args, monkeypatch):
+def test_small_budget_blocks_pod_mutation_preserving_retirement(args, monkeypatch):
     args.timeout_seconds = 320
     backend = make_backend(args, monkeypatch, initial_pool_count=3)
     summary = {"success": False, "mutation_started": False}
@@ -1475,7 +2050,7 @@ def test_small_budget_blocks_healthy_mutation_before_retirement(args, monkeypatc
     ):
         maintenance.execute_maintenance(args, summary, backend.run)
     assert backend.retirement_calls == 0
-    assert len(backend.deleted_agents) == 2
+    assert not backend.deleted_agents
 
 
 def test_main_dry_run_reports_planned_success(args, monkeypatch, capsys):

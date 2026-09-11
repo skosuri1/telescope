@@ -23,6 +23,12 @@ parameters:
     type: string
   - name: source_network_container_id
     type: string
+  - name: resume_build_id
+    type: number
+    default: 0
+  - name: resume_manifest_json
+    type: string
+    default: ""
 
 jobs:
   - job: cni_worker_maintenance
@@ -52,6 +58,18 @@ jobs:
             echo "CNI maintenance requires existing n100, no workload/other maintenance mode, and one complete source plan." >&2
             exit 1
           fi
+          if ! [[ "$RESUME_BUILD_ID" =~ ^(0|[1-9][0-9]*)$ ]] ||
+            { [ "$RESUME_BUILD_ID" = "0" ] && [ -n "$RESUME_MANIFEST_JSON" ]; } ||
+            { [ "$RESUME_BUILD_ID" != "0" ] && [ -z "$RESUME_MANIFEST_JSON" ]; } ||
+            [ "${#RESUME_MANIFEST_JSON}" -gt 32768 ]; then
+            echo "Post-surge continuation requires a positive original build ID and a bounded identity manifest together." >&2
+            exit 1
+          fi
+          if [ "$RESUME_BUILD_ID" != "0" ]; then
+            jq -e --argjson build "$RESUME_BUILD_ID" \
+              'type == "object" and .schema_version == 1 and .source_build_id == $build' \
+              <<< "$RESUME_MANIFEST_JSON" >/dev/null
+          fi
         displayName: "Require one explicit existing-n100 CNI source"
         env:
           EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
@@ -64,6 +82,8 @@ jobs:
           SOURCE_UID: ${{ parameters.source_uid }}
           SOURCE_PROVIDER_ID: ${{ parameters.source_provider_id }}
           SOURCE_NETWORK_CONTAINER_ID: ${{ parameters.source_network_container_id }}
+          RESUME_BUILD_ID: "${{ parameters.resume_build_id }}"
+          RESUME_MANIFEST_JSON: ${{ parameters.resume_manifest_json }}
 
       - template: /steps/setup-tests.yml
         parameters:
@@ -72,6 +92,19 @@ jobs:
           run_id: ${{ parameters.target_run_id }}
           credential_type: service_connection
           ssh_key_enabled: false
+
+      - ${{ if gt(parameters.resume_build_id, 0) }}:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download the original owned-surge checkpoint"
+            inputs:
+              buildType: specific
+              project: $(System.TeamProjectId)
+              definition: $(System.DefinitionId)
+              specificBuildWithTriggering: false
+              buildVersionToDownload: specific
+              pipelineId: ${{ parameters.resume_build_id }}
+              artifactName: n100-cni-worker-maintenance-${{ parameters.resume_build_id }}-1
+              targetPath: $(Pipeline.Workspace)/n100-cni-worker-resume-${{ parameters.resume_build_id }}
 
       - template: /steps/topology/clustermesh-scale/reuse/maintain-cni-worker.yml
         parameters:
@@ -85,3 +118,5 @@ jobs:
           source_uid: ${{ parameters.source_uid }}
           source_provider_id: ${{ parameters.source_provider_id }}
           source_network_container_id: ${{ parameters.source_network_container_id }}
+          resume_build_id: ${{ parameters.resume_build_id }}
+          resume_manifest_json: ${{ parameters.resume_manifest_json }}

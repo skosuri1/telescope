@@ -91,6 +91,12 @@ parameters:
   - name: scaleDebugCniWorkerNetworkContainerId
     type: string
     default: ""
+  - name: scaleDebugCniWorkerResumeBuildId
+    type: number
+    default: 0
+  - name: scaleDebugCniWorkerResumeManifestJson
+    type: string
+    default: ""
   - name: scaleDebugLeaseExtensionHours
     type: number
     default: 168
@@ -3099,6 +3105,8 @@ stages:
               source_uid: ${{ parameters.scaleDebugCniWorkerUid }}
               source_provider_id: ${{ parameters.scaleDebugCniWorkerProviderId }}
               source_network_container_id: ${{ parameters.scaleDebugCniWorkerNetworkContainerId }}
+              resume_build_id: ${{ parameters.scaleDebugCniWorkerResumeBuildId }}
+              resume_manifest_json: ${{ parameters.scaleDebugCniWorkerResumeManifestJson }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}

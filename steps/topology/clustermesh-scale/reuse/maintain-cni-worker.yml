@@ -19,6 +19,12 @@ parameters:
     type: string
   - name: source_network_container_id
     type: string
+  - name: resume_build_id
+    type: number
+    default: 0
+  - name: resume_manifest_json
+    type: string
+    default: ""
 
 steps:
   - script: |
@@ -35,9 +41,39 @@ steps:
         echo "CNI maintenance requires exact preserved n100 confirmation and a complete source identity." >&2
         exit 1
       fi
+      if ! [[ "$RESUME_BUILD_ID" =~ ^(0|[1-9][0-9]*)$ ]] ||
+        { [ "$RESUME_BUILD_ID" = "0" ] && [ -n "$RESUME_MANIFEST_JSON" ]; } ||
+        { [ "$RESUME_BUILD_ID" != "0" ] && [ -z "$RESUME_MANIFEST_JSON" ]; } ||
+        [ "${#RESUME_MANIFEST_JSON}" -gt 32768 ]; then
+        echo "Post-surge continuation requires the original build ID and identity manifest together." >&2
+        exit 1
+      fi
       summary_dir="$ARTIFACT_STAGING_DIRECTORY/n100-cni-worker-maintenance"
       mkdir -p "$summary_dir"
       echo "##vso[task.setvariable variable=CNI_WORKER_MAINTENANCE_DIAGNOSTICS_READY]true"
+      resume_args=()
+      if [ "$RESUME_BUILD_ID" != "0" ]; then
+        if ! jq -e --argjson build "$RESUME_BUILD_ID" --arg group "$RUN_ID" \
+          --arg role "$SOURCE_ROLE" --arg node "$SOURCE_NODE" --arg uid "$SOURCE_UID" '
+            type == "object" and .schema_version == 1 and .source_build_id == $build
+            and .resource_group == $group and .role == $role
+            and .source_worker == $node and .source_worker_uid == $uid' \
+          <<< "$RESUME_MANIFEST_JSON" >/dev/null; then
+          echo "Continuation identity manifest does not match the explicit preserved source." >&2
+          exit 1
+        fi
+        if [ ! -f "$RESUME_INPUT_DIRECTORY/maintenance.json" ]; then
+          echo "The original owned-surge maintenance artifact is missing." >&2
+          exit 1
+        fi
+        printf '%s\n' "$RESUME_MANIFEST_JSON" > "$summary_dir/resume-manifest.json"
+        cp -- "$RESUME_INPUT_DIRECTORY/maintenance.json" "$summary_dir/resume-source.json"
+        resume_args=(
+          --resume-build-id "$RESUME_BUILD_ID"
+          --resume-summary "$summary_dir/resume-source.json"
+          --resume-manifest "$summary_dir/resume-manifest.json"
+        )
+      fi
       expected_tfvars_sha=$(sha256sum "$SOURCE_ROOT/$TFVARS_PATH" | awk '{print $1}')
       az aks list --subscription "$EXPECTED_SUBSCRIPTION_ID" \
         --resource-group "$RUN_ID" --output json --only-show-errors \
@@ -70,6 +106,7 @@ steps:
         --source-provider-id "$SOURCE_PROVIDER_ID"
         --source-network-container-id "$SOURCE_NETWORK_CONTAINER_ID"
         --kubeconfig "$kubeconfig" --context "$cluster_name"
+        "${resume_args[@]}"
       )
       echo "Qualifying the explicit source with the read-only maintenance plan."
       python3 -u "$helper" "${common[@]}" --summary-file "$summary_dir/plan.json"
@@ -88,6 +125,9 @@ steps:
       SOURCE_UID: ${{ parameters.source_uid }}
       SOURCE_PROVIDER_ID: ${{ parameters.source_provider_id }}
       SOURCE_NETWORK_CONTAINER_ID: ${{ parameters.source_network_container_id }}
+      RESUME_BUILD_ID: "${{ parameters.resume_build_id }}"
+      RESUME_MANIFEST_JSON: ${{ parameters.resume_manifest_json }}
+      RESUME_INPUT_DIRECTORY: $(Pipeline.Workspace)/n100-cni-worker-resume-${{ parameters.resume_build_id }}
       SOURCE_ROOT: $(Pipeline.Workspace)/s
       TFVARS_PATH: ${{ parameters.tfvars_path }}
       ARTIFACT_STAGING_DIRECTORY: $(Build.ArtifactStagingDirectory)
