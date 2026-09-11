@@ -240,7 +240,7 @@ work when there are no failed pools. Set
 `CLUSTERMESH_DEBUG_EARLY_LIVE_OVERLAY_REPAIR_ENABLED=false` to opt out; the
 original strict pool health gate still applies.
 
-The initial Fleet payload is persisted before validation. A well-formed,
+The initial and final Fleet payloads are persisted before validation. A well-formed,
 selected member with `PartialConnectivity` can be reobserved read-only within
 the existing inventory-attempt and quiescence bounds. It must actually return
 to `Connected`; malformed identities, other errors, and exhausted observations

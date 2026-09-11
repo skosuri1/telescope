@@ -747,7 +747,8 @@ def test_job_publishes_diagnostics_without_masking_reconcile_failure():
 
 
 @pytest.mark.parametrize("outcome", ["recovers", "never-recovers", "invalid-identity", "other-error"])
-def test_initial_fleet_health_is_observed_without_weakening_gates(tmp_path, monkeypatch, outcome):
+@pytest.mark.parametrize("phase", ["initial", "final"])
+def test_fleet_health_is_observed_without_weakening_gates(tmp_path, monkeypatch, outcome, phase):
     args = arm.parse_args([
         "--resource-group", "12345-deadbeef",
         "--expected-subscription", "s",
@@ -785,17 +786,17 @@ def test_initial_fleet_health_is_observed_without_weakening_gates(tmp_path, monk
 
     summary = {}
     if outcome == "recovers":
-        members = arm.read_connected_fleet_members(args, clusters, summary, runner)
+        members = arm.read_connected_fleet_members(args, clusters, summary, runner, phase=phase)
         arm.validate_fleet_members(members, clusters)
         assert len(calls) == 2 and len(sleeps) == 1
     else:
         with pytest.raises(arm.ReconcileError):
-            arm.read_connected_fleet_members(args, clusters, summary, runner)
+            arm.read_connected_fleet_members(args, clusters, summary, runner, phase=phase)
         assert len(calls) == (args.inventory_attempts if outcome == "never-recovers" else 1)
     saved = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
-    assert len(saved["initial_fleet_members"]) == 2
+    assert len(saved[f"{phase}_fleet_members"]) == 2
     if outcome != "invalid-identity":
-        assert saved["initial_fleet_health_observations"][0]["unhealthy_members"][0]["name"] == "mesh-2"
+        assert saved[f"{phase}_fleet_health_observations"][0]["unhealthy_members"][0]["name"] == "mesh-2"
 
 
 def test_fleet_members_must_be_exactly_connected():

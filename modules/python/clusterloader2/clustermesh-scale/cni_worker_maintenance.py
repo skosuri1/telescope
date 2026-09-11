@@ -2212,6 +2212,9 @@ def execute_maintenance(
             lambda command, timeout: operator.run(command, timeout),
             args.request_timeout_seconds,
         )
+        summary["initial_worker_state"] = workers.state_to_dict(cluster_state)
+        summary["initial_pool_configuration"] = _pool_configuration(pool_payload)
+        _save(args.summary_file, summary)
         nodes_payload = operator.kubectl_json(
             ["get", "nodes", "-o", "json"],
             timeout_seconds=args.request_timeout_seconds,
