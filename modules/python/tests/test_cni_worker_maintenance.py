@@ -245,6 +245,7 @@ def daemonset_pod(name, node_name, owner):
     return {
         "metadata": {
             "name": f"{name}-{node_name[-1]}",
+            "uid": f"{name}-{node_name}-pod-uid",
             "namespace": "kube-system",
             "ownerReferences": [
                 {
@@ -1115,6 +1116,14 @@ class Backend:
                             self.exclusion_token = taint["value"]
                 elif path == "/metadata/annotations":
                     target["metadata"]["annotations"] = operation["value"]
+                elif path.startswith("/metadata/annotations/"):
+                    key = path[len("/metadata/annotations/"):].replace("~1", "/").replace("~0", "~")
+                    if operation["op"] == "test":
+                        assert target["metadata"]["annotations"][key] == operation["value"]
+                    elif operation["op"] == "remove":
+                        del target["metadata"]["annotations"][key]
+                    else:
+                        target["metadata"]["annotations"][key] = operation["value"]
                 elif path.startswith("/spec/taints/") and operation["op"] == "remove":
                     del target["spec"]["taints"][int(path.split("/")[-1])]
             return ""
@@ -1230,6 +1239,175 @@ def assert_no_mutations(backend):
         token in command for command in backend.calls
         for token in ("scale", "update", "patch", "drain", "run", "delete", "apply")
     )
+
+
+def prepare_empty_host_recovery(args, monkeypatch):
+    backend, prior, manifest = prepare_resume(args, monkeypatch)
+    prior["status"] = "proving-fresh-ip-growth"
+    prior["fresh_nodes"] = list(manifest["fresh_node_uids"])
+    prior["fresh_ip_growth"] = {
+        name: {
+            "node_uid": manifest["fresh_node_uids"][name],
+            "network_container_id": manifest["fresh_network_container_ids"][name],
+            "initial_assigned": 16,
+            **({"after_assigned": 32, "ready_probe_ips": ["10.89.7.17", "10.89.7.18"]}
+               if name == FRESH_A else {}),
+        }
+        for name in manifest["fresh_node_uids"]
+    }
+    Path(args.resume_summary).write_text(json.dumps(prior), encoding="utf-8")
+    args.recover_empty_fresh_node = FRESH_B
+    args.recover_empty_fresh_uid = manifest["fresh_node_uids"][FRESH_B]
+    backend.nodes[FRESH_B]["status"]["nodeInfo"] = {"bootID": "boot-before"}
+    redeploys = []
+
+    def runner(command, timeout):
+        if command[:2] == ["az", "rest"]:
+            assert command[command.index("--method") + 1] == "post"
+            assert command[command.index("--url") + 1] == (
+                f"https://management.azure.com/subscriptions/{SUBSCRIPTION}"
+                f"/resourceGroups/{NODE_RESOURCE_GROUP}/providers/Microsoft.Compute"
+                f"/virtualMachineScaleSets/{VMSS}/virtualMachines/4/redeploy?api-version=2026-04-01"
+            )
+            assert command[command.index("--subscription") + 1] == SUBSCRIPTION
+            redeploys.append(list(command))
+            backend.nodes[FRESH_B]["status"]["nodeInfo"]["bootID"] = "boot-after"
+            return ""
+        if command[:3] == ["az", "vmss", "get-instance-view"]:
+            assert command[command.index("--instance-id") + 1] == "4"
+            return json.dumps({"statuses": [
+                {"code": "ProvisioningState/succeeded"}, {"code": "PowerState/running"},
+            ]})
+        return backend.run(command, timeout)
+
+    return backend, prior, manifest, runner, redeploys
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_empty_host_recovery_is_explicit_and_never_scales(args, monkeypatch, execute):
+    backend, _, _, runner, redeploys = prepare_empty_host_recovery(args, monkeypatch)
+    args.execute = execute
+    summary = {}
+    maintenance.execute_maintenance(args, summary, runner)
+    assert summary["success"] is True
+    assert backend.scale_calls == 0
+    assert len(redeploys) == int(execute)
+    if execute:
+        assert summary["empty_host_recovery"]["success"] is True
+        assert summary["empty_host_recovery"]["cordon_retained"] is False
+        assert summary["empty_host_recovery"]["current_boot_id"] == "boot-after"
+        assert backend.retirement_calls == 1
+    else:
+        assert_no_mutations(backend)
+
+
+@pytest.mark.parametrize("drift", [
+    "original-worker", "qualified-worker", "target-uid", "missing-persisted-uids",
+    "non-daemonset", "pvc", "dirty-probes", "workload-moved",
+])
+def test_empty_host_recovery_refuses_unqualified_scope(args, monkeypatch, drift):
+    backend, prior, manifest, runner, redeploys = prepare_empty_host_recovery(args, monkeypatch)
+    if drift == "original-worker":
+        args.recover_empty_fresh_node = SOURCE
+        args.recover_empty_fresh_uid = SOURCE_UID
+    elif drift == "qualified-worker":
+        args.recover_empty_fresh_node = FRESH_A
+        args.recover_empty_fresh_uid = manifest["fresh_node_uids"][FRESH_A]
+    elif drift == "target-uid":
+        args.recover_empty_fresh_uid = SOURCE_UID
+    elif drift == "missing-persisted-uids":
+        prior.pop("agent_uids")
+    elif drift == "dirty-probes":
+        prior["probe_cleanup_pending"] = [{"uid": "leftover"}]
+    elif drift == "workload-moved":
+        prior["pending_moves"] = [{"name": "kwok-node-0"}]
+    else:
+        original = backend.build_all_pods
+
+        def unsafe_pods():
+            payload = original()
+            if drift == "non-daemonset":
+                payload["items"].append(cilium_operator_pod(FRESH_B))
+            else:
+                for pod in payload["items"]:
+                    if pod.get("spec", {}).get("nodeName") == FRESH_B:
+                        pod["spec"]["volumes"] = [{"persistentVolumeClaim": {"claimName": "unsafe"}}]
+            return payload
+
+        monkeypatch.setattr(backend, "build_all_pods", unsafe_pods)
+    Path(args.resume_summary).write_text(json.dumps(prior), encoding="utf-8")
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, {}, runner)
+    assert not redeploys
+    assert_no_mutations(backend)
+
+
+def test_empty_host_recovery_never_retries_rejected_request(args, monkeypatch):
+    backend, _, _, runner, _ = prepare_empty_host_recovery(args, monkeypatch)
+    attempts = []
+
+    def denied(command, timeout):
+        if command[:2] == ["az", "rest"]:
+            attempts.append(command)
+            raise maintenance.workers.ReconcileError("AuthorizationFailed")
+        return runner(command, timeout)
+
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError, match="AuthorizationFailed"):
+        maintenance.execute_maintenance(args, summary, denied)
+    assert len(attempts) == 1 and not backend.deleted_agents
+    assert backend.scale_calls == 0
+    assert summary["empty_host_recovery"]["cordon_retained"] is True
+    assert summary["success"] is False
+
+
+def test_empty_host_recovery_requires_actual_new_boot(args, monkeypatch):
+    backend, _, _, runner, redeploys = prepare_empty_host_recovery(args, monkeypatch)
+    monkeypatch.setattr(maintenance, "EMPTY_HOST_RECOVERY_SECONDS", 2)
+
+    def unchanged_boot(command, timeout):
+        result = runner(command, timeout)
+        if command[:2] == ["az", "rest"]:
+            backend.nodes[FRESH_B]["status"]["nodeInfo"]["bootID"] = "boot-before"
+        return result
+
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError, match="bounded observation"):
+        maintenance.execute_maintenance(args, summary, unchanged_boot)
+    assert len(redeploys) == 1 and not backend.deleted_agents
+    assert summary["success"] is False
+
+
+def test_empty_host_recovery_refuses_busy_instance_before_cordon(args, monkeypatch):
+    backend, _, _, runner, redeploys = prepare_empty_host_recovery(args, monkeypatch)
+
+    def busy(command, timeout):
+        if command[:3] == ["az", "vmss", "get-instance-view"]:
+            return json.dumps({"statuses": [
+                {"code": "ProvisioningState/updating"}, {"code": "PowerState/running"},
+            ]})
+        return runner(command, timeout)
+
+    with pytest.raises(maintenance.workers.ReconcileError, match="quiescent"):
+        maintenance.execute_maintenance(args, {}, busy)
+    assert not redeploys
+    assert_no_mutations(backend)
+
+
+def test_empty_host_recovery_requires_real_ip_growth_after_redeploy(args, monkeypatch):
+    backend, _, _, runner, redeploys = prepare_empty_host_recovery(args, monkeypatch)
+    backend.probe_growth[FRESH_B] = False
+    monkeypatch.setattr(maintenance, "IP_GROWTH_WAIT_SECONDS", 3)
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, summary, runner)
+    assert len(redeploys) == 1 and backend.scale_calls == 0
+    assert not backend.deleted_agents
+    assert summary["empty_host_recovery"]["redeploy_completed"] is True
+    assert summary["empty_host_recovery"]["success"] is False
+    assert summary["empty_host_recovery"]["cordon_retained"] is True
+    assert backend.nodes[FRESH_B]["spec"]["unschedulable"] is True
+    assert summary["success"] is False and not summary["probe_cleanup_pending"]
 
 
 @pytest.mark.parametrize("legacy", [False, True])

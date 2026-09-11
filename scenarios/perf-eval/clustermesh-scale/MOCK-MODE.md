@@ -225,6 +225,24 @@ the source build, input hashes and original failure/quarantine evidence. A
 failed continuation retains its hold and failure evidence; it is not permission
 to resume partially moved workloads or perform arbitrary rollback.
 
+An additional, explicit recovery path handles one empty newly added worker that
+failed IP qualification. Supply `--recover-empty-fresh-node` and
+`--recover-empty-fresh-uid` together with the three resume arguments. This accepts
+only a `proving-fresh-ip-growth` checkpoint with persisted original identities,
+zero workload moves, completed probe cleanup, and exactly one unqualified fresh
+worker. The target must contain only current kube-system DaemonSet Pods, with no
+mock agents, other workloads or PVCs. The read-only plan performs no host action.
+
+Execution cordons that exact target, submits one single-VM Compute **redeploy**
+request (not a pool update, scale, deletion or reimage), and observes the original
+Node UID with a changed boot ID and successful/running instance state for at most
+15 minutes. It preserves all original mock-agent UIDs and never retries the host
+request. Normal scheduling is restored before fresh qualification; a failed
+qualification retains an explicit target cordon. Host recovery is not successful
+until real IP growth passes. IP qualification is bounded to five minutes, with
+retirement/finalization time reserved, rather than consuming the full operation
+budget on a permanently unprogrammed IP batch.
+
 When local Azure permissions are unavailable, the same helper can run through
 the existing service connection in the preserved n100 resume stage. Select
 `debugMode=resume-existing`, `scaleDebugCniWorkerMaintenanceOnly=true`, and
@@ -242,6 +260,13 @@ normal maintenance unchanged. The job downloads
 and pipeline definition. It preserves the input summary and manifest in the new
 diagnostics and passes the same three resume CLI arguments to both the read-only
 plan and the explicit execution.
+
+For the explicit empty-host recovery above, additionally set
+`scaleDebugCniWorkerRecoverEmptyFreshNode` and
+`scaleDebugCniWorkerRecoverEmptyFreshUid`. Both default to empty and require the
+original checkpoint and manifest. They cannot select an original worker or a
+fresh worker whose prior IP qualification succeeded. All ordinary capacity,
+healthy-source evacuation, ownership and cleanup limits remain unchanged.
 
 The maintenance-only job obtains private, job-local credentials, runs the
 read-only plan, then invokes the same helper with `--execute` and fresh proof.

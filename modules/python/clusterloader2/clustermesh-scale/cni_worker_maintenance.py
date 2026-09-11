@@ -46,6 +46,9 @@ RETIREMENT_MINIMUM_SECONDS = 180
 DRAIN_PHASE_BUDGET_SECONDS = 900
 KWOK_READY_WAIT_SECONDS = 300
 SURGE_READY_WAIT_SECONDS = 300
+IP_GROWTH_WAIT_SECONDS = 300
+EMPTY_HOST_RECOVERY_SECONDS = 900
+EMPTY_HOST_RECOVERY_KEY = "mock-clustermesh/empty-host-recovery"
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -583,6 +586,14 @@ def _resume_options(args) -> bool:
         ),
         "--resume-build-id, --resume-summary and --resume-manifest require all three, with a positive build ID",
     )
+    recovery = (
+        getattr(args, "recover_empty_fresh_node", ""),
+        getattr(args, "recover_empty_fresh_uid", ""),
+    )
+    require(
+        not any(recovery) or (all(recovery) and bool(values[0])),
+        "Empty fresh-host recovery requires both target name/UID and an explicit resume checkpoint",
+    )
     return bool(values[0])
 
 
@@ -632,6 +643,7 @@ def _load_resume(args) -> Optional[dict]:
     _require_resume_paths(args)
     prior, summary_sha = _read_resume_json(args.resume_summary)
     manifest, manifest_sha = _read_resume_json(args.resume_manifest)
+    recover_host = bool(getattr(args, "recover_empty_fresh_node", ""))
     require(
         isinstance(manifest.get("schema_version"), int)
         and not isinstance(manifest["schema_version"], bool) and manifest["schema_version"] == 1
@@ -663,7 +675,9 @@ def _load_resume(args) -> Optional[dict]:
         and prior.get("mutation_started") is True
         and prior.get("surge_request_accepted") is True
         and prior.get("source_quarantined") is True
-        and prior.get("status") == "waiting-for-surge"
+        and prior.get("status") == (
+            "proving-fresh-ip-growth" if recover_host else "waiting-for-surge"
+        )
         and isinstance(prior.get("initial_pool_count"), int)
         and not isinstance(prior["initial_pool_count"], bool)
         and prior["initial_pool_count"] in (MIN_INITIAL_POOL_COUNT, STEADY_POOL_COUNT),
@@ -671,6 +685,8 @@ def _load_resume(args) -> Optional[dict]:
     )
     forbidden_prefixes = ("pending_", "healthy_", "probe_", "fresh_ip_", "retirement", "source_pre_drain", "destination_memory")
     for key, value in prior.items():
+        if recover_host and key == "fresh_ip_growth":
+            continue
         if key.startswith(forbidden_prefixes) or key in ("temporary_exclusions", "cleanup_errors", "cilium_final"):
             require(not value, f"Resume refuses prior mutation or unclean evidence: {key}")
     original = _identity_map(manifest.get("original_real_node_uids"), "Original real workers")
@@ -687,7 +703,36 @@ def _load_resume(args) -> Optional[dict]:
     _identity_map(manifest.get("agent_uids"), "Original mock agents", EXPECTED_AGENT_NAMES)
     require(isinstance(manifest.get("controller_uid"), str) and manifest["controller_uid"], "Original controller UID is required")
     for key in ("original_real_node_uids", "original_kwok_node_uids", "agent_uids", "controller_uid"):
+        require(not recover_host or key in prior, f"Empty-host recovery requires persisted {key}")
         require(key not in prior or prior[key] == manifest[key], f"Resume manifest differs from persisted {key}")
+    if recover_host:
+        target = args.recover_empty_fresh_node
+        growth = prior.get("fresh_ip_growth")
+        require(
+            target in fresh and fresh[target] == args.recover_empty_fresh_uid
+            and isinstance(growth, dict) and set(growth) == set(fresh)
+            and sorted(prior.get("fresh_nodes") or []) == sorted(fresh),
+            "Host recovery target must be one explicitly pinned original fresh worker",
+        )
+        for name, row in growth.items():
+            require(
+                isinstance(row, dict) and row.get("node_uid") == fresh[name]
+                and row.get("network_container_id") == manifest["fresh_network_container_ids"][name]
+                and isinstance(row.get("initial_assigned"), int) and row["initial_assigned"] > 0,
+                f"{name}: original IP-qualification evidence is not exact",
+            )
+            if name == target:
+                require(
+                    "after_assigned" not in row and not row.get("ready_probe_ips"),
+                    "Refusing host recovery of an already IP-qualified fresh worker",
+                )
+            else:
+                require(
+                    isinstance(row.get("after_assigned"), int)
+                    and row["after_assigned"] > row["initial_assigned"]
+                    and row.get("ready_probe_ips"),
+                    "Only one unqualified fresh worker may undergo host recovery",
+                )
     require(
         isinstance(prior.get("initial_pool_configuration"), dict)
         and prior["initial_pool_configuration"]
@@ -705,6 +750,181 @@ def _load_resume(args) -> Optional[dict]:
             "prior_source_quarantined": True, "prior_surge_request_accepted": True,
         },
     }
+
+
+def _empty_host_target(operator, args, selected, resume) -> Tuple[dict, str, str, Set[str]]:
+    target_name = args.recover_empty_fresh_node
+    nodes = _real_node_map(operator.kubectl_json(["get", "nodes", "-o", "json"]))
+    target = nodes.get(target_name)
+    require(
+        target is not None and target["metadata"]["uid"] == args.recover_empty_fresh_uid
+        and workers.node_is_ready(target) and not target["spec"].get("unschedulable")
+        and not _taints(target) and EMPTY_HOST_RECOVERY_KEY not in _annotations(target),
+        "The exact empty fresh worker must be Ready, schedulable and unowned by another recovery",
+    )
+    _validate_real_node_scope(
+        target, subscription=args.expected_subscription,
+        node_resource_group=selected["nodeResourceGroup"],
+    )
+    identity = workers.provider_identity(target)
+    require(identity is not None and mocks._node_pool_name(target) == DEFAULT_POOL_NAME,
+            "The empty-host target is not an exact default-pool VMSS instance")
+    view = operator.az_json(
+        "vmss", "get-instance-view", "--resource-group", selected["nodeResourceGroup"],
+        "--name", identity[0], "--instance-id", identity[1],
+    )
+    require(
+        {"ProvisioningState/succeeded", "PowerState/running"}
+        <= {row.get("code") for row in (view.get("statuses") or [])},
+        "The exact empty-host instance is not quiescent and running",
+    )
+    pods = operator.kubectl_json(["get", "pods", "-A", "-o", "json"])
+    target_pods = [
+        pod for pod in _items(pods, "empty-host Pod inventory")
+        if (pod.get("spec") or {}).get("nodeName") == target_name
+    ]
+    daemonsets = operator.kubectl_json(["-n", "kube-system", "get", "daemonsets", "-o", "json"])
+    owners = {
+        (row["metadata"]["name"], row["metadata"]["uid"])
+        for row in _items(daemonsets, "empty-host DaemonSet inventory")
+    }
+    require(
+        all(
+            (pod.get("metadata") or {}).get("namespace") == "kube-system"
+            and isinstance((pod.get("metadata") or {}).get("uid"), str)
+            and bool(pod["metadata"]["uid"])
+            and not any("persistentVolumeClaim" in volume for volume in (pod.get("spec") or {}).get("volumes", []))
+            and any(
+                owner.get("kind") == "DaemonSet" and owner.get("controller") is True
+                and (owner.get("name"), owner.get("uid")) in owners
+                for owner in (pod.get("metadata") or {}).get("ownerReferences", [])
+            )
+            for pod in target_pods
+        ),
+        "Fresh-host recovery requires zero mock, non-DaemonSet or PVC-backed target Pods",
+    )
+    require(
+        target["metadata"]["uid"] == resume["manifest"]["fresh_node_uids"][target_name],
+        "The empty-host target no longer matches its original fresh-worker identity",
+    )
+    return target, identity[0], identity[1], {pod["metadata"]["uid"] for pod in target_pods}
+
+
+def _recover_empty_fresh_host(operator, args, selected, initial, resume, summary) -> None:
+    target, vmss_name, instance_id, target_pod_uids = _empty_host_target(operator, args, selected, resume)
+    target_name = args.recover_empty_fresh_node
+    boot_id = ((target.get("status") or {}).get("nodeInfo") or {}).get("bootID")
+    require(isinstance(boot_id, str) and boot_id, "The original target boot ID is required")
+    recovery_budget = _phase_budget(
+        operator, maximum_seconds=EMPTY_HOST_RECOVERY_SECONDS,
+        reserve_after_seconds=RETIREMENT_MINIMUM_SECONDS + FINAL_QUALIFICATION_RESERVE_SECONDS,
+        minimum_seconds=args.request_timeout_seconds, description="one empty-host redeployment",
+    )
+    record = summary["empty_host_recovery"] = {
+        "node_name": target_name, "node_uid": args.recover_empty_fresh_uid,
+        "vmss_name": vmss_name, "instance_id": instance_id,
+        "previous_boot_id": boot_id, "request_attempted": False,
+        "request_accepted": False, "cordon_retained": True, "success": False,
+        "redeploy_completed": False,
+    }
+    annotation = f"empty-fresh-host-recovery build={args.resume_build_id} uid={args.recover_empty_fresh_uid}"
+    _save(args.summary_file, summary)
+    annotations = dict(_annotations(target))
+    annotations[EMPTY_HOST_RECOVERY_KEY] = annotation
+    operator.kubectl([
+        "patch", "node", target_name, "--type=json", "-p", json.dumps([
+            {"op": "test", "path": "/metadata/uid", "value": args.recover_empty_fresh_uid},
+            {"op": "test", "path": "/metadata/resourceVersion", "value": target["metadata"]["resourceVersion"]},
+            {"op": "add", "path": "/metadata/annotations", "value": annotations},
+            {"op": "add", "path": "/spec/unschedulable", "value": True},
+        ]),
+    ])
+    after_cordon_pods = operator.kubectl_json(["get", "pods", "-A", "-o", "json"])
+    require(
+        {
+            pod["metadata"]["uid"] for pod in _items(after_cordon_pods, "cordoned empty-host inventory")
+            if (pod.get("spec") or {}).get("nodeName") == target_name
+        } <= target_pod_uids,
+        "The empty-host Pod inventory changed before redeployment",
+    )
+    record["request_attempted"] = True
+    redeploy_url = (
+        f"https://management.azure.com/subscriptions/{args.expected_subscription}"
+        f"/resourceGroups/{selected['nodeResourceGroup']}/providers/Microsoft.Compute"
+        f"/virtualMachineScaleSets/{vmss_name}/virtualMachines/{instance_id}"
+        "/redeploy?api-version=2026-04-01"
+    )
+    record["redeploy_url"] = redeploy_url
+    _save(args.summary_file, summary)
+    operator.run([
+        "az", "rest", "--method", "post", "--url", redeploy_url,
+        "--output", "none", "--only-show-errors",
+    ], args.request_timeout_seconds)
+    record["request_accepted"] = True
+    summary["status"] = "recovering-empty-fresh-host"
+    _save(args.summary_file, summary)
+    deadline = min(operator.work_deadline, time.monotonic() + recovery_budget)
+    expected_nodes = {
+        **resume["manifest"]["original_real_node_uids"], **resume["manifest"]["fresh_node_uids"],
+    }
+    while time.monotonic() < deadline:
+        nodes = _real_node_map(operator.kubectl_json(["get", "nodes", "-o", "json"]))
+        require(
+            {name: node["metadata"]["uid"] for name, node in nodes.items()} == expected_nodes,
+            "A real worker identity changed during the bounded host redeployment",
+        )
+        agents = _require_exact_agents(
+            operator.kubectl_json(["-n", DEFAULT_NAMESPACE, "get", "pods", "-l", mocks.AGENT_SELECTOR, "-o", "json"]),
+            initial["controller_uid"],
+        )
+        require(
+            {name: pod["metadata"]["uid"] for name, pod in agents.items()} == initial["agent_uids"]
+            and all(mocks._pod_ready(agents[name]) and _readiness_condition_true(agents[name])
+                    for name in initial["initial_ready_agent_uids"]),
+            "An original mock agent changed during the empty-host recovery",
+        )
+        view = operator.az_json(
+            "vmss", "get-instance-view", "--resource-group", selected["nodeResourceGroup"],
+            "--name", vmss_name, "--instance-id", instance_id,
+        )
+        codes = {row.get("code") for row in (view.get("statuses") or [])}
+        target = nodes[target_name]
+        current_boot = ((target.get("status") or {}).get("nodeInfo") or {}).get("bootID")
+        record["last_instance_codes"] = sorted(code for code in codes if isinstance(code, str))
+        record["current_boot_id"] = current_boot
+        _save(args.summary_file, summary)
+        if (
+            {"ProvisioningState/succeeded", "PowerState/running"} <= codes
+            and workers.node_is_ready(target) and current_boot and current_boot != boot_id
+        ):
+            break
+        require(
+            not any(str(code).lower().startswith("provisioningstate/failed") for code in codes),
+            "The targeted host redeployment failed; refusing another request",
+        )
+        time.sleep(min(args.poll_seconds, operator.remaining_seconds(args.poll_seconds)))
+    else:
+        raise workers.ReconcileError("One empty-host redeployment exceeded its bounded observation window")
+    target = operator.kubectl_json(["get", "node", target_name, "-o", "json"])
+    operator.kubectl([
+        "patch", "node", target_name, "--type=json", "-p", json.dumps([
+            {"op": "test", "path": "/metadata/uid", "value": args.recover_empty_fresh_uid},
+            {"op": "test", "path": f"/metadata/annotations/{EMPTY_HOST_RECOVERY_KEY.replace('/', '~1')}", "value": annotation},
+            {"op": "add", "path": "/spec/unschedulable", "value": False},
+            {"op": "remove", "path": f"/metadata/annotations/{EMPTY_HOST_RECOVERY_KEY.replace('/', '~1')}"},
+        ]),
+    ])
+    restore_deadline = min(operator.work_deadline, time.monotonic() + 90)
+    while time.monotonic() < restore_deadline:
+        target = operator.kubectl_json(["get", "node", target_name, "-o", "json"])
+        require(target["metadata"]["uid"] == args.recover_empty_fresh_uid, "Recovered host UID changed")
+        if workers.node_is_ready(target) and not target["spec"].get("unschedulable") and not _taints(target):
+            record["cordon_retained"] = False
+            record["redeploy_completed"] = True
+            _save(args.summary_file, summary)
+            return
+        time.sleep(min(args.poll_seconds, operator.remaining_seconds(args.poll_seconds)))
+    raise workers.ReconcileError("Recovered host did not restore normal scheduling")
 
 
 def _require_resume_hold(args, nodes: dict) -> None:
@@ -2598,6 +2818,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--resume-build-id", type=int, default=0)
     parser.add_argument("--resume-summary", default="")
     parser.add_argument("--resume-manifest", default="")
+    parser.add_argument("--recover-empty-fresh-node", default="")
+    parser.add_argument("--recover-empty-fresh-uid", default="")
     args = parser.parse_args(argv)
     try:
         if _resume_options(args):
@@ -2614,6 +2836,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--source-provider-id must be a full AKS VMSS providerID")
     _parse_uuid(args.node_uid, "--node-uid")
     _parse_uuid(args.source_network_container_id, "--source-network-container-id")
+    if args.recover_empty_fresh_uid:
+        _parse_uuid(args.recover_empty_fresh_uid, "--recover-empty-fresh-uid")
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
     if args.request_timeout_seconds <= 0:
@@ -2809,6 +3033,8 @@ def execute_maintenance(
                 operator.kubectl_json(["get", "deployments", "-A", "-o", "json"]),
                 operator.kubectl_json(["get", "statefulsets", "-A", "-o", "json"]),
             )
+            if getattr(args, "recover_empty_fresh_node", ""):
+                _empty_host_target(operator, args, selected, resume)
             startup = _startup_operator(operator)
             applicable = _derive_applicable_daemonsets(
                 system_pods, sorted(name for name in initial["initial_real_node_uids"] if name != args.node_name),
@@ -2822,6 +3048,11 @@ def execute_maintenance(
             summary["success"] = True
             _save(args.summary_file, summary)
             return
+
+        if resume and getattr(args, "recover_empty_fresh_node", ""):
+            summary["mutation_started"] = True
+            _recover_empty_fresh_host(operator, args, selected, initial, resume, summary)
+            startup = _startup_operator(operator)
 
         baseline_config = initial["initial_pool_configuration"]
         if resume:
@@ -2890,7 +3121,19 @@ def execute_maintenance(
         summary["status"] = "proving-fresh-ip-growth"
         summary["mutation_started"] = True
         _save(args.summary_file, summary)
-        _prove_fresh_ip_growth(operator, args, cluster, fresh_nodes, summary)
+        ip_budget = _phase_budget(
+            operator, maximum_seconds=IP_GROWTH_WAIT_SECONDS,
+            reserve_after_seconds=RETIREMENT_MINIMUM_SECONDS + FINAL_QUALIFICATION_RESERVE_SECONDS,
+            minimum_seconds=args.request_timeout_seconds, description="bounded IP growth and retirement",
+        )
+        ip_operator = ClusterOperator(
+            args, cluster_name, runner, time.monotonic() + ip_budget, operator.cleanup_deadline,
+        )
+        _prove_fresh_ip_growth(ip_operator, args, cluster, fresh_nodes, summary)
+        if summary.get("empty_host_recovery"):
+            summary["empty_host_recovery"]["success"] = True
+            summary["empty_host_recovery"]["ip_growth_verified"] = True
+            _save(args.summary_file, summary)
         require(
             not mocks._tolerates(
                 {"key": EXCLUSION_KEY, "value": "bounded", "effect": "NoSchedule"},
@@ -3105,6 +3348,29 @@ def execute_maintenance(
             operator.cleanup_mode = True
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        host_recovery = summary.get("empty_host_recovery") or {}
+        if operator is not None and host_recovery.get("redeploy_completed") \
+                and not host_recovery.get("success") and not host_recovery.get("cordon_retained"):
+            try:
+                target = operator.kubectl_json(
+                    ["get", "node", host_recovery["node_name"], "-o", "json"], cleanup=True,
+                )
+                require(target["metadata"]["uid"] == host_recovery["node_uid"], "Unqualified recovered host UID changed")
+                annotation = f"unqualified-empty-host-recovery build={args.resume_build_id} uid={host_recovery['node_uid']}"
+                annotations = dict(_annotations(target))
+                require(EMPTY_HOST_RECOVERY_KEY not in annotations, "Another operation owns the recovered host annotation")
+                annotations[EMPTY_HOST_RECOVERY_KEY] = annotation
+                operator.kubectl([
+                    "patch", "node", host_recovery["node_name"], "--type=json", "-p", json.dumps([
+                        {"op": "test", "path": "/metadata/uid", "value": host_recovery["node_uid"]},
+                        {"op": "test", "path": "/metadata/resourceVersion", "value": target["metadata"]["resourceVersion"]},
+                        {"op": "add", "path": "/metadata/annotations", "value": annotations},
+                        {"op": "add", "path": "/spec/unschedulable", "value": True},
+                    ]),
+                ], cleanup=True)
+                host_recovery["cordon_retained"] = True
+            except EXPECTED_ERRORS as error:
+                cleanup_errors.append(f"Failed to quarantine unqualified recovered host: {error}")
         if operator is not None and cluster is not None:
             cleanup_errors.extend(_cleanup_probe_pods(operator, args, cluster, summary))
             _remove_temporary_exclusions(

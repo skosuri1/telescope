@@ -25,6 +25,12 @@ parameters:
   - name: resume_manifest_json
     type: string
     default: ""
+  - name: recover_empty_fresh_node
+    type: string
+    default: ""
+  - name: recover_empty_fresh_uid
+    type: string
+    default: ""
 
 steps:
   - script: |
@@ -46,6 +52,12 @@ steps:
         { [ "$RESUME_BUILD_ID" != "0" ] && [ -z "$RESUME_MANIFEST_JSON" ]; } ||
         [ "${#RESUME_MANIFEST_JSON}" -gt 32768 ]; then
         echo "Post-surge continuation requires the original build ID and identity manifest together." >&2
+        exit 1
+      fi
+      if [ -n "$RECOVER_EMPTY_FRESH_NODE$RECOVER_EMPTY_FRESH_UID" ] &&
+        { [ -z "$RECOVER_EMPTY_FRESH_NODE" ] || [ -z "$RECOVER_EMPTY_FRESH_UID" ] ||
+          [ "$RESUME_BUILD_ID" = "0" ]; }; then
+        echo "Empty-host recovery requires an explicit fresh node/UID and original checkpoint." >&2
         exit 1
       fi
       summary_dir="$ARTIFACT_STAGING_DIRECTORY/n100-cni-worker-maintenance"
@@ -108,6 +120,12 @@ steps:
         --kubeconfig "$kubeconfig" --context "$cluster_name"
         "${resume_args[@]}"
       )
+      if [ -n "$RECOVER_EMPTY_FRESH_NODE" ]; then
+        common+=(
+          --recover-empty-fresh-node "$RECOVER_EMPTY_FRESH_NODE"
+          --recover-empty-fresh-uid "$RECOVER_EMPTY_FRESH_UID"
+        )
+      fi
       echo "Qualifying the explicit source with the read-only maintenance plan."
       python3 -u "$helper" "${common[@]}" --summary-file "$summary_dir/plan.json"
       echo "Executing the same bounded single-source maintenance with fresh live proof."
@@ -128,6 +146,8 @@ steps:
       RESUME_BUILD_ID: "${{ parameters.resume_build_id }}"
       RESUME_MANIFEST_JSON: ${{ parameters.resume_manifest_json }}
       RESUME_INPUT_DIRECTORY: $(Pipeline.Workspace)/n100-cni-worker-resume-${{ parameters.resume_build_id }}
+      RECOVER_EMPTY_FRESH_NODE: ${{ parameters.recover_empty_fresh_node }}
+      RECOVER_EMPTY_FRESH_UID: ${{ parameters.recover_empty_fresh_uid }}
       SOURCE_ROOT: $(Pipeline.Workspace)/s
       TFVARS_PATH: ${{ parameters.tfvars_path }}
       ARTIFACT_STAGING_DIRECTORY: $(Build.ArtifactStagingDirectory)

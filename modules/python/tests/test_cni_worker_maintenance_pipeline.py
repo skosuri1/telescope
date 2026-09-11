@@ -30,6 +30,8 @@ SOURCE_ENV = {
     "SOURCE_NETWORK_CONTAINER_ID": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
     "RESUME_BUILD_ID": "0",
     "RESUME_MANIFEST_JSON": "",
+    "RECOVER_EMPTY_FRESH_NODE": "",
+    "RECOVER_EMPTY_FRESH_UID": "",
 }
 RESUME_MANIFEST = {
     "schema_version": 1,
@@ -65,6 +67,9 @@ def template(path):
     ({"RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST)}, 1),
     ({"RESUME_BUILD_ID": "43", "RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST)}, 1),
     ({"RESUME_BUILD_ID": "42", "RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST)}, 0),
+    ({"RECOVER_EMPTY_FRESH_NODE": "fresh-node"}, 1),
+    ({"RECOVER_EMPTY_FRESH_UID": "fresh-uid"}, 1),
+    ({"RECOVER_EMPTY_FRESH_NODE": "fresh-node", "RECOVER_EMPTY_FRESH_UID": "fresh-uid"}, 1),
 ])
 def test_job_guard_rejects_incomplete_or_conflicting_modes(overrides, expected):
     script = template(JOB)["jobs"][0]["steps"][0]["script"]
@@ -126,6 +131,8 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
     assert invocation["parameters"]["run_workload"] == "${{ parameters.scaleDebugRunWorkload }}"
     assert invocation["parameters"]["resume_build_id"] == "${{ parameters.scaleDebugCniWorkerResumeBuildId }}"
     assert invocation["parameters"]["resume_manifest_json"] == "${{ parameters.scaleDebugCniWorkerResumeManifestJson }}"
+    assert invocation["parameters"]["recover_empty_fresh_node"] == "${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshNode }}"
+    assert invocation["parameters"]["recover_empty_fresh_uid"] == "${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshUid }}"
     assert stage["variables"]["CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY"] == (
         "${{ parameters.scaleDebugCniWorkerMaintenanceOnly }}"
     )
@@ -159,10 +166,11 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
     ("empty-inventory", 5, 0),
     ("ambiguous-inventory", 5, 0),
 ])
-@pytest.mark.parametrize("continuation", [False, True])
+@pytest.mark.parametrize("continuation", ["none", "resume", "host"])
 def test_real_step_plans_then_executes_with_private_credentials(
     tmp_path, failure, expected, helper_calls, continuation,
 ):
+    resuming = continuation != "none"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     private = tmp_path / "private"
@@ -173,7 +181,7 @@ def test_real_step_plans_then_executes_with_private_credentials(
     trace = tmp_path / "helper-calls.jsonl"
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    if continuation:
+    if resuming:
         (checkpoint / "maintenance.json").write_text('{"checkpoint":"original"}', encoding="utf-8")
     (source / "test.tfvars").write_text("cluster_count = 100\n", encoding="utf-8")
     fake_az = bin_dir / "az"
@@ -238,6 +246,12 @@ def test_real_step_plans_then_executes_with_private_credentials(
             assert json.loads(manifest.read_text(encoding="utf-8")) == json.loads(os.environ["RESUME_MANIFEST_JSON"])
         else:
             assert not any(flag in args for flag in ("--resume-build-id", "--resume-summary", "--resume-manifest"))
+        if os.environ["RECOVER_EMPTY_FRESH_NODE"]:
+            assert args[args.index("--recover-empty-fresh-node") + 1] == os.environ["RECOVER_EMPTY_FRESH_NODE"]
+            assert args[args.index("--recover-empty-fresh-uid") + 1] == os.environ["RECOVER_EMPTY_FRESH_UID"]
+        else:
+            assert "--recover-empty-fresh-node" not in args
+            assert "--recover-empty-fresh-uid" not in args
         with open(os.environ["FAKE_TRACE"], "a", encoding="utf-8") as handle:
             handle.write(json.dumps(args) + "\\n")
         summary = Path(args[args.index("--summary-file") + 1])
@@ -261,9 +275,11 @@ def test_real_step_plans_then_executes_with_private_credentials(
         "PRIVATE_TEMP_ROOT": str(private),
         "FAKE_TRACE": str(trace),
         "FAKE_FAILURE": failure,
-        "RESUME_BUILD_ID": "42" if continuation else "0",
-        "RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST) if continuation else "",
+        "RESUME_BUILD_ID": "42" if resuming else "0",
+        "RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST) if resuming else "",
         "RESUME_INPUT_DIRECTORY": str(checkpoint),
+        "RECOVER_EMPTY_FRESH_NODE": "fresh-worker" if continuation == "host" else "",
+        "RECOVER_EMPTY_FRESH_UID": "fresh-uid" if continuation == "host" else "",
     }
     result = subprocess.run(
         ["bash", "-c", template(STEP)["steps"][0]["script"]],
@@ -286,7 +302,7 @@ def test_real_step_plans_then_executes_with_private_credentials(
         "fake-private-credentials" not in path.read_text(encoding="utf-8")
         for path in artifacts.rglob("*") if path.is_file()
     )
-    if continuation:
+    if resuming:
         assert json.loads((checkpoint / "maintenance.json").read_text(encoding="utf-8")) == {
             "checkpoint": "original",
         }
