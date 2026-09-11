@@ -312,6 +312,26 @@ repair ownership. Final worker count, VMSS instance absence, pool configuration,
 unchanged mock/KWOK identities, and full Cilium peer proof remain mandatory.
 An already absent source can be certified without another mutation.
 
+### `cilium_exec_blocked_by_failed_worker`
+
+Build 79763 safely refused Fleet repair because mesh-51's Cilium exec request
+to worker `10.51.0.5:10250` returned a proxy 504. The worker had stopped sending
+heartbeats, but its Pod container-status entries still reported Ready. The
+Pod's actual Ready condition was False.
+
+Live Cilium probes now require the Pod Ready condition and reject terminating
+Pods before exec. They report the Pod and worker names instead of treating stale
+container readiness as current availability. This does not waive any peer proof
+or authorize a Fleet rejoin from a partial probe.
+
+Diagnose the worker separately using fresh Node/lease and Compute state.
+A stale scheduled Freeze event is not sufficient evidence to interrupt live
+migration. In this case, Compute reported a terminal, non-recoverable
+`OSProvisioningClientError` and an unavailable VM agent. Recovery was scoped to
+that exact failed instance only after ownership, volume and unaffected-service
+safety checks; the pool's desired count was not changed. Full live peer proof
+remains required after host recovery.
+
 ---
 
 ## Covered / NOT-covered matrix (release scope statement)

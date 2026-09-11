@@ -215,7 +215,11 @@ def fleet_fixture(tmp_path, monkeypatch):
         if "pods" in command:
             return json.dumps({"items": [{
                 "metadata": {"name": f"{role}-cilium-{index}"}, "spec": {"nodeName": f"{role}-node-{index}"},
-                "status": {"phase": "Running", "containerStatuses": [{"name": "cilium-agent", "ready": True}]},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [{"name": "cilium-agent", "ready": True}],
+                },
             } for index in range(3)]})
         assert "cilium-dbg" in command
         remotes = [{

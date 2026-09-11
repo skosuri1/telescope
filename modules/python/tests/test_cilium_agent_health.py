@@ -72,6 +72,7 @@ def test_probe_retries_all_agent_status_until_healthy():
                             "spec": {"nodeName": "node-a"},
                             "status": {
                                 "phase": "Running",
+                                "conditions": [{"type": "Ready", "status": "True"}],
                                 "containerStatuses": [
                                     {"name": "cilium-agent", "ready": True}
                                 ],

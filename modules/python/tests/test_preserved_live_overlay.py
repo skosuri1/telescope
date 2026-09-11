@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[1]
@@ -195,6 +197,7 @@ def test_read_status_probes_every_named_ready_cilium_pod():
                             "spec": {"nodeName": "node-a"},
                             "status": {
                                 "phase": "Running",
+                                "conditions": [{"type": "Ready", "status": "True"}],
                                 "containerStatuses": [
                                     {"name": "cilium-agent", "ready": True}
                                 ],
@@ -205,6 +208,7 @@ def test_read_status_probes_every_named_ready_cilium_pod():
                             "spec": {"nodeName": "node-b"},
                             "status": {
                                 "phase": "Running",
+                                "conditions": [{"type": "Ready", "status": "True"}],
                                 "containerStatuses": [
                                     {"name": "cilium-agent", "ready": True}
                                 ],
@@ -227,6 +231,35 @@ def test_read_status_probes_every_named_ready_cilium_pod():
         "cilium-a",
         "cilium-b",
     ]
+
+
+@pytest.mark.parametrize("pod_ready,deleting", [
+    ("False", False),
+    ("Unknown", False),
+    (None, False),
+    ("True", True),
+])
+def test_read_status_rejects_stale_container_readiness_before_exec(pod_ready, deleting):
+    cluster = overlay.Cluster("clustermesh-51", "rg", "mesh-51", "/tmp/mesh-51.config")
+    metadata = {"name": "cilium-stale"}
+    if deleting:
+        metadata["deletionTimestamp"] = "2026-09-11T02:57:55Z"
+    conditions = [] if pod_ready is None else [{"type": "Ready", "status": pod_ready}]
+
+    def runner(args, _timeout):
+        assert "exec" not in args, "An unready or terminating agent must not receive exec"
+        return json.dumps({"items": [{
+            "metadata": metadata,
+            "spec": {"nodeName": "failed-worker"},
+            "status": {
+                "phase": "Running",
+                "conditions": conditions,
+                "containerStatuses": [{"name": "cilium-agent", "ready": True}],
+            },
+        }]})
+
+    with pytest.raises(overlay.ProbeError, match=r"node=failed-worker, Pod Ready="):
+        overlay.read_status(cluster, runner, 30)
 
 
 def test_many_remote_failures_on_one_observer_repair_local_member():

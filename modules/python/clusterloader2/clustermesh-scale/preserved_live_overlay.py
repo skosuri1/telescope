@@ -305,11 +305,24 @@ def read_status(
             ),
             None,
         )
+        conditions = status.get("conditions") if isinstance(status, dict) else None
+        ready_condition = next(
+            (
+                condition for condition in conditions or []
+                if isinstance(condition, dict) and condition.get("type") == "Ready"
+            ),
+            None,
+        )
+        terminating = metadata.get("deletionTimestamp") if isinstance(metadata, dict) else None
         pod_ready = (
             isinstance(status, dict)
             and status.get("phase") == "Running"
             and isinstance(cilium_status, dict)
             and cilium_status.get("ready") is True
+            and isinstance(conditions, list)
+            and isinstance(ready_condition, dict)
+            and ready_condition.get("status") == "True"
+            and not terminating
         )
         if (
             not isinstance(pod_name, str)
@@ -320,7 +333,9 @@ def read_status(
         ):
             raise ProbeError(
                 f"{cluster.role}: Cilium agent Pod is not Running/Ready: "
-                f"{pod_name or 'unknown'}"
+                f"{pod_name or 'unknown'} (node={node_name or 'unknown'}, "
+                f"Pod Ready={(ready_condition or {}).get('status', 'missing')}, "
+                f"terminating={bool(terminating)})"
             )
         output = runner(
             [
