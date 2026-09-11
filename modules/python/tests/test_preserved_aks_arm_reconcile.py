@@ -2,6 +2,7 @@
 
 import importlib.util
 import copy
+import json
 import sys
 from pathlib import Path
 
@@ -743,6 +744,58 @@ def test_job_publishes_diagnostics_without_masking_reconcile_failure():
         "eq(variables['AKS_ARM_RECONCILE_DIAGNOSTICS_READY'], 'true'))"
     ) in template
     assert 'artifact: "n100-aks-arm-reconcile-$(Build.BuildId)-$(System.JobAttempt)"' in template
+
+
+@pytest.mark.parametrize("outcome", ["recovers", "never-recovers", "invalid-identity", "other-error"])
+def test_initial_fleet_health_is_observed_without_weakening_gates(tmp_path, monkeypatch, outcome):
+    args = arm.parse_args([
+        "--resource-group", "12345-deadbeef",
+        "--expected-subscription", "s",
+        "--expected-region", "eastus2euap",
+        "--expected-count", "2",
+        "--expected-tfvars-sha", "expected",
+        "--summary-file", str(tmp_path / "summary.json"),
+    ])
+    clusters, _ = arm.validate_cluster_inventory(
+        [cluster_row(1), cluster_row(2)],
+        expected_count=2, region="eastus2euap", max_repair_clusters=1,
+    )
+    calls = []
+    sleeps = []
+    monkeypatch.setattr(arm.time, "sleep", sleeps.append)
+
+    def runner(command, _timeout):
+        assert command[:4] == ["az", "fleet", "clustermeshprofile", "list-members"]
+        calls.append(command)
+        members = [{
+            "name": f"mesh-{index}", "provisioningState": "Succeeded",
+            "labels": {"mesh": "true"},
+            "meshProperties": {"status": {"state": "Connected"}},
+        } for index in (1, 2)]
+        if outcome == "invalid-identity":
+            members[1]["name"] = "mesh-3"
+        elif outcome != "recovers" or len(calls) == 1:
+            members[1]["meshProperties"]["status"] = {
+                "state": "Disconnected",
+                "error": {
+                    "code": "OtherFailure" if outcome == "other-error" else "PartialConnectivity"
+                },
+            }
+        return json.dumps(members)
+
+    summary = {}
+    if outcome == "recovers":
+        members = arm.read_connected_fleet_members(args, clusters, summary, runner)
+        arm.validate_fleet_members(members, clusters)
+        assert len(calls) == 2 and len(sleeps) == 1
+    else:
+        with pytest.raises(arm.ReconcileError):
+            arm.read_connected_fleet_members(args, clusters, summary, runner)
+        assert len(calls) == (args.inventory_attempts if outcome == "never-recovers" else 1)
+    saved = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert len(saved["initial_fleet_members"]) == 2
+    if outcome != "invalid-identity":
+        assert saved["initial_fleet_health_observations"][0]["unhealthy_members"][0]["name"] == "mesh-2"
 
 
 def test_fleet_members_must_be_exactly_connected():

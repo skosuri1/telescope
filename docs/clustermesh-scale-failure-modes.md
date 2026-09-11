@@ -240,6 +240,13 @@ work when there are no failed pools. Set
 `CLUSTERMESH_DEBUG_EARLY_LIVE_OVERLAY_REPAIR_ENABLED=false` to opt out; the
 original strict pool health gate still applies.
 
+The initial Fleet payload is persisted before validation. A well-formed,
+selected member with `PartialConnectivity` can be reobserved read-only within
+the existing inventory-attempt and quiescence bounds. It must actually return
+to `Connected`; malformed identities, other errors, and exhausted observations
+remain fatal. This avoids losing the evidence for a brief member-health flap
+such as mesh-22 in build 79769 without treating partial connectivity as healthy.
+
 For an explicit repair-only run on that same stage, set
 `scaleDebugArmRepairOnly=true`. It executes the shared
 `reconcile-preserved-arm.yml` through the normal service connection without

@@ -365,6 +365,10 @@ def validate_cluster_inventory(
     return clusters, failed
 
 
+class FleetHealthError(ReconcileError):
+    """An exact readable Fleet inventory has members that are not Connected."""
+
+
 def validate_fleet_members(payload: object, clusters: List[Cluster]) -> None:
     """Require exact, fully Connected Fleet membership."""
 
@@ -382,18 +386,84 @@ def validate_fleet_members(payload: object, clusters: List[Cluster]) -> None:
     }
     if actual_roles != expected_roles:
         raise ReconcileError("Fleet member names do not match AKS mesh roles")
-    unhealthy = [
-        str(row.get("name"))
-        for row in payload
-        if not isinstance(row.get("meshProperties"), dict)
-        or not isinstance(row["meshProperties"].get("status"), dict)
-        or row["meshProperties"]["status"].get("state") != "Connected"
-    ]
+    unhealthy = []
+    for row in payload:
+        mesh = row.get("meshProperties")
+        status = mesh.get("status") if isinstance(mesh, dict) else None
+        if not isinstance(status, dict) or not isinstance(status.get("state"), str):
+            raise ReconcileError(
+                f"{row['name']}: Fleet member health is unreadable",
+                evidence={"fleet_member": row},
+            )
+        if status["state"] != "Connected":
+            unhealthy.append(row)
     if unhealthy:
-        raise ReconcileError(
+        raise FleetHealthError(
             "refusing AKS ARM repair while Fleet members are not Connected: "
-            + " ".join(sorted(unhealthy))
+            + " ".join(sorted(row["name"] for row in unhealthy)),
+            evidence={"unhealthy_fleet_members": unhealthy},
         )
+
+
+def read_connected_fleet_members(
+    args: argparse.Namespace, clusters: List[Cluster], summary: dict, runner: Runner,
+) -> object:
+    """Observe transient PartialConnectivity without ever accepting it as healthy."""
+
+    deadline = time.monotonic() + args.quiescence_timeout_seconds
+    command = [
+        "az", "fleet", "clustermeshprofile", "list-members",
+        "--resource-group", args.resource_group, "--fleet-name", args.fleet_name,
+        "--name", args.profile_name, "--output", "json", "--only-show-errors",
+    ]
+
+    def bounded_read(arguments, timeout):
+        remaining = math.ceil(deadline - time.monotonic())
+        if remaining <= 0:
+            raise ReconcileError("Fleet health observation deadline expired")
+        return runner(arguments, min(timeout, remaining))
+
+    observations = summary.setdefault("initial_fleet_health_observations", [])
+    for attempt in range(1, args.inventory_attempts + 1):
+        members = parse_json(
+            run_read_with_retries(
+                command, bounded_read,
+                timeout_seconds=args.inventory_timeout_seconds,
+                attempts=args.inventory_attempts,
+                retry_seconds=args.inventory_retry_seconds,
+            ),
+            "Fleet member",
+        )
+        summary["initial_fleet_members"] = members
+        write_json_atomic(args.summary_file, summary)
+        try:
+            validate_fleet_members(members, clusters)
+            return members
+        except FleetHealthError as error:
+            unhealthy = error.evidence["unhealthy_fleet_members"]
+            observations.append({
+                "attempt": attempt, "observed_at": utc_now(),
+                "unhealthy_members": unhealthy,
+            })
+            write_json_atomic(args.summary_file, summary)
+            partial_connectivity = all(
+                row.get("provisioningState") == "Succeeded"
+                and isinstance(row.get("labels"), dict)
+                and row["labels"].get("mesh") == "true"
+                and isinstance(row["meshProperties"]["status"].get("error"), dict)
+                and row["meshProperties"]["status"]["error"].get("code") == "PartialConnectivity"
+                for row in unhealthy
+            )
+            remaining = deadline - time.monotonic()
+            if not partial_connectivity or attempt == args.inventory_attempts or remaining <= 0:
+                raise
+            print(
+                "Fleet PartialConnectivity observation; waiting read-only for Connected: "
+                + ",".join(row["name"] for row in unhealthy),
+                flush=True,
+            )
+            time.sleep(min(args.inventory_retry_seconds, remaining))
+    raise ReconcileError("Fleet health observation did not run")
 
 
 def validate_latest_operation(cluster: Cluster, payload: object) -> dict:
@@ -1557,31 +1627,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for cluster in clusters for pool in cluster.failed_pools
         ]
 
-        fleet_members = parse_json(
-            run_read_with_retries(
-                [
-                    "az",
-                    "fleet",
-                    "clustermeshprofile",
-                    "list-members",
-                    "--resource-group",
-                    args.resource_group,
-                    "--fleet-name",
-                    args.fleet_name,
-                    "--name",
-                    args.profile_name,
-                    "--output",
-                    "json",
-                    "--only-show-errors",
-                ],
-                run_command,
-                timeout_seconds=args.inventory_timeout_seconds,
-                attempts=args.inventory_attempts,
-                retry_seconds=args.inventory_retry_seconds,
-            ),
-            "Fleet member",
-        )
-        validate_fleet_members(fleet_members, clusters)
+        read_connected_fleet_members(args, clusters, summary, run_command)
 
         failure_evidence: Dict[str, dict] = {}
         summary["failure_evidence"] = failure_evidence
