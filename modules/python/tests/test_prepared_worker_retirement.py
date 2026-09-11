@@ -497,6 +497,118 @@ def test_fleet_partial_observation_keeps_all_identity_and_connected_gates(args, 
             assert observed["profile"] == 1
 
 
+@pytest.mark.parametrize("fault", [
+    "healthy-peers", "failed-read", "failed-cilium", "denied-credentials", "foreign", "deadline", "too-many",
+])
+def test_failed_fleet_diagnostics_are_private_bounded_and_never_permit_retirement(
+    args, backend, monkeypatch, fault,
+):
+    calls, credentials = [], []
+    _, clusters, members = scope_data(args)
+    roles = range(6) if fault == "too-many" else [95]
+    for index in roles:
+        members[index]["meshProperties"]["status"] = {
+            "state": "Failed", "error": {"code": "ConnectivityTimeout"},
+        }
+    if fault == "foreign":
+        members[95]["clusterResourceId"] = "foreign"
+    pod = {
+        "metadata": {
+            "name": "clustermesh-apiserver-test", "uid": "api-pod-uid",
+            "namespace": "kube-system",
+        },
+        "spec": {"containers": [{"name": "apiserver"}]},
+        "status": {"containerStatuses": [{"name": "apiserver", "restartCount": 1}]},
+    }
+
+    def diagnostic_read(command, timeout):
+        calls.append(list(command))
+        assert 0 < timeout <= 45
+        if command[:4] == ["az", "fleet", "member", "list"]:
+            return json.dumps(members)
+        if command[:3] == ["az", "aks", "get-credentials"]:
+            assert command[-2:] == ["--subscription", args.expected_subscription]
+            assert command[command.index("--name") + 1] == clusters[95]["name"]
+            path = Path(command[command.index("--file") + 1])
+            credentials.append(path)
+            if fault == "denied-credentials":
+                raise retirement.workers.ReconcileError("AuthorizationFailed")
+            path.write_text("private-test-credential", encoding="utf-8")
+            if fault == "deadline":
+                backend.clock += 301
+            return ""
+        if command[0] == "kubectl":
+            if "--context" in command:
+                assert command[command.index("--context") + 1] == clusters[95]["name"]
+            path = Path(command[command.index("--kubeconfig") + 1])
+            assert path.stat().st_mode & 0o777 == 0o600
+            if "exec" in command:
+                if fault == "failed-cilium":
+                    raise retirement.workers.ReconcileError("Cilium status read failed")
+                return json.dumps({"cluster-mesh": {"clusters": []}})
+            if "logs" in command:
+                return "bounded container log\n"
+            if "--raw=/readyz" in command:
+                return "ok"
+            if "events" in command and fault == "failed-read":
+                raise retirement.workers.ReconcileError("command timed out after 45s")
+            if "pods" in command:
+                return json.dumps({"items": [pod]})
+            return json.dumps({"items": []})
+        return backend.run(command, timeout)
+
+    def peers(**kwargs):
+        assert kwargs["role"] == "mesh-96"
+        assert kwargs["expected_remote_count"] == 99
+        assert kwargs["expected_remote_names"] == {f"assigned-{index}" for index in range(1, 101) if index != 96}
+        try:
+            kwargs["runner"]([
+                "kubectl", "--kubeconfig", kwargs["kubeconfig"],
+                "-n", "kube-system", "exec", "cilium-test", "-c", "cilium-agent",
+                "--", "cilium-dbg", "status", "-o", "json",
+            ], 45)
+        except retirement.cilium.overlay.ProbeError as error:
+            return {"healthy": False, "agents": [], "fatal_error": str(error)}
+        return {"healthy": True, "agents": [{"node_name": "real-node", "healthy": True}]}
+
+    monkeypatch.setattr(retirement.cilium, "probe", peers)
+    summary = {"success": False, "mutation_started": False, "request_accepted": False}
+    with pytest.raises(retirement.workers.ReconcileError):
+        retirement.execute_retirement(args, summary, diagnostic_read)
+    assert not summary["success"] and not summary["mutation_started"] and not summary["request_accepted"]
+    assert not any("delete-machines" in call or "update" in call or "patch" in call for call in calls)
+    assert all(not path.exists() for path in credentials)
+    if fault == "foreign":
+        assert "fleet_failure_diagnostics" not in summary and not credentials
+        return
+    diagnostics = summary["fleet_failure_diagnostics"]
+    assert diagnostics["read_only"]
+    if fault == "too-many":
+        assert diagnostics["errors"] and not credentials and not diagnostics["roles"]
+        return
+    record = diagnostics["roles"]["mesh-96"]
+    if fault == "denied-credentials":
+        assert len(credentials) == 1
+        assert record["errors"][0]["error"] == "AuthorizationFailed"
+        assert not any(call[0] == "kubectl" for call in calls)
+    elif fault == "deadline":
+        assert not any(call[0] == "kubectl" for call in calls)
+        assert any("deadline" in error["error"] for error in record["errors"])
+    else:
+        assert record["log_pod_uids"] == {pod["metadata"]["name"]: "api-pod-uid"}
+        assert record["cilium"]["healthy"] is (fault != "failed-cilium")
+        if fault == "failed-cilium":
+            assert record["cilium"]["fatal_error"] == "Cilium status read failed"
+        else:
+            assert "cilium-test-status.json" in record["files"]
+        assert "clustermesh-apiserver-test-apiserver-previous.log" in record["files"]
+        if fault == "failed-read":
+            assert any(error["capture"] == "events.json" for error in record["errors"])
+    for path in Path(args.summary_file).parent.rglob("*"):
+        if path.is_file():
+            assert "private-test-credential" not in path.read_text(encoding="utf-8")
+
+
 def test_failed_final_peer_proof_is_preserved_and_fatal(args, backend):
     backend.fail_final_peers = True
     summary = {"success": False, "mutation_started": False, "request_accepted": False}

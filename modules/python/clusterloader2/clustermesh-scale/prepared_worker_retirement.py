@@ -172,6 +172,152 @@ def validate_scope(args, group: dict, clusters: list, members: list) -> tuple:
     return selected, identities
 
 
+def collect_fleet_failure_diagnostics(args, clusters, failure, summary, runner) -> None:
+    """Read only the structurally owned failed members; never authorize retirement."""
+
+    evidence = {"started_at": workers.utc_now(), "read_only": True, "roles": {}, "errors": []}
+    summary["fleet_failure_diagnostics"] = evidence
+    deadline = time.monotonic() + 300
+    by_role = {row["tags"]["role"]: row for row in clusters}
+
+    def save():
+        mocks.write_json_atomic(args.summary_file, summary)
+
+    def bounded_read(command, timeout=45):
+        remaining = int(deadline - time.monotonic())
+        require(remaining > 0, "Read-only Fleet diagnostic deadline expired")
+        return runner(command, min(timeout, remaining))
+
+    if len(failure.members) > 5:
+        evidence["errors"].append("Read-only diagnostics limited to at most five unhealthy members")
+        evidence["finished_at"] = workers.utc_now()
+        save()
+        return
+    with tempfile.TemporaryDirectory(prefix="fleet-diagnostic-credentials-") as temporary:
+        def collect_member(member):
+            role = member["name"]
+            selected = by_role[role]
+            directory = Path(args.summary_file).parent / "fleet-failure" / role
+            directory.mkdir(parents=True, exist_ok=True)
+            record = {"cluster_id": selected["id"], "files": {}, "errors": [], "log_pod_uids": {}}
+            evidence["roles"][role] = record
+            save()
+            print(f"{role}: collecting bounded read-only Fleet failure diagnostics.", flush=True)
+            kubeconfig = str(Path(temporary) / f"{role}.config")
+            try:
+                bounded_read([
+                    "az", "aks", "get-credentials", "--resource-group", args.resource_group,
+                    "--name", selected["name"], "--file", kubeconfig, "--only-show-errors",
+                ])
+                require(Path(kubeconfig).is_file() and Path(kubeconfig).stat().st_size > 0,
+                        f"{role}: diagnostic credentials are unavailable")
+                Path(kubeconfig).chmod(0o600)
+            except (workers.ReconcileError, OSError) as error:
+                record["errors"].append({"capture": "credentials", "error": str(error)})
+                print(f"{role}: diagnostic credential read failed: {error}", flush=True)
+                save()
+                return
+            prefix = [
+                "kubectl", "--kubeconfig", kubeconfig, "--context", selected["name"],
+                "--request-timeout=45s",
+            ]
+
+            def capture(label, command, *, json_output=False):
+                try:
+                    output = bounded_read(prefix + command)
+                    payload = workers.parse_json(output, f"{role}/{label}") if json_output else output
+                    path = directory / label
+                    if json_output:
+                        mocks.write_json_atomic(str(path), payload)
+                    else:
+                        path.write_text(output, encoding="utf-8")
+                    record["files"][label] = str(path.relative_to(Path(args.summary_file).parent))
+                    return payload
+                except (workers.ReconcileError, OSError) as error:
+                    record["errors"].append({"capture": label, "error": str(error)})
+                    print(f"{role}: diagnostic {label} failed: {error}", flush=True)
+                    return None
+                finally:
+                    save()
+
+            capture("readyz.txt", ["get", "--raw=/readyz"])
+            pods = capture("pods.json", ["get", "pods", "-A", "-o", "json"], json_output=True)
+            for label, command in (
+                ("nodes.json", ["get", "nodes", "-o", "json"]),
+                ("system-controllers.json", [
+                    "-n", "kube-system", "get",
+                    "deployments,replicasets,daemonsets,services,endpointslices", "-o", "json",
+                ]),
+                ("events.json", ["get", "events", "-A", "-o", "json"]),
+                ("nnc.json", ["get", "nnc", "-A", "-o", "json"]),
+                ("cilium-config.json", ["-n", "kube-system", "get", "configmap", "cilium-config", "-o", "json"]),
+            ):
+                capture(label, command, json_output=True)
+
+            def cilium_read(command, timeout):
+                try:
+                    output = bounded_read(command, timeout)
+                    if "exec" in command:
+                        pod_name = command[command.index("exec") + 1]
+                        require(bool(re.fullmatch(r"[a-z0-9][a-z0-9.-]*", pod_name)),
+                                "Invalid diagnostic Cilium Pod name")
+                        label = f"{pod_name}-status.json"
+                        path = directory / label
+                        path.write_text(output, encoding="utf-8")
+                        record["files"][label] = str(path.relative_to(Path(args.summary_file).parent))
+                    return output
+                except (workers.ReconcileError, OSError) as error:
+                    raise cilium.overlay.ProbeError(str(error)) from error
+
+            record["cilium"] = cilium.probe(
+                role=role, kubeconfig=kubeconfig, expected_remote_count=99,
+                expected_remote_names={
+                    row["cluster_name"] for row in failure.identities if row["role"] != role
+                },
+                attempts=1, retry_seconds=0, command_timeout_seconds=45, runner=cilium_read,
+            )
+            save()
+            if not isinstance(pods, dict) or not isinstance(pods.get("items"), list):
+                record["errors"].append({"capture": "logs", "error": "Pod inventory is unreadable"})
+                save()
+                return
+            log_pods = [
+                pod for pod in pods["items"]
+                if isinstance(pod, dict)
+                and pod.get("metadata", {}).get("namespace") == "kube-system"
+                and (
+                    (pod["metadata"].get("labels") or {}).get("k8s-app") == "cilium"
+                    or str(pod["metadata"].get("name", "")).startswith(
+                        ("clustermesh-apiserver-", "azure-cns-")
+                    )
+                )
+            ]
+            if len(log_pods) > 20:
+                record["errors"].append({"capture": "logs", "error": "Pod log capture limited to 20 Pods"})
+            for pod in log_pods[:20]:
+                name, uid = pod["metadata"].get("name"), pod["metadata"].get("uid")
+                if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", name) or not uid:
+                    record["errors"].append({"capture": "logs", "error": "Pod name or UID is unreadable"})
+                    continue
+                record["log_pod_uids"][name] = uid
+                statuses = {
+                    row["name"]: row for row in (pod.get("status") or {}).get("containerStatuses", [])
+                }
+                for container in pod.get("spec", {}).get("containers", []):
+                    container_name = container["name"]
+                    command = [
+                        "-n", "kube-system", "logs", name, "-c", container_name,
+                        "--tail=150", "--since=1h", "--timestamps=true", "--limit-bytes=131072",
+                    ]
+                    capture(f"{name}-{container_name}.log", command)
+                    if statuses.get(container_name, {}).get("restartCount", 0) > 0:
+                        capture(f"{name}-{container_name}-previous.log", command + ["--previous"])
+        for member in failure.members:
+            collect_member(member)
+    evidence["finished_at"] = workers.utc_now()
+    save()
+
+
 def pool_configuration(pool: dict) -> dict:
     """Require all configuration except the intentional count reduction to stay fixed."""
 
@@ -360,14 +506,13 @@ def execute_retirement(args, summary: dict, runner=workers.run_command) -> None:
     except FleetNotConnected as error:
         summary["initial_unhealthy_fleet_roles"] = [row["name"] for row in error.members]
         save()
-        require(
-            all(
-                isinstance(row["meshProperties"]["status"].get("error"), dict)
-                and row["meshProperties"]["status"]["error"].get("code") == "PartialConnectivity"
-                for row in error.members
-            ),
-            str(error),
-        )
+        if not all(
+            isinstance(row["meshProperties"]["status"].get("error"), dict)
+            and row["meshProperties"]["status"]["error"].get("code") == "PartialConnectivity"
+            for row in error.members
+        ):
+            collect_fleet_failure_diagnostics(args, clusters, error, summary, run)
+            raise
         expected_identities = {row["role"]: (row["cluster_name"], row["cluster_id"]) for row in error.identities}
         observation_args = argparse.Namespace(
             resource_group=args.resource_group, fleet_name="clustermesh-flt",

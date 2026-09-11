@@ -124,6 +124,13 @@ unhealthy members. Structurally valid `PartialConnectivity` is observed read-onl
 through the existing bounded Fleet observer, but every member must actually
 return to Connected with unchanged authoritative identities before retirement.
 Other health errors, foreign identities and exhausted observations remain fatal.
+For other health errors with fully validated ownership, the helper first collects
+read-only diagnostics for at most five unhealthy members, bounded to five minutes:
+API readiness, Nodes/Pods, system controllers/endpoints, UID-associated events,
+NNC state, exact all-agent Cilium peer status, and bounded API-server/Cilium/CNS
+container logs. Credentials remain in a private temporary directory outside the
+published artifact and are deleted on exit. Diagnostic failures are recorded;
+even healthy Cilium results do not waive the Fleet Connected gate or allow writes.
 Transient read timeouts have bounded retries; deletion requests and authorization
 failures are never retried automatically.
 
