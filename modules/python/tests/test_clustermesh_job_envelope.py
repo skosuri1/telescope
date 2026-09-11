@@ -1,4 +1,4 @@
-"""Tests for ClusterMesh job timeout and agent-capacity preflights."""
+"""Tests for ClusterMesh job cancellation, timeout and agent-capacity preflights."""
 
 import os
 import subprocess
@@ -19,6 +19,7 @@ EXECUTE_TEMPLATE_PATH = (
     / "execute.yml"
 )
 PROVISION_TEMPLATE_PATH = REPOSITORY_ROOT / "steps" / "provision-resources.yml"
+CLEANUP_TEMPLATE_PATH = REPOSITORY_ROOT / "steps" / "cleanup-resources.yml"
 TERRAFORM_RUN_COMMAND_PATH = (
     REPOSITORY_ROOT / "steps" / "terraform" / "run-command.yml"
 )
@@ -64,14 +65,39 @@ def test_job_template_exposes_timeout_and_cancellation_envelopes():
     )
 
 
-def test_only_terraform_destroy_can_start_during_cancellation():
+def test_job_condition_honors_cancellation_with_existing_admission_rules():
+    document = yaml.safe_load(COMPETITIVE_JOB_PATH.read_text(encoding="utf-8"))
+    condition = "".join(document["jobs"][0]["condition"].split())
+
+    assert condition == (
+        "and(not(canceled()),"
+        "or(eq(variables['CLUSTERMESH_REUSE_SMOKE_MODE'],''),"
+        "${{eq(parameters.mock_preservation_proof,true)}}),"
+        "or(eq(variables['Build.Reason'],'Manual'),"
+        "and(eq(variables['Build.Reason'],'Schedule'),"
+        "eq(variables['Build.SourceBranchName'],'main'))))"
+    )
+
+
+def test_cancellation_uses_direct_cleanup_instead_of_more_terraform():
     template = TERRAFORM_RUN_COMMAND_PATH.read_text(encoding="utf-8")
 
     assert (
-        "or(succeeded(), eq('${{ parameters.command }}', 'destroy'))"
+        "or(succeeded(), and(eq('${{ parameters.command }}', 'destroy'), not(canceled())))"
         in template
     )
     assert "ne(variables['SKIP_RESOURCE_MANAGEMENT'], 'true')" in template
+    cleanup = yaml.safe_load(CLEANUP_TEMPLATE_PATH.read_text(encoding="utf-8"))
+    cancellation = next(
+        step for step in cleanup["steps"]
+        if step.get("displayName") == "Begin Resource Group Deletion on Cancellation"
+    )
+    assert cancellation["condition"] == (
+        "and(canceled(), ${{ eq(parameters.cloud, 'azure') }}, "
+        "ne(variables['SKIP_RESOURCE_MANAGEMENT'], 'true'))"
+    )
+    assert "timeout 120s az group delete" in cancellation["script"]
+    assert "--no-wait" in cancellation["script"]
 
 
 def test_publish_path_skips_cancellation_before_cleanup():
