@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Clear stale AKS ARM failure states after healthy Fleet mesh formation."""
 
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import argparse
@@ -37,6 +39,7 @@ class Cluster:
     node_resource_group: str
     state: str
     power_state: str
+    failed_pools: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -64,6 +67,13 @@ TRANSIENT_READ_RE = re.compile(
 )
 ROLE_RE = re.compile(r"^mesh-(?P<number>[1-9][0-9]*)$")
 BUSY_POOL_STATES = {"Updating", "Scaling", "Upgrading", "DeletingMachines"}
+MAX_FAILED_POOL_REPAIRS = 5
+POOL_CONFIG_FIELDS = (
+    "count", "vmSize", "mode", "osType", "osSKU", "osDiskType", "osDiskSizeGb",
+    "maxPods", "vnetSubnetId", "podSubnetId", "availabilityZones",
+    "enableAutoScaling", "minCount", "maxCount", "nodeLabels", "nodeTaints",
+    "orchestratorVersion", "kubeletConfig", "linuxOSConfig",
+)
 
 
 def utc_now() -> str:
@@ -191,6 +201,7 @@ def validate_cluster_inventory(
     expected_count: int,
     region: str,
     max_repair_clusters: int,
+    allow_failed_pool_repair: bool = False,
 ) -> Tuple[List[Cluster], List[Cluster]]:
     """Validate exact cluster identity and return all/failed clusters."""
 
@@ -257,7 +268,9 @@ def validate_cluster_inventory(
             )
         unsafe_pools = [
             pool for pool in pools
-            if not _pool_is_quiescent(pool, allow_failed=state == "Failed")
+            if not _pool_is_quiescent(
+                pool, allow_failed=state == "Failed" or allow_failed_pool_repair
+            )
         ]
         if unsafe_pools:
             details = []
@@ -287,6 +300,13 @@ def validate_cluster_inventory(
                 f"{role}: one or more node pools are not safely quiescent: "
                 + json.dumps(details, sort_keys=True)
             )
+        failed_pools = tuple(
+            str(pool.get("name") or "")
+            for pool in pools
+            if allow_failed_pool_repair and pool.get("provisioningState") == "Failed"
+        )
+        if any(name not in ("default", "prompool", "churnpool") for name in failed_pools):
+            raise ReconcileError(f"{role}: refusing repair of an unknown failed pool")
         seen_names.add(name)
         role_numbers.append(number)
         clusters.append(
@@ -298,6 +318,7 @@ def validate_cluster_inventory(
                 node_resource_group=node_resource_group,
                 state=state,
                 power_state=power_state,
+                failed_pools=failed_pools,
             )
         )
 
@@ -310,6 +331,10 @@ def validate_cluster_inventory(
         raise ReconcileError(
             f"refusing AKS ARM repair on {len(failed)} clusters; maximum is "
             f"{max_repair_clusters}"
+        )
+    if sum(len(cluster.failed_pools) for cluster in clusters) > MAX_FAILED_POOL_REPAIRS:
+        raise ReconcileError(
+            f"refusing failed-pool repair above maximum {MAX_FAILED_POOL_REPAIRS}"
         )
     return clusters, failed
 
@@ -377,7 +402,8 @@ def validate_cluster_data_plane(
     expected_remote_count: int,
     runner: Runner,
     query_timeout_seconds: int,
-) -> None:
+    identity_inventory: Optional[str] = None,
+) -> Optional[dict]:
     """Require a reachable control plane and healthy live ClusterMesh."""
 
     runner(
@@ -439,6 +465,34 @@ def validate_cluster_data_plane(
             f"{cluster.role}: clustermesh-apiserver is not Available"
         )
 
+    if identity_inventory is not None:
+        summary_path = f"{kubeconfig}.cilium-health.json"
+        if os.path.exists(summary_path):
+            os.remove(summary_path)
+        runner(
+            [
+                sys.executable,
+                os.path.join(os.path.dirname(__file__), "cilium_agent_health.py"),
+                "--role", cluster.role,
+                "--kubeconfig", kubeconfig,
+                "--expected-remote-count", str(expected_remote_count),
+                "--identity-inventory", identity_inventory,
+                "--attempts", "3",
+                "--retry-seconds", "5",
+                "--command-timeout-seconds", "20",
+                "--summary-file", summary_path,
+            ],
+            max(query_timeout_seconds, 300),
+        )
+        try:
+            with open(summary_path, encoding="utf-8") as handle:
+                summary = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ReconcileError(f"{cluster.role}: Cilium proof is unavailable: {error}") from error
+        if not isinstance(summary, dict) or summary.get("healthy") is not True:
+            raise ReconcileError(f"{cluster.role}: all-agent Cilium identity/peer proof failed")
+        return summary
+
     status = parse_json(
         runner(
             [
@@ -487,6 +541,228 @@ def validate_cluster_data_plane(
             f"{cluster.role}: unhealthy Cilium remotes: "
             + " ".join(sorted(unhealthy))
         )
+    return None
+
+
+def write_pool_repair_identities(path: str, members: object, clusters: List[Cluster]) -> None:
+    """Use authoritative Fleet assignments, never inferred role-number identities."""
+
+    identities = []
+    for member in members:
+        identity = member.get("meshProperties", {}).get("ciliumProperties", {})
+        name = identity.get("name")
+        cluster_id = identity.get("id")
+        if (
+            not isinstance(name, str) or not name
+            or not isinstance(cluster_id, int) or isinstance(cluster_id, bool)
+            or cluster_id <= 0
+        ):
+            raise ReconcileError(f"{member.get('name')}: missing Fleet Cilium identity")
+        identities.append({
+            "role": member["name"], "cluster_name": name, "cluster_id": cluster_id,
+        })
+    if (
+        len(identities) != len(clusters)
+        or {item["role"] for item in identities} != {cluster.role for cluster in clusters}
+        or len({item["cluster_name"] for item in identities}) != len(clusters)
+        or len({item["cluster_id"] for item in identities}) != len(clusters)
+    ):
+        raise ReconcileError("Failed-pool repair requires an exact, unique Fleet identity inventory")
+    write_json_atomic(path, identities)
+
+
+def pool_configuration(pool: dict) -> dict:
+    """Configuration fields a no-option pool update must preserve."""
+
+    return {name: pool.get(name) for name in POOL_CONFIG_FIELDS}
+
+
+def read_pool(cluster: Cluster, pool_name: str, runner: Runner, timeout: int) -> dict:
+    payload = parse_json(
+        runner(
+            [
+                "az", "aks", "nodepool", "show",
+                "--resource-group", cluster.resource_group,
+                "--cluster-name", cluster.name, "--name", pool_name,
+                "--output", "json", "--only-show-errors",
+            ],
+            timeout,
+        ),
+        f"{cluster.role}/{pool_name}",
+    )
+    if not isinstance(payload, dict):
+        raise ReconcileError(f"{cluster.role}/{pool_name}: pool response is not an object")
+    expected_id = f"{cluster.resource_id}/agentPools/{pool_name}".lower()
+    if str(payload.get("id") or "").lower() != expected_id or payload.get("name") != pool_name:
+        raise ReconcileError(f"{cluster.role}/{pool_name}: pool resource identity mismatch")
+    count = payload.get("count")
+    if (
+        not isinstance(count, int) or isinstance(count, bool) or count <= 0
+        or payload.get("enableAutoScaling") is True
+    ):
+        raise ReconcileError(f"{cluster.role}/{pool_name}: pool count/autoscaling is not fixed")
+    power = payload.get("powerState")
+    if not isinstance(power, dict) or power.get("code") != "Running":
+        raise ReconcileError(f"{cluster.role}/{pool_name}: pool is not powered Running")
+    return payload
+
+
+def validate_pool_workers(
+    cluster: Cluster, pool: dict, kubeconfig: str, runner: Runner, timeout: int,
+) -> List[str]:
+    """Require exact Ready workers and a stable backing VMSS before any pool PUT."""
+
+    payload = parse_json(
+        runner(
+            ["kubectl", "--kubeconfig", kubeconfig, f"--request-timeout={timeout}s",
+             "get", "nodes", "-o", "json"],
+            timeout,
+        ),
+        f"{cluster.role} worker inventory",
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise ReconcileError(f"{cluster.role}: invalid worker inventory")
+    nodes = [
+        node for node in payload["items"]
+        if (node.get("metadata", {}).get("labels", {}).get("kubernetes.azure.com/agentpool")
+            or node.get("metadata", {}).get("labels", {}).get("agentpool")) == pool["name"]
+        and node.get("metadata", {}).get("labels", {}).get("type") != "kwok"
+    ]
+    if len(nodes) != pool["count"]:
+        raise ReconcileError(f"{cluster.role}/{pool['name']}: real worker count differs from desired")
+    vmss_names = set()
+    for node in nodes:
+        metadata = node.get("metadata", {})
+        spec = node.get("spec", {})
+        if (
+            metadata.get("deletionTimestamp")
+            or spec.get("unschedulable")
+            or not any(
+                condition.get("type") == "Ready" and condition.get("status") == "True"
+                for condition in node.get("status", {}).get("conditions", [])
+            )
+        ):
+            raise ReconcileError(f"{cluster.role}/{pool['name']}: worker is not safely Ready")
+        match = re.fullmatch(
+            r"azure:///subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/"
+            r"Microsoft.Compute/virtualMachineScaleSets/([^/]+)/virtualMachines/([^/]+)",
+            str(spec.get("providerID") or ""), re.IGNORECASE,
+        )
+        if (
+            match is None
+            or match.group(2).lower() != cluster.node_resource_group.lower()
+            or not cluster.resource_id.lower().startswith(f"/subscriptions/{match.group(1).lower()}/")
+        ):
+            raise ReconcileError(f"{cluster.role}/{pool['name']}: worker VMSS identity mismatch")
+        vmss_names.add(match.group(3))
+    if len(vmss_names) != 1:
+        raise ReconcileError(f"{cluster.role}/{pool['name']}: ambiguous backing VMSS")
+    vmss = parse_json(
+        runner(
+            ["az", "vmss", "show", "--resource-group", cluster.node_resource_group,
+             "--name", next(iter(vmss_names)), "--output", "json", "--only-show-errors"],
+            timeout,
+        ),
+        f"{cluster.role}/{pool['name']} backing VMSS",
+    )
+    if (
+        not isinstance(vmss, dict)
+        or vmss.get("provisioningState") != "Succeeded"
+        or vmss.get("sku", {}).get("capacity") != pool["count"]
+    ):
+        raise ReconcileError(f"{cluster.role}/{pool['name']}: backing VMSS is not quiescent at desired capacity")
+    return [node["metadata"]["name"] for node in nodes]
+
+
+def require_pool_cilium_coverage(cluster: Cluster, pool_name: str, workers: List[str], health: dict) -> None:
+    covered = {
+        agent.get("node_name")
+        for agent in health.get("agents", [])
+        if isinstance(agent, dict) and agent.get("healthy") is True
+    }
+    if not set(workers).issubset(covered):
+        raise ReconcileError(f"{cluster.role}/{pool_name}: Cilium proof does not cover every pool worker")
+
+
+def reconcile_failed_pool(
+    cluster: Cluster, pool_name: str, kubeconfig: str, identity_inventory: str,
+    expected_remote_count: int, runner: Runner, args: argparse.Namespace, evidence: dict,
+) -> None:
+    """Reassert only an unchanged, terminal-Failed pool after live health proof."""
+
+    evidence.update({"role": cluster.role, "pool": pool_name, "status": "validating"})
+    pool = read_pool(cluster, pool_name, runner, args.query_timeout_seconds)
+    evidence["configuration_before"] = pool_configuration(pool)
+    if pool.get("provisioningState") == "Succeeded":
+        evidence["status"] = "already-succeeded"
+        return
+    if pool.get("provisioningState") != "Failed":
+        raise ReconcileError(f"{cluster.role}/{pool_name}: pool is no longer terminal Failed")
+    evidence["health_before"] = validate_cluster_data_plane(
+        cluster, kubeconfig, expected_remote_count, runner, args.query_timeout_seconds,
+        identity_inventory=identity_inventory,
+    )
+    evidence["workers_before"] = validate_pool_workers(
+        cluster, pool, kubeconfig, runner, args.query_timeout_seconds,
+    )
+    require_pool_cilium_coverage(
+        cluster, pool_name, evidence["workers_before"], evidence["health_before"],
+    )
+    latest = read_pool(cluster, pool_name, runner, args.query_timeout_seconds)
+    if pool_configuration(latest) != pool_configuration(pool):
+        raise ReconcileError(f"{cluster.role}/{pool_name}: configuration changed during health proof")
+    if latest.get("provisioningState") == "Succeeded":
+        evidence["status"] = "already-succeeded"
+        return
+    if latest.get("provisioningState") != "Failed":
+        raise ReconcileError(f"{cluster.role}/{pool_name}: another operation started during health proof")
+    evidence["status"] = "reconciling"
+    print(f"{cluster.role}/{pool_name}: healthy workers/mesh; reasserting unchanged pool configuration", flush=True)
+    runner(
+        ["az", "aks", "nodepool", "update",
+         "--resource-group", cluster.resource_group, "--cluster-name", cluster.name,
+         "--name", pool_name, "--no-wait", "--output", "none", "--only-show-errors"],
+        min(args.mutation_timeout_seconds, 180),
+    )
+    submitted_at = time.monotonic()
+    deadline = submitted_at + args.recovery_timeout_seconds
+    saw_processing = False
+    evidence["observed_states"] = []
+    while time.monotonic() < deadline:
+        remaining = math.ceil(deadline - time.monotonic())
+        current = read_pool(cluster, pool_name, runner, min(args.query_timeout_seconds, remaining))
+        state = current.get("provisioningState")
+        evidence["observed_states"].append(state)
+        evidence["configuration_after"] = pool_configuration(current)
+        if pool_configuration(current) != pool_configuration(pool):
+            raise ReconcileError(f"{cluster.role}/{pool_name}: no-option update changed pool configuration")
+        if state == "Succeeded":
+            if time.monotonic() >= deadline:
+                raise ReconcileError(f"{cluster.role}/{pool_name}: completion was observed after deadline")
+            evidence["workers_after"] = validate_pool_workers(
+                cluster, current, kubeconfig, runner, args.query_timeout_seconds,
+            )
+            evidence["health_after"] = validate_cluster_data_plane(
+                cluster, kubeconfig, expected_remote_count, runner, args.query_timeout_seconds,
+                identity_inventory=identity_inventory,
+            )
+            require_pool_cilium_coverage(
+                cluster, pool_name, evidence["workers_after"], evidence["health_after"],
+            )
+            evidence["status"] = "repaired"
+            return
+        if state in BUSY_POOL_STATES:
+            saw_processing = True
+        elif (
+            state == "Failed" and not saw_processing
+            and time.monotonic() - submitted_at < 60
+        ):
+            # An accepted asynchronous PUT can briefly retain its old Failed state.
+            pass
+        else:
+            raise ReconcileError(f"{cluster.role}/{pool_name}: update ended in {state}")
+        time.sleep(min(args.poll_seconds, max(0, deadline - time.monotonic())))
+    raise ReconcileError(f"{cluster.role}/{pool_name}: pool reconciliation deadline exhausted")
 
 
 def reconcile_cluster(
@@ -640,6 +916,9 @@ def read_quiescent_inventory(
                     payload, expected_count=args.expected_count,
                     region=args.expected_region,
                     max_repair_clusters=args.max_repair_clusters,
+                    allow_failed_pool_repair=(
+                        phase == "initial" and args.failed_pool_repair_enabled
+                    ),
                 )
             except InventoryBusyError as error:
                 observations.append({"observed_at": utc_now(), "reason": str(error)})
@@ -676,6 +955,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--inventory-attempts", type=int, default=3)
     parser.add_argument("--inventory-retry-seconds", type=int, default=15)
     parser.add_argument("--quiescence-timeout-seconds", type=int, default=900)
+    parser.add_argument("--failed-pool-repair-enabled", action="store_true")
     parser.add_argument("--mutation-timeout-seconds", type=int, default=1800)
     parser.add_argument("--recovery-timeout-seconds", type=int, default=1800)
     parser.add_argument("--poll-seconds", type=int, default=30)
@@ -749,6 +1029,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args, summary, "initial", run_command,
         )
         summary["initial_failed_roles"] = [cluster.role for cluster in failed]
+        summary["initial_failed_pools"] = [
+            {"role": cluster.role, "pool": pool}
+            for cluster in clusters for pool in cluster.failed_pools
+        ]
 
         fleet_members = parse_json(
             run_read_with_retries(
@@ -852,6 +1136,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"{result.role}={result.error}" for result in failures
                 )
             )
+
+        summary["pool_repairs"] = []
+        if any(cluster.failed_pools for cluster in clusters):
+            identity_members = parse_json(
+                run_read_with_retries(
+                    ["az", "fleet", "member", "list",
+                     "--resource-group", args.resource_group,
+                     "--fleet-name", args.fleet_name,
+                     "--output", "json", "--only-show-errors"],
+                    run_command, timeout_seconds=args.inventory_timeout_seconds,
+                    attempts=args.inventory_attempts,
+                    retry_seconds=args.inventory_retry_seconds,
+                ),
+                "Fleet identity assignments",
+            )
+            validate_fleet_members(identity_members, clusters)
+            with tempfile.TemporaryDirectory(prefix="aks-pool-reconcile-") as temp_dir:
+                identities = os.path.join(temp_dir, "cilium-identities.json")
+                write_pool_repair_identities(identities, identity_members, clusters)
+                for cluster in clusters:
+                    for pool_name in cluster.failed_pools:
+                        evidence = {}
+                        summary["pool_repairs"].append(evidence)
+                        try:
+                            reconcile_failed_pool(
+                                cluster, pool_name,
+                                os.path.join(temp_dir, f"{cluster.role}.config"),
+                                identities, args.expected_count - 1,
+                                run_command, args, evidence,
+                            )
+                        finally:
+                            write_json_atomic(args.summary_file, summary)
 
         final_clusters, final_failed = read_quiescent_inventory(
             args, summary, "final", run_command,

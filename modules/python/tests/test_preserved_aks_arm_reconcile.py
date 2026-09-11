@@ -1,6 +1,7 @@
 """Tests for bounded preserved AKS ARM state reconciliation."""
 
 import importlib.util
+import copy
 import sys
 from pathlib import Path
 
@@ -151,6 +152,247 @@ def test_failed_cluster_allows_quiescent_failed_pool_state():
             region="eastus2euap",
             max_repair_clusters=1,
         )
+
+
+def test_failed_pool_repair_is_opt_in_and_capped():
+    rows = [cluster_row(1), cluster_row(2, pool_state="Failed")]
+    clusters, failed = arm.validate_cluster_inventory(
+        rows, expected_count=2, region="eastus2euap", max_repair_clusters=1,
+        allow_failed_pool_repair=True,
+    )
+    assert failed == []
+    assert clusters[1].failed_pools == ("default",)
+    with pytest.raises(arm.ReconcileError, match="maximum 5"):
+        arm.validate_cluster_inventory(
+            [cluster_row(number, pool_state="Failed") for number in range(1, 7)],
+            expected_count=6, region="eastus2euap", max_repair_clusters=10,
+            allow_failed_pool_repair=True,
+        )
+    rows[1]["agentPoolProfiles"][0]["name"] = "unowned"
+    with pytest.raises(arm.ReconcileError, match="unknown failed pool"):
+        arm.validate_cluster_inventory(
+            rows, expected_count=2, region="eastus2euap", max_repair_clusters=1,
+            allow_failed_pool_repair=True,
+        )
+
+
+def pool_cluster():
+    return arm.Cluster(
+        name="clustermesh-2", role="mesh-2", resource_group="12345-deadbeef",
+        resource_id="/subscriptions/s/resourceGroups/12345-deadbeef/providers/Microsoft.ContainerService/managedClusters/clustermesh-2",
+        node_resource_group="MC_12345-deadbeef_clustermesh-2_eastus2euap",
+        state="Succeeded", power_state="Running", failed_pools=("prompool",),
+    )
+
+
+def pool_payload(state="Failed"):
+    cluster = pool_cluster()
+    return {
+        "id": f"{cluster.resource_id}/agentPools/prompool",
+        "name": "prompool", "provisioningState": state,
+        "powerState": {"code": "Running"}, "count": 1,
+        "enableAutoScaling": False, "vmSize": "Standard_D8_v3",
+        "vnetSubnetId": "/node-subnet", "podSubnetId": "/pod-subnet",
+    }
+
+
+def pool_node(ready="True"):
+    cluster = pool_cluster()
+    return {
+        "metadata": {
+            "name": "node-a",
+            "labels": {"kubernetes.azure.com/agentpool": "prompool"},
+        },
+        "spec": {
+            "providerID": f"azure:///subscriptions/s/resourceGroups/{cluster.node_resource_group}/providers/Microsoft.Compute/virtualMachineScaleSets/pool-vmss/virtualMachines/0",
+        },
+        "status": {"conditions": [{"type": "Ready", "status": ready}]},
+    }
+
+
+def test_failed_pool_requires_exact_ready_workers_and_stable_vmss():
+    calls = []
+
+    def runner(command, _timeout):
+        calls.append(command)
+        if command[0] == "kubectl":
+            return arm.json.dumps({"items": [pool_node()]})
+        return arm.json.dumps({"provisioningState": "Succeeded", "sku": {"capacity": 1}})
+
+    assert arm.validate_pool_workers(pool_cluster(), pool_payload(), "/fake", runner, 5) == ["node-a"]
+    assert all(command[0] == "kubectl" or command[:3] == ["az", "vmss", "show"] for command in calls)
+
+
+@pytest.mark.parametrize("fault", ["not-ready", "missing", "cordoned", "wrong-identity", "vmss-failed", "wrong-capacity"])
+def test_failed_pool_unhealthy_workers_prevent_mutation(fault):
+    node = pool_node()
+    nodes = [node]
+    vmss = {"provisioningState": "Succeeded", "sku": {"capacity": 1}}
+    if fault == "not-ready":
+        node["status"]["conditions"][0]["status"] = "False"
+    elif fault == "missing":
+        nodes = []
+    elif fault == "cordoned":
+        node["spec"]["unschedulable"] = True
+    elif fault == "wrong-identity":
+        node["spec"]["providerID"] = node["spec"]["providerID"].replace("/subscriptions/s/", "/subscriptions/other/")
+    elif fault == "vmss-failed":
+        vmss["provisioningState"] = "Failed"
+    else:
+        vmss["sku"]["capacity"] = 2
+
+    def runner(command, _timeout):
+        assert "update" not in command
+        return arm.json.dumps({"items": nodes} if command[0] == "kubectl" else vmss)
+
+    with pytest.raises(arm.ReconcileError):
+        arm.validate_pool_workers(pool_cluster(), pool_payload(), "/fake", runner, 5)
+
+
+def test_pool_reconcile_preserves_configuration_and_health_order(tmp_path, monkeypatch):
+    fake_clock(monkeypatch)
+    order = []
+    pool_reads = iter(["Failed", "Failed", "Updating", "Succeeded"])
+
+    def health(*_args, **kwargs):
+        assert kwargs["identity_inventory"] == "/identities.json"
+        order.append("health")
+        return {"healthy": True, "agents": [{"node_name": "node-a", "healthy": True}]}
+
+    def workers(*_args):
+        order.append("workers")
+        return ["node-a"]
+
+    def runner(command, _timeout):
+        if command[:4] == ["az", "aks", "nodepool", "show"]:
+            order.append("read")
+            return arm.json.dumps(pool_payload(next(pool_reads)))
+        assert command[:4] == ["az", "aks", "nodepool", "update"]
+        assert all(option not in command for option in ("--node-count", "--node-vm-size", "--kubernetes-version", "--node-image-only"))
+        order.append("update")
+        return ""
+
+    monkeypatch.setattr(arm, "validate_cluster_data_plane", health)
+    monkeypatch.setattr(arm, "validate_pool_workers", workers)
+    evidence = {}
+    arm.reconcile_failed_pool(
+        pool_cluster(), "prompool", "/fake", "/identities.json", 1,
+        runner, quiescence_args(tmp_path), evidence,
+    )
+    assert evidence["status"] == "repaired"
+    assert evidence["configuration_before"] == evidence["configuration_after"]
+    assert order == ["read", "health", "workers", "read", "update", "read", "read", "workers", "health"]
+
+
+def test_pool_reconcile_aborts_before_update_if_live_health_fails(tmp_path, monkeypatch):
+    calls = []
+
+    def runner(command, _timeout):
+        calls.append(command)
+        assert "update" not in command
+        return arm.json.dumps(pool_payload())
+
+    def unhealthy(*_args, **_kwargs):
+        raise arm.ReconcileError("Cilium unhealthy")
+
+    monkeypatch.setattr(arm, "validate_cluster_data_plane", unhealthy)
+    with pytest.raises(arm.ReconcileError, match="Cilium unhealthy"):
+        arm.reconcile_failed_pool(
+            pool_cluster(), "prompool", "/fake", "/identities.json", 1,
+            runner, quiescence_args(tmp_path), {},
+        )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("fault", ["configuration-change", "failed-update"])
+def test_pool_reconcile_never_accepts_config_drift_or_failed_update(
+    tmp_path, monkeypatch, fault,
+):
+    fake_clock(monkeypatch)
+    monkeypatch.setattr(
+        arm, "validate_cluster_data_plane",
+        lambda *_a, **_k: {"healthy": True, "agents": [{"node_name": "node-a", "healthy": True}]},
+    )
+    monkeypatch.setattr(arm, "validate_pool_workers", lambda *_a: ["node-a"])
+    reads = 0
+
+    def runner(command, _timeout):
+        nonlocal reads
+        if "update" in command:
+            return ""
+        reads += 1
+        payload = copy.deepcopy(pool_payload())
+        if reads == 3:
+            payload["provisioningState"] = "Updating"
+        elif reads >= 4:
+            payload["provisioningState"] = "Succeeded" if fault == "configuration-change" else "Failed"
+            if fault == "configuration-change":
+                payload["count"] = 2
+        return arm.json.dumps(payload)
+
+    with pytest.raises(arm.ReconcileError, match="changed pool configuration|update ended in Failed"):
+        arm.reconcile_failed_pool(
+            pool_cluster(), "prompool", "/fake", "/identities.json", 1,
+            runner, quiescence_args(tmp_path), {},
+        )
+
+
+def test_final_inventory_never_accepts_remaining_failed_pool(tmp_path, monkeypatch):
+    fake_clock(monkeypatch)
+    args = quiescence_args(tmp_path)
+    args.failed_pool_repair_enabled = True
+    with pytest.raises(arm.ReconcileError, match="not safely quiescent"):
+        arm.read_quiescent_inventory(
+            args, {}, "final",
+            lambda *_args: arm.json.dumps([cluster_row(1), cluster_row(2, pool_state="Failed")]),
+        )
+
+
+def test_failed_pool_requires_cilium_coverage_of_its_own_worker():
+    with pytest.raises(arm.ReconcileError, match="every pool worker"):
+        arm.require_pool_cilium_coverage(
+            pool_cluster(), "prompool", ["node-a"],
+            {"healthy": True, "agents": [{"node_name": "another-node", "healthy": True}]},
+        )
+
+
+@pytest.mark.parametrize("fault", ["wrong-id", "wrong-name", "stopped", "autoscaling", "zero-count"])
+def test_pool_read_refuses_unsafe_identity_power_or_count(fault):
+    payload = pool_payload()
+    if fault == "wrong-id":
+        payload["id"] = payload["id"].replace("clustermesh-2", "clustermesh-3")
+    elif fault == "wrong-name":
+        payload["name"] = "default"
+    elif fault == "stopped":
+        payload["powerState"]["code"] = "Stopped"
+    elif fault == "autoscaling":
+        payload["enableAutoScaling"] = True
+    else:
+        payload["count"] = 0
+    with pytest.raises(arm.ReconcileError):
+        arm.read_pool(
+            pool_cluster(), "prompool",
+            lambda *_args: arm.json.dumps(payload), 5,
+        )
+
+
+def test_pool_identity_inventory_uses_exact_fleet_assignments(tmp_path):
+    clusters, _ = arm.validate_cluster_inventory(
+        [cluster_row(1), cluster_row(2)],
+        expected_count=2, region="eastus2euap", max_repair_clusters=1,
+    )
+    members = [
+        {"name": "mesh-1", "meshProperties": {"ciliumProperties": {"name": "mesh-17", "id": 7}}},
+        {"name": "mesh-2", "meshProperties": {"ciliumProperties": {"name": "mesh-29", "id": 9}}},
+    ]
+    path = tmp_path / "identities.json"
+    arm.write_pool_repair_identities(str(path), members, clusters)
+    assert arm.json.loads(path.read_text(encoding="utf-8")) == [
+        {"role": "mesh-1", "cluster_name": "mesh-17", "cluster_id": 7},
+        {"role": "mesh-2", "cluster_name": "mesh-29", "cluster_id": 9},
+    ]
+    with pytest.raises(arm.ReconcileError, match="exact, unique"):
+        arm.write_pool_repair_identities(str(path), members + [members[0]], clusters)
 
 
 def test_inventory_rejects_active_operations_and_excess_failures():
@@ -317,6 +559,8 @@ def test_job_publishes_diagnostics_without_masking_reconcile_failure():
     script = template[start:end]
 
     assert 'reconcile_rc=0' in script
+    assert "CLUSTERMESH_DEBUG_FAILED_POOL_REPAIR_ENABLED" in script
+    assert "pool_repair_args=(--failed-pool-repair-enabled)" in script
     assert '--summary-file "$summary_dir/aks-arm-reconcile.json" || reconcile_rc=$?' in script
     assert 'if [ -s "$summary_dir/aks-arm-reconcile.json" ]; then' in script
     assert script.index("task.uploadfile") < script.index('exit "$reconcile_rc"')

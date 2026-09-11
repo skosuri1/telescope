@@ -214,6 +214,10 @@ jobs:
         "$(Pipeline.Workspace)/s/${{ parameters.tfvars_path }}" \
         | awk '{print $1}')
       reconcile_rc=0
+      pool_repair_args=()
+      if [ "${CLUSTERMESH_DEBUG_FAILED_POOL_REPAIR_ENABLED:-true}" = "true" ]; then
+        pool_repair_args=(--failed-pool-repair-enabled)
+      fi
       python3 "$PRESERVED_AKS_ARM_RECONCILER" \
         --resource-group "$RUN_ID" \
         --expected-subscription "${{ parameters.expected_subscription_id }}" \
@@ -223,6 +227,7 @@ jobs:
         --max-repair-clusters "${CLUSTERMESH_DEBUG_MAX_AKS_ARM_REPAIR_CLUSTERS:-10}" \
         --max-concurrent "${CLUSTERMESH_DEBUG_AKS_ARM_REPAIR_CONCURRENCY:-2}" \
         --quiescence-timeout-seconds "${CLUSTERMESH_DEBUG_POOL_QUIESCENCE_TIMEOUT_SECONDS:-900}" \
+        "${pool_repair_args[@]}" \
         --summary-file "$summary_dir/aks-arm-reconcile.json" || reconcile_rc=$?
       if [ -s "$summary_dir/aks-arm-reconcile.json" ]; then
         echo "##vso[task.uploadfile]$summary_dir/aks-arm-reconcile.json"
