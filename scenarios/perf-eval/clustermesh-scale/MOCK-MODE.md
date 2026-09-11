@@ -286,6 +286,16 @@ retirement still follow. The pipeline uses a bounded 60-minute helper budget for
 this explicit path, retaining the existing per-phase and cleanup limits. A
 failed or ambiguous request is recorded rather than retried automatically.
 
+New replacement NNC objects may briefly exist before their status is published.
+Only the explicitly new, Node-UID-pinned object's absent/empty network-container
+status is observed within the replacement deadline; malformed retained objects
+or incorrect owners still fail immediately. A failed
+`restoring-owned-replacement-capacity` checkpoint with both exact deletion and
+restoration already accepted can be adopted read-only after the new worker and
+network container are fully initialized. That continuation validates the old
+identities are gone, derives the new pinned manifest, and repeats **neither**
+deletion nor scaling. Plan-only adoption never adds a quarantine or changes Pods.
+
 The maintenance-only job obtains private, job-local credentials, runs the
 read-only plan, then invokes the same helper with `--execute` and fresh proof.
 Credentials are removed on exit and are never included in the

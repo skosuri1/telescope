@@ -1572,6 +1572,81 @@ def test_empty_replacement_still_requires_functional_new_ips(args, monkeypatch):
     assert backend.nodes[replacement_name]["spec"]["unschedulable"] is True
 
 
+def test_empty_replacement_waits_for_only_new_nnc_status(args, monkeypatch):
+    backend, _, _, runner, operations, replacement_name = prepare_empty_replacement(args, monkeypatch)
+    original_nnc = backend.build_nnc
+    pending = {"reads": 3}
+
+    def initializing():
+        payload = original_nnc()
+        if operations["restored"] and pending["reads"]:
+            pending["reads"] -= 1
+            for row in payload["items"]:
+                if row["metadata"]["name"] == replacement_name:
+                    row["status"]["networkContainers"] = []
+        return payload
+
+    monkeypatch.setattr(backend, "build_nnc", initializing)
+    summary = {}
+    maintenance.execute_maintenance(args, summary, runner)
+    assert summary["success"] is True and pending["reads"] == 0
+    assert len(operations["deletes"]) == len(operations["restores"]) == 1
+
+
+def prepare_accepted_restoration(args, monkeypatch):
+    backend, _, manifest, runner, operations, replacement_name = prepare_empty_replacement(args, monkeypatch)
+    checkpoint = {}
+    with monkeypatch.context() as patch:
+        def uninitialized_network(*_):
+            raise maintenance.workers.ReconcileError("NNC status not initialized")
+        patch.setattr(maintenance, "_replacement_nnc_map", uninitialized_network)
+        with pytest.raises(maintenance.workers.ReconcileError, match="NNC status"):
+            maintenance.execute_maintenance(args, checkpoint, runner)
+    assert checkpoint["status"] == "restoring-owned-replacement-capacity"
+    assert checkpoint["empty_worker_replacement"]["restore_accepted"] is True
+    checkpoint["error"] = "NNC status not initialized"
+    args.resume_build_id = 79817
+    manifest["source_build_id"] = 79817
+    Path(args.resume_summary).write_text(json.dumps(checkpoint), encoding="utf-8")
+    Path(args.resume_manifest).write_text(json.dumps(manifest), encoding="utf-8")
+    backend.calls.clear()
+    operations["deletes"].clear()
+    operations["restores"].clear()
+    return backend, checkpoint, runner, operations, replacement_name
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_adopt_accepted_restoration_never_repeats_cloud_writes(args, monkeypatch, execute):
+    backend, _, runner, operations, replacement_name = prepare_accepted_restoration(args, monkeypatch)
+    args.execute = execute
+    summary = {}
+    maintenance.execute_maintenance(args, summary, runner)
+    assert summary["success"] is True
+    assert not operations["deletes"] and not operations["restores"]
+    assert summary["replacement_derived_manifest"]["fresh_node_uids"][replacement_name] == backend.nodes[replacement_name]["metadata"]["uid"]
+    assert summary["empty_worker_replacement"]["adopted_accepted_restoration"] is True
+    if execute:
+        assert backend.retirement_calls == 1 and SOURCE not in backend.nodes
+        assert summary["empty_worker_replacement"]["ip_growth_verified"] is True
+    else:
+        assert_no_mutations(backend)
+        assert not backend.nodes[replacement_name]["spec"].get("unschedulable")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("delete_accepted", False), ("restore_accepted", False),
+    ("intermediate_pool_count", 4), ("old_node_uid", "foreign"),
+])
+def test_adopt_restoration_refuses_unproven_transition(args, monkeypatch, field, value):
+    backend, checkpoint, runner, operations, _ = prepare_accepted_restoration(args, monkeypatch)
+    checkpoint["empty_worker_replacement"][field] = value
+    Path(args.resume_summary).write_text(json.dumps(checkpoint), encoding="utf-8")
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, {}, runner)
+    assert not operations["deletes"] and not operations["restores"]
+    assert_no_mutations(backend)
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_resume_plan_is_read_only_with_original_hold(args, monkeypatch, legacy):
     backend, _, _ = prepare_resume(args, monkeypatch, legacy=legacy)

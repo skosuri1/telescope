@@ -652,6 +652,10 @@ def _load_resume(args) -> Optional[dict]:
     prior, summary_sha = _read_resume_json(args.resume_summary)
     manifest, manifest_sha = _read_resume_json(args.resume_manifest)
     recover_host = bool(getattr(args, "recover_empty_fresh_node", ""))
+    accepted_replacement = (
+        getattr(args, "replace_empty_fresh", False)
+        and prior.get("status") == "restoring-owned-replacement-capacity"
+    )
     require(
         isinstance(manifest.get("schema_version"), int)
         and not isinstance(manifest["schema_version"], bool) and manifest["schema_version"] == 1
@@ -684,6 +688,7 @@ def _load_resume(args) -> Optional[dict]:
         and prior.get("surge_request_accepted") is True
         and prior.get("source_quarantined") is True
         and prior.get("status") == (
+            "restoring-owned-replacement-capacity" if accepted_replacement else
             "proving-fresh-ip-growth" if recover_host else "waiting-for-surge"
         )
         and isinstance(prior.get("initial_pool_count"), int)
@@ -693,7 +698,7 @@ def _load_resume(args) -> Optional[dict]:
     )
     forbidden_prefixes = ("pending_", "healthy_", "probe_", "fresh_ip_", "retirement", "source_pre_drain", "destination_memory")
     for key, value in prior.items():
-        if recover_host and key == "fresh_ip_growth":
+        if recover_host and not accepted_replacement and key == "fresh_ip_growth":
             continue
         if key.startswith(forbidden_prefixes) or key in ("temporary_exclusions", "cleanup_errors", "cilium_final"):
             require(not value, f"Resume refuses prior mutation or unclean evidence: {key}")
@@ -713,7 +718,7 @@ def _load_resume(args) -> Optional[dict]:
     for key in ("original_real_node_uids", "original_kwok_node_uids", "agent_uids", "controller_uid"):
         require(not recover_host or key in prior, f"Empty-host recovery requires persisted {key}")
         require(key not in prior or prior[key] == manifest[key], f"Resume manifest differs from persisted {key}")
-    if recover_host:
+    if recover_host and not accepted_replacement:
         target = args.recover_empty_fresh_node
         growth = prior.get("fresh_ip_growth")
         require(
@@ -750,6 +755,20 @@ def _load_resume(args) -> Optional[dict]:
                 and previous.get("success") is False and previous.get("cordon_retained") is True,
                 "Replacement requires the exact failed, quarantined post-redeploy target",
             )
+    if accepted_replacement:
+        transition = prior.get("empty_worker_replacement") or {}
+        target = args.recover_empty_fresh_node
+        require(
+            target in fresh and fresh[target] == args.recover_empty_fresh_uid
+            and transition.get("old_node_name") == target
+            and transition.get("old_node_uid") == fresh[target]
+            and transition.get("old_network_container_id") == manifest["fresh_network_container_ids"][target]
+            and transition.get("delete_attempted") is True and transition.get("delete_accepted") is True
+            and transition.get("intermediate_pool_count") == 3
+            and transition.get("restore_attempted") is True and transition.get("restore_accepted") is True
+            and transition.get("replacement_completed") is False and transition.get("success") is False,
+            "Read-only replacement adoption requires the exact accepted deletion and restoration checkpoint",
+        )
     require(
         isinstance(prior.get("initial_pool_configuration"), dict)
         and prior["initial_pool_configuration"]
@@ -760,6 +779,7 @@ def _load_resume(args) -> Optional[dict]:
     _require_cilium_proof(prior.get("cilium_before") or {}, sorted(original))
     return {
         "prior": prior, "manifest": manifest,
+        "accepted_replacement": accepted_replacement,
         "provenance": {
             "source_build_id": args.resume_build_id,
             "summary_sha256": summary_sha, "manifest_sha256": manifest_sha,
@@ -1000,6 +1020,92 @@ def _observe_empty_replacement(operator, args, initial, retained, old_name, old_
     return nodes, real, pods
 
 
+def _replacement_nnc_map(payload, new_name, new_uid):
+    rows = _items(payload, "replacement network-container inventory")
+    require(
+        len({row["metadata"]["name"] for row in rows}) == len(rows),
+        "Replacement network-container names are not unique",
+    )
+    candidate = next((row for row in rows if row["metadata"]["name"] == new_name), None)
+    if candidate is not None:
+        require(_node_owner_uid(candidate) == new_uid, "New network-container owner UID does not match")
+        containers = (candidate.get("status") or {}).get("networkContainers")
+        if containers is None or containers == []:
+            return _nnc_map({"items": [row for row in rows if row["metadata"]["name"] != new_name]})
+    return _nnc_map(payload)
+
+
+def _derive_replacement_manifest(resume, record, new_name, new_uid, new_nc):
+    original_manifest = resume["manifest"]
+    old_name = record["old_node_name"]
+    manifest = dict(original_manifest)
+    manifest["fresh_node_uids"] = {
+        name: uid for name, uid in original_manifest["fresh_node_uids"].items() if name != old_name
+    }
+    manifest["fresh_network_container_ids"] = {
+        name: nc for name, nc in original_manifest["fresh_network_container_ids"].items() if name != old_name
+    }
+    manifest["fresh_node_uids"][new_name] = new_uid
+    manifest["fresh_network_container_ids"][new_name] = new_nc
+    resume["manifest"] = manifest
+    resume["replacement_completed"] = True
+    return manifest
+
+
+def _adopt_accepted_replacement(args, selected, state, pool, nodes, pods, nncs, resume, summary):
+    manifest = resume["manifest"]
+    record = dict(resume["prior"]["empty_worker_replacement"])
+    old_name = record["old_node_name"]
+    retained = {
+        name: uid for name, uid in {
+            **manifest["original_real_node_uids"], **manifest["fresh_node_uids"],
+        }.items() if name != old_name
+    }
+    real = _real_node_map(nodes)
+    require(old_name not in real, "Previously deleted empty worker is still present")
+    require(all(name in real and real[name]["metadata"]["uid"] == uid for name, uid in retained.items()),
+            "A retained worker changed before accepted replacement adoption")
+    candidates = [node for name, node in real.items() if name not in retained]
+    require(len(candidates) == 1, "Accepted restoration must have exactly one distinct replacement Node")
+    new = candidates[0]
+    new_name, new_uid = new["metadata"]["name"], new["metadata"]["uid"]
+    identity = workers.provider_identity(new)
+    original_pool = _pool_from_state(state, DEFAULT_POOL_NAME)
+    require(
+        identity is not None and identity[0] == original_pool.vmss_name.lower()
+        and identity[1] != record["old_instance_id"]
+        and new_uid not in set(retained.values()) | {record["old_node_uid"]}
+        and mocks._node_pool_name(new) == DEFAULT_POOL_NAME,
+        "Accepted replacement is not a distinct original-pool instance and Node UID",
+    )
+    _validate_pre_scale_state(
+        args, selected, state, pool, nodes, 4, resume["prior"]["initial_pool_configuration"],
+        {**retained, new_name: new_uid},
+    )
+    _require_resume_hold(args, real)
+    network = _nnc_map(nncs)
+    require(
+        old_name not in network
+        and not any((pod.get("spec") or {}).get("nodeName") == old_name for pod in _items(pods, "old target Pod references"))
+        and new_name in network and network[new_name]["node_uid"] == new_uid
+        and network[new_name]["network_container_id"] != record["old_network_container_id"]
+        and network[new_name]["assigned_ip_count"] > 0
+        and len(network[new_name]["ip_addresses"]) == network[new_name]["assigned_ip_count"],
+        "Accepted replacement does not have an initialized distinct Node-owned network container",
+    )
+    derived = _derive_replacement_manifest(
+        resume, record, new_name, new_uid, network[new_name]["network_container_id"],
+    )
+    record.update({
+        "node_name": new_name, "node_uid": new_uid, "new_instance_id": identity[1],
+        "network_container_id": network[new_name]["network_container_id"],
+        "replacement_completed": True, "cordon_retained": False, "pool_count": 4,
+        "adopted_accepted_restoration": True,
+    })
+    summary["empty_worker_replacement"] = record
+    summary["replacement_derived_manifest"] = derived
+
+
 def _replace_empty_fresh_host(operator, args, selected, initial, resume, summary) -> None:
     target, vmss_name, instance_id, _ = _empty_host_target(operator, args, selected, resume)
     old_name, old_uid = target["metadata"]["name"], target["metadata"]["uid"]
@@ -1100,8 +1206,10 @@ def _replace_empty_fresh_host(operator, args, selected, initial, resume, summary
                 and identity["image"] == pool.get("nodeImageVersion"),
                 "The new worker is not a distinct instance of the original default pool",
             )
-            nnc = _nnc_map(operator.kubectl_json(["get", "nnc", "-A", "-o", "json"]))
             new_name = new["metadata"]["name"]
+            nnc = _replacement_nnc_map(
+                operator.kubectl_json(["get", "nnc", "-A", "-o", "json"]), new_name, identity["uid"],
+            )
             network = nnc.get(new_name)
             if (
                 pool.get("count") == 4 and pool.get("provisioningState") == "Succeeded"
@@ -1109,6 +1217,8 @@ def _replace_empty_fresh_host(operator, args, selected, initial, resume, summary
                 and not _taints(new) and network is not None
                 and network["node_uid"] == identity["uid"]
                 and network["network_container_id"] != record["old_network_container_id"]
+                and network["assigned_ip_count"] > 0
+                and len(network["ip_addresses"]) == network["assigned_ip_count"]
             ):
                 state = workers.probe_cluster(
                     workers.Cluster(selected["name"], args.resource_group, args.role, args.kubeconfig),
@@ -1118,17 +1228,9 @@ def _replace_empty_fresh_host(operator, args, selected, initial, resume, summary
                     args, selected, state, pool, nodes, 4, initial["initial_pool_configuration"],
                     {**retained, new_name: identity["uid"]},
                 )
-                manifest = dict(original_manifest)
-                manifest["fresh_node_uids"] = {
-                    name: uid for name, uid in original_manifest["fresh_node_uids"].items() if name != old_name
-                }
-                manifest["fresh_network_container_ids"] = {
-                    name: nc for name, nc in original_manifest["fresh_network_container_ids"].items() if name != old_name
-                }
-                manifest["fresh_node_uids"][new_name] = identity["uid"]
-                manifest["fresh_network_container_ids"][new_name] = network["network_container_id"]
-                resume["manifest"] = manifest
-                resume["replacement_completed"] = True
+                manifest = _derive_replacement_manifest(
+                    resume, record, new_name, identity["uid"], network["network_container_id"],
+                )
                 summary["replacement_derived_manifest"] = manifest
                 summary["resume_fresh_network_container_ids"] = manifest["fresh_network_container_ids"]
                 record.update({
@@ -3203,6 +3305,11 @@ def execute_maintenance(
             ["get", "nnc", "-A", "-o", "json"],
             timeout_seconds=args.request_timeout_seconds,
         )
+        if resume and resume.get("accepted_replacement"):
+            _adopt_accepted_replacement(
+                args, selected, cluster_state, pool_payload, nodes_payload, pods_payload,
+                nnc_payload, resume, summary,
+            )
         validation_args = (
             args, selected, cluster_state, pool_payload, nodes_payload,
             pods_payload, events_payload, controller_payload, nnc_payload,
@@ -3257,7 +3364,7 @@ def execute_maintenance(
                 operator.kubectl_json(["get", "deployments", "-A", "-o", "json"]),
                 operator.kubectl_json(["get", "statefulsets", "-A", "-o", "json"]),
             )
-            if getattr(args, "recover_empty_fresh_node", ""):
+            if getattr(args, "recover_empty_fresh_node", "") and not resume.get("replacement_completed"):
                 _empty_host_target(operator, args, selected, resume)
             startup = _startup_operator(operator)
             applicable = _derive_applicable_daemonsets(
@@ -3273,7 +3380,7 @@ def execute_maintenance(
             _save(args.summary_file, summary)
             return
 
-        if resume and getattr(args, "recover_empty_fresh_node", ""):
+        if resume and getattr(args, "recover_empty_fresh_node", "") and not resume.get("replacement_completed"):
             summary["mutation_started"] = True
             if getattr(args, "replace_empty_fresh", False):
                 _replace_empty_fresh_host(operator, args, selected, initial, resume, summary)
@@ -3582,7 +3689,8 @@ def execute_maintenance(
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         host_recovery = summary.get("empty_host_recovery") or summary.get("empty_worker_replacement") or {}
-        if operator is not None and (host_recovery.get("redeploy_completed") or host_recovery.get("replacement_completed")) \
+        if operator is not None and args.execute and summary.get("mutation_started") \
+                and (host_recovery.get("redeploy_completed") or host_recovery.get("replacement_completed")) \
                 and not host_recovery.get("success") and not host_recovery.get("cordon_retained"):
             try:
                 target = operator.kubectl_json(
