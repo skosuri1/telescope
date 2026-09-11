@@ -1,0 +1,58 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: tfvars_path
+    type: string
+  - name: overlay_mode
+    type: string
+
+jobs:
+  - job: preserved_arm_repair
+    displayName: "Repair preserved mesh peers and failed pools"
+    variables:
+      SCENARIO_NAME: clustermesh-scale
+      CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "3000"
+      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "120"
+      SUITE_TOTAL_BUDGET_SECONDS: "0"
+      AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
+    timeoutInMinutes: 3000
+    cancelTimeoutInMinutes: 120
+    steps:
+      - script: |
+          set -euo pipefail
+          if [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
+            [ "$OVERLAY_MODE" != "resume-existing" ] ||
+            [ "${RETIREMENT_ONLY,,}" = "true" ] ||
+            [ "${CLUSTERMESH_PRESERVED_AKS_ARM_RECONCILE_ENABLED:-false}" != "true" ]; then
+            echo "ARM repair-only mode requires enabled existing-n100 repair and no other maintenance mode." >&2
+            exit 1
+          fi
+        displayName: "Require existing n100 ARM repair scope"
+        env:
+          EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+          OVERLAY_MODE: ${{ parameters.overlay_mode }}
+          RETIREMENT_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_ONLY)
+
+      - template: /steps/setup-tests.yml
+        parameters:
+          cloud: azure
+          region: ${{ parameters.region }}
+          run_id: ${{ parameters.target_run_id }}
+          credential_type: service_connection
+          ssh_key_enabled: false
+
+      - template: /steps/topology/clustermesh-scale/reuse/reconcile-preserved-arm.yml
+        parameters:
+          target_run_id: ${{ parameters.target_run_id }}
+          expected_subscription_id: ${{ parameters.expected_subscription_id }}
+          region: ${{ parameters.region }}
+          expected_cluster_count: ${{ parameters.expected_cluster_count }}
+          tfvars_path: ${{ parameters.tfvars_path }}
+          overlay_mode: ${{ parameters.overlay_mode }}

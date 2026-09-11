@@ -88,7 +88,10 @@ parameters:
 
 jobs:
 - job: azure
-  condition: and(succeeded(), ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'))
+  condition: >-
+    and(succeeded(),
+    ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'),
+    ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'))
   variables:
     CLUSTERMESH_JOB_TIMEOUT_MINUTES: ${{ parameters.timeout_in_minutes }}
     CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: ${{ parameters.cancel_timeout_in_minutes }}
@@ -218,54 +221,14 @@ jobs:
       retirement_node: ${{ parameters.prepared_retirement_node }}
       retirement_uid: ${{ parameters.prepared_retirement_uid }}
 
-  - script: |
-      set -euo pipefail
-      if [ "${CLUSTERMESH_PRESERVED_AKS_ARM_RECONCILE_ENABLED:-false}" != "true" ]; then
-        echo "Preserved AKS ARM state reconciliation disabled; skipping."
-        exit 0
-      fi
-      summary_dir="$(Build.ArtifactStagingDirectory)/n100-aks-arm-reconcile"
-      mkdir -p "$summary_dir"
-      echo "##vso[task.setvariable variable=AKS_ARM_RECONCILE_DIAGNOSTICS_READY]true"
-      if [ "$CLUSTERMESH_DEBUG_CONFIRM_RESUME" != "$RUN_ID" ]; then
-        echo "CLUSTERMESH_DEBUG_CONFIRM_RESUME must equal $RUN_ID." >&2
-        exit 1
-      fi
-      expected_tfvars_sha=$(sha256sum \
-        "$(Pipeline.Workspace)/s/${{ parameters.tfvars_path }}" \
-        | awk '{print $1}')
-      reconcile_rc=0
-      pool_repair_args=()
-      if [ "${CLUSTERMESH_DEBUG_FAILED_POOL_REPAIR_ENABLED:-true}" = "true" ]; then
-        pool_repair_args=(--failed-pool-repair-enabled)
-      fi
-      python3 "$PRESERVED_AKS_ARM_RECONCILER" \
-        --resource-group "$RUN_ID" \
-        --expected-subscription "${{ parameters.expected_subscription_id }}" \
-        --expected-region "${{ parameters.region }}" \
-        --expected-count "${{ parameters.expected_cluster_count }}" \
-        --expected-tfvars-sha "$expected_tfvars_sha" \
-        --max-repair-clusters "${CLUSTERMESH_DEBUG_MAX_AKS_ARM_REPAIR_CLUSTERS:-10}" \
-        --max-concurrent "${CLUSTERMESH_DEBUG_AKS_ARM_REPAIR_CONCURRENCY:-2}" \
-        --quiescence-timeout-seconds "${CLUSTERMESH_DEBUG_POOL_QUIESCENCE_TIMEOUT_SECONDS:-900}" \
-        "${pool_repair_args[@]}" \
-        --summary-file "$summary_dir/aks-arm-reconcile.json" || reconcile_rc=$?
-      if [ -s "$summary_dir/aks-arm-reconcile.json" ]; then
-        echo "##vso[task.uploadfile]$summary_dir/aks-arm-reconcile.json"
-      fi
-      exit "$reconcile_rc"
-    displayName: "Reconcile stale preserved AKS ARM states"
-    env:
-      PRESERVED_AKS_ARM_RECONCILER: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/preserved_aks_arm_reconcile.py
-      RUN_ID: ${{ parameters.target_run_id }}
-      CLUSTERMESH_DEBUG_CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
-
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish preserved AKS ARM diagnostics"
-    condition: and(succeededOrFailed(), eq(variables['AKS_ARM_RECONCILE_DIAGNOSTICS_READY'], 'true'))
-    inputs:
-      targetPath: "$(Build.ArtifactStagingDirectory)/n100-aks-arm-reconcile"
-      artifact: "n100-aks-arm-reconcile-$(Build.BuildId)-$(System.JobAttempt)"
+  - template: /steps/topology/clustermesh-scale/reuse/reconcile-preserved-arm.yml
+    parameters:
+      target_run_id: ${{ parameters.target_run_id }}
+      expected_subscription_id: ${{ parameters.expected_subscription_id }}
+      region: ${{ parameters.region }}
+      expected_cluster_count: ${{ parameters.expected_cluster_count }}
+      tfvars_path: ${{ parameters.tfvars_path }}
+      overlay_mode: ${{ parameters.overlay_mode }}
 
   - script: |
       set -euo pipefail

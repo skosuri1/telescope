@@ -658,9 +658,11 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     assert "/steps/provision-resources.yml" not in resume
     assert "/steps/cleanup-resources.yml" not in resume
     assert "validate-existing-scale.sh" in resume
-    assert "preserved_aks_arm_reconcile.py" in resume
+    arm_template_name = "/steps/topology/clustermesh-scale/reuse/reconcile-preserved-arm.yml"
+    arm_template = (REPOSITORY_ROOT / arm_template_name.lstrip("/")).read_text(encoding="utf-8")
+    assert "preserved_aks_arm_reconcile.py" in arm_template
     assert (
-        resume.index('displayName: "Reconcile stale preserved AKS ARM states"')
+        resume.index(f"- template: {arm_template_name}")
         < resume.index(
             'displayName: "Validate preserved scale clusters and prepare Fleet overlay"'
         )
@@ -706,7 +708,7 @@ def test_resume_job_skips_terraform_and_preserves_resources():
     assert "buildVersionToDownload: specific" in resume
     assert resume.count("/steps/validate-resources.yml") == 1
     assert resume.index("Download preserved n100 KWOK baseline") < resume.index(
-        "Reconcile stale preserved AKS ARM states"
+        f"- template: {arm_template_name}"
     )
     assert (
         "artifactName: n100-kwok-preservation-"

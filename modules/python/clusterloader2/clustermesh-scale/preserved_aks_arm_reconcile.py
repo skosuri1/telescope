@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clear stale AKS ARM failure states after healthy Fleet mesh formation."""
+"""Reconcile preserved AKS ARM failures only after authoritative live health proof."""
 
 # pylint: disable=too-many-lines
 
@@ -16,7 +16,8 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 
@@ -72,8 +73,11 @@ TRANSIENT_READ_RE = re.compile(
 ROLE_RE = re.compile(r"^mesh-(?P<number>[1-9][0-9]*)$")
 BUSY_POOL_STATES = {"Updating", "Scaling", "Upgrading", "DeletingMachines"}
 MAX_FAILED_POOL_REPAIRS = 5
+LIVE_OVERLAY_CLUSTER_COUNT = 100
+MAX_LIVE_OVERLAY_REPAIR_ROLES = 20
+LIVE_OVERLAY_CLEANUP_SECONDS = 300
 POOL_CONFIG_FIELDS = (
-    "count", "vmSize", "mode", "osType", "osSKU", "osDiskType", "osDiskSizeGb",
+    "count", "vmSize", "mode", "osType", "osSKU", "osSku", "osDiskType", "osDiskSizeGb",
     "maxPods", "vnetSubnetId", "podSubnetId", "availabilityZones",
     "enableAutoScaling", "minCount", "maxCount", "nodeLabels", "nodeTaints",
     "orchestratorVersion", "kubeletConfig", "linuxOSConfig",
@@ -207,6 +211,8 @@ def validate_cluster_inventory(
     region: str,
     max_repair_clusters: int,
     allow_failed_pool_repair: bool = False,
+    expected_subscription: Optional[str] = None,
+    expected_resource_group: Optional[str] = None,
 ) -> Tuple[List[Cluster], List[Cluster]]:
     """Validate exact cluster identity and return all/failed clusters."""
 
@@ -223,7 +229,10 @@ def validate_cluster_inventory(
         if not isinstance(row, dict):
             raise ReconcileError("malformed AKS inventory entry")
         name = row.get("name")
-        role = (row.get("tags") or {}).get("role")
+        tags = row.get("tags")
+        if not isinstance(tags, dict):
+            raise ReconcileError("AKS inventory entry has no valid ownership tags")
+        role = tags.get("role")
         match = ROLE_RE.fullmatch(str(role or ""))
         if not isinstance(name, str) or not name:
             raise ReconcileError("AKS inventory entry has no name")
@@ -266,6 +275,18 @@ def validate_cluster_inventory(
             raise ReconcileError(f"{role}: AKS resource ID is missing")
         if not isinstance(node_resource_group, str) or not node_resource_group:
             raise ReconcileError(f"{role}: node resource group is missing")
+        if expected_resource_group is not None:
+            expected_id = (
+                f"/subscriptions/{expected_subscription}/resourceGroups/"
+                f"{expected_resource_group}/providers/"
+                f"Microsoft.ContainerService/managedClusters/{name}"
+            )
+            if (
+                resource_group.lower() != expected_resource_group.lower()
+                or resource_id.lower() != expected_id.lower()
+                or tags.get("run_id") != expected_resource_group
+            ):
+                raise ReconcileError(f"{role}: preserved AKS ownership identity mismatch")
         pools = row.get("agentPoolProfiles")
         if not isinstance(pools, list) or not pools:
             raise ReconcileError(
@@ -347,8 +368,12 @@ def validate_cluster_inventory(
 def validate_fleet_members(payload: object, clusters: List[Cluster]) -> None:
     """Require exact, fully Connected Fleet membership."""
 
-    if not isinstance(payload, list):
-        raise ReconcileError("Fleet member response is not an array")
+    if (
+        not isinstance(payload, list)
+        or len(payload) != len(clusters)
+        or any(not isinstance(row, dict) for row in payload)
+    ):
+        raise ReconcileError("Fleet member response is not an exact inventory")
     expected_roles = {cluster.role for cluster in clusters}
     actual_roles = {
         str(row.get("name"))
@@ -360,9 +385,9 @@ def validate_fleet_members(payload: object, clusters: List[Cluster]) -> None:
     unhealthy = [
         str(row.get("name"))
         for row in payload
-        if not isinstance(row, dict)
-        or row.get("meshProperties", {}).get("status", {}).get("state")
-        != "Connected"
+        if not isinstance(row.get("meshProperties"), dict)
+        or not isinstance(row["meshProperties"].get("status"), dict)
+        or row["meshProperties"]["status"].get("state") != "Connected"
     ]
     if unhealthy:
         raise ReconcileError(
@@ -399,6 +424,36 @@ def validate_latest_operation(cluster: Cluster, payload: object) -> dict:
         "start_time": str(payload.get("startTime") or ""),
         "end_time": str(payload.get("endTime") or ""),
     }
+
+
+def read_terminal_cluster_operation(cluster: Cluster, runner: Runner, timeout: int) -> dict:
+    """Fail closed on an unreadable or still-active latest provider operation."""
+
+    operation = parse_json(
+        runner(
+            ["az", "aks", "operation", "show-latest", "--resource-group", cluster.resource_group,
+             "--name", cluster.name, "--output", "json", "--only-show-errors"],
+            timeout,
+        ),
+        f"{cluster.role} latest AKS operation",
+    )
+    if not isinstance(operation, dict) or operation.get("status") not in ("Succeeded", "Failed"):
+        raise ReconcileError(
+            f"{cluster.role}: latest AKS provider operation is not safely terminal",
+            evidence={"latest_operation": operation},
+        )
+    return operation
+
+
+def read_failed_cluster_operation(cluster: Cluster, runner: Runner, timeout: int) -> dict:
+    """Recheck the original stale-addon gate, including after an overlay recovery."""
+
+    exists = runner(
+        ["az", "group", "exists", "--name", cluster.node_resource_group, "--only-show-errors"], timeout,
+    ).strip()
+    if exists.lower() != "true":
+        raise ReconcileError(f"{cluster.role}: node resource group is missing")
+    return validate_latest_operation(cluster, read_terminal_cluster_operation(cluster, runner, timeout))
 
 
 def validate_cluster_data_plane(
@@ -578,12 +633,17 @@ def validate_cluster_data_plane(
     return None
 
 
-def write_pool_repair_identities(path: str, members: object, clusters: List[Cluster]) -> None:
+def write_pool_repair_identities(path: str, members: object, clusters: List[Cluster]) -> List[dict]:
     """Use authoritative Fleet assignments, never inferred role-number identities."""
 
+    if not isinstance(members, list) or any(not isinstance(member, dict) for member in members):
+        raise ReconcileError("Fleet Cilium identity inventory is not an array of members")
     identities = []
     for member in members:
-        identity = member.get("meshProperties", {}).get("ciliumProperties", {})
+        mesh = member.get("meshProperties")
+        identity = mesh.get("ciliumProperties") if isinstance(mesh, dict) else None
+        if not isinstance(identity, dict):
+            raise ReconcileError(f"{member.get('name')}: missing Fleet Cilium identity")
         name = identity.get("name")
         cluster_id = identity.get("id")
         if (
@@ -602,7 +662,9 @@ def write_pool_repair_identities(path: str, members: object, clusters: List[Clus
         or len({item["cluster_id"] for item in identities}) != len(clusters)
     ):
         raise ReconcileError("Failed-pool repair requires an exact, unique Fleet identity inventory")
+    identities.sort(key=lambda item: item["role"])
     write_json_atomic(path, identities)
+    return identities
 
 
 def pool_configuration(pool: dict) -> dict:
@@ -783,7 +845,11 @@ def reconcile_failed_pool(
     if latest.get("provisioningState") != "Failed":
         raise ReconcileError(f"{cluster.role}/{pool_name}: another operation started during health proof")
     evidence["status"] = "reconciling"
-    print(f"{cluster.role}/{pool_name}: healthy workers/mesh; reasserting unchanged pool configuration", flush=True)
+    print(
+        f"{cluster.role}/{pool_name}: healthy workers/mesh; submitting unchanged "
+        "pool update (may resume an upgrade and drain workers)",
+        flush=True,
+    )
     runner(
         ["az", "aks", "nodepool", "update",
          "--resource-group", cluster.resource_group, "--cluster-name", cluster.name,
@@ -969,7 +1035,7 @@ def read_quiescent_inventory(
             summary[f"{phase}_pool_states"] = [
                 {
                     "name": row.get("name"),
-                    "role": (row.get("tags") or {}).get("role"),
+                    "role": row["tags"].get("role") if isinstance(row.get("tags"), dict) else None,
                     "provisioning_state": row.get("provisioningState"),
                     "power_state": row.get("powerState"),
                     "pools": row.get("agentPoolProfiles"),
@@ -983,7 +1049,16 @@ def read_quiescent_inventory(
                     region=args.expected_region,
                     max_repair_clusters=args.max_repair_clusters,
                     allow_failed_pool_repair=(
-                        phase == "initial" and args.failed_pool_repair_enabled
+                        phase in (
+                            "initial", "live_overlay_before_repair",
+                            "live_overlay_after_repair", "live_overlay_after_probe",
+                        ) and args.failed_pool_repair_enabled
+                    ),
+                    expected_subscription=(
+                        args.expected_subscription if args.live_overlay_repair_enabled else None
+                    ),
+                    expected_resource_group=(
+                        args.resource_group if args.live_overlay_repair_enabled else None
                     ),
                 )
             except InventoryBusyError as error:
@@ -1000,6 +1075,377 @@ def read_quiescent_inventory(
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(pause, remaining))
+
+
+def read_live_overlay_authority(
+    clusters: List[Cluster], args: argparse.Namespace, runner: Runner,
+    evidence: dict, identities_path: str, lease_required_until: datetime,
+    repair_roles: Sequence[str] = (),
+) -> List[dict]:
+    """Read the preserved ownership, leases and idle Fleet authority without writes."""
+
+    if args.expected_count != LIVE_OVERLAY_CLUSTER_COUNT or len(clusters) != args.expected_count:
+        raise ReconcileError("Early live-overlay recovery requires the full exact 100-cluster inventory")
+    if not re.fullmatch(r"[0-9]+-[0-9a-f]{8}", args.resource_group):
+        raise ReconcileError("Invalid preserved RUN_ID; expected <build-id>-<8 hex>")
+    subscription = runner(
+        ["az", "account", "show", "--query", "id", "-o", "tsv"], args.query_timeout_seconds,
+    ).strip()
+    if subscription.lower() != args.expected_subscription.lower():
+        raise ReconcileError("Subscription changed before live-overlay recovery")
+    prefix = f"/subscriptions/{args.expected_subscription}/resourceGroups/{args.resource_group}"
+    resource_group = parse_json(
+        runner(
+            ["az", "group", "show", "--name", args.resource_group, "--output", "json", "--only-show-errors"],
+            args.query_timeout_seconds,
+        ),
+        "preserved resource group",
+    )
+    evidence["resource_group"] = resource_group
+    validate_resource_group(
+        resource_group, args.resource_group, args.expected_region,
+        args.expected_count, args.expected_tfvars_sha,
+    )
+    if str(resource_group.get("id") or "").lower() != prefix.lower():
+        raise ReconcileError("Preserved resource-group resource identity mismatch")
+
+    def lease_expiry(value: object, description: str) -> datetime:
+        try:
+            return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError) as error:
+            raise ReconcileError(f"{description}: invalid deletion_due_time") from error
+
+    parent_expiry = lease_expiry(resource_group["tags"].get("deletion_due_time"), args.resource_group)
+    if parent_expiry <= lease_required_until:
+        raise ReconcileError("Preserved parent lease does not cover the bounded live-overlay recovery")
+    expected_groups = {cluster.node_resource_group.lower(): cluster for cluster in clusters}
+    if len(expected_groups) != args.expected_count:
+        raise ReconcileError("Preserved inventory has duplicate managed resource groups")
+    groups = parse_json(
+        runner(
+            ["az", "group", "list", "--query",
+             "[].{name:name,location:location,managedBy:managedBy,deletion_due_time:tags.deletion_due_time}",
+             "--output", "json", "--only-show-errors"],
+            args.inventory_timeout_seconds,
+        ),
+        "managed resource-group inventory",
+    )
+    if not isinstance(groups, list) or any(not isinstance(group, dict) for group in groups):
+        raise ReconcileError("Managed resource-group inventory is not readable")
+    selected_groups = [
+        group for group in groups if str(group.get("name") or "").lower() in expected_groups
+    ]
+    evidence["node_resource_groups"] = selected_groups
+    if (
+        len(selected_groups) != args.expected_count
+        or len({str(group["name"]).lower() for group in selected_groups}) != args.expected_count
+    ):
+        raise ReconcileError("Managed resource-group inventory is not exact; refusing Fleet mutation")
+    for group in selected_groups:
+        cluster = expected_groups[group["name"].lower()]
+        expected_id = f"{prefix}/providers/Microsoft.ContainerService/managedClusters/{cluster.name}"
+        if (
+            cluster.resource_group.lower() != args.resource_group.lower()
+            or cluster.resource_id.lower() != expected_id.lower()
+            or str(group.get("managedBy") or "").lower() != cluster.resource_id.lower()
+            or str(group.get("location") or "").lower() != args.expected_region.lower()
+        ):
+            raise ReconcileError(f"{cluster.role}: managed resource-group ownership identity mismatch")
+        if lease_expiry(group.get("deletion_due_time"), group["name"]) < parent_expiry:
+            raise ReconcileError(f"{cluster.role}: managed resource-group lease is shorter than the parent lease")
+
+    evidence["latest_operations"] = {}
+    for cluster in clusters:
+        if cluster.failed_pools or cluster.state == "Failed" or cluster.role in repair_roles:
+            operation = read_terminal_cluster_operation(cluster, runner, args.query_timeout_seconds)
+            evidence["latest_operations"][cluster.role] = operation
+            if cluster.state == "Failed":
+                validate_latest_operation(cluster, operation)
+
+    fleet_id = f"{prefix}/providers/Microsoft.ContainerService/fleets/{args.fleet_name}"
+    for kind, command, expected_id in (
+        ("fleet", ["az", "fleet", "show", "--name", args.fleet_name], fleet_id),
+        ("profile", ["az", "fleet", "clustermeshprofile", "show", "--fleet-name", args.fleet_name,
+                     "--name", args.profile_name], f"{fleet_id}/clusterMeshProfiles/{args.profile_name}"),
+    ):
+        payload = parse_json(
+            runner(
+                command + ["--resource-group", args.resource_group, "--output", "json", "--only-show-errors"],
+                args.query_timeout_seconds,
+            ),
+            kind,
+        )
+        evidence[kind] = payload
+        properties = payload.get("properties") if isinstance(payload, dict) else None
+        state = (
+            payload.get("provisioningState") or (properties or {}).get("provisioningState")
+        ) if isinstance(payload, dict) and (properties is None or isinstance(properties, dict)) else None
+        if (
+            not isinstance(payload, dict)
+            or str(payload.get("id") or "").lower() != expected_id.lower()
+            or state != "Succeeded"
+        ):
+            raise ReconcileError(f"Existing Fleet {kind} is not the expected idle Succeeded resource")
+
+    for kind, command in (
+        ("members", ["az", "fleet", "member", "list"]),
+        ("applied_members", ["az", "fleet", "clustermeshprofile", "list-members", "--name", args.profile_name]),
+    ):
+        members = parse_json(
+            runner(
+                command + ["--resource-group", args.resource_group, "--fleet-name", args.fleet_name,
+                           "--output", "json", "--only-show-errors"],
+                args.inventory_timeout_seconds,
+            ),
+            f"Fleet {kind}",
+        )
+        evidence[kind] = members
+        validate_fleet_members(members, clusters)
+    by_role = {cluster.role: cluster for cluster in clusters}
+    for member in evidence["members"]:
+        if (
+            str(member.get("clusterResourceId") or "").lower() != by_role[member["name"]].resource_id.lower()
+            or member.get("provisioningState") != "Succeeded"
+            or not isinstance(member.get("labels"), dict)
+            or member["labels"].get("mesh") != "true"
+        ):
+            raise ReconcileError(f"{member['name']}: Fleet ownership, selector or operation state is unsafe")
+    return write_pool_repair_identities(identities_path, evidence["members"], clusters)
+
+
+def run_live_overlay_command(
+    command: Sequence[str], timeout_seconds: int, log_path: str,
+    environment: Optional[Dict[str, str]] = None,
+) -> int:
+    """Keep complete child output, including failures, outside credential tempdirs."""
+
+    with open(log_path, "w", encoding="utf-8") as log:
+        try:
+            # TERM permits the existing Fleet script's selector-restoration trap;
+            # a timed-out submission is still a failed, possibly active operation.
+            completed = subprocess.run(
+                ["timeout", "--signal=TERM", f"--kill-after={LIVE_OVERLAY_CLEANUP_SECONDS}s",
+                 f"{timeout_seconds}s", *command],
+                check=False, stdout=log, stderr=subprocess.STDOUT, text=True, env=environment,
+            )
+        except OSError as error:
+            log.write(f"Unable to execute live-overlay command: {error}\n")
+            raise ReconcileError(f"Unable to execute live-overlay command; see {log_path}: {error}") from error
+    return completed.returncode
+
+
+def validate_live_overlay_proof(
+    proof: object, returncode: int, roles_path: str, identities: List[dict], max_roles: int,
+) -> None:
+    """Reject partial/read-failed probes even if they emitted a bounded repair plan."""
+
+    if not isinstance(proof, dict) or returncode not in (0, 2):
+        raise ReconcileError(f"Live-overlay probe failed unsafely (exit={returncode})")
+    observed = proof.get("identities")
+    if (
+        proof.get("cluster_count") != LIVE_OVERLAY_CLUSTER_COUNT
+        or not isinstance(observed, list) or len(observed) != len(identities)
+        or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("cluster_id"), int) or isinstance(item["cluster_id"], bool)
+            for item in observed
+        )
+        or sorted(observed, key=lambda item: str(item.get("role"))) != sorted(identities, key=lambda item: item["role"])
+    ):
+        raise ReconcileError("Live-overlay probe does not match the exact authoritative Fleet identities")
+    drift = proof.get("drift")
+    roles = proof.get("repair_roles")
+    if (
+        not isinstance(drift, list)
+        or any(not isinstance(item, dict) or item.get("command_error") for item in drift)
+    ):
+        raise ReconcileError("Live-overlay agent probe is unreadable; refusing Fleet mutation")
+    try:
+        with open(roles_path, encoding="utf-8") as handle:
+            written_roles = handle.read().splitlines()
+    except OSError as error:
+        raise ReconcileError(f"Live-overlay repair roles are unavailable: {error}") from error
+    if not isinstance(roles, list) or roles != written_roles:
+        raise ReconcileError("Live-overlay repair roles do not match the current proof")
+    if returncode == 0:
+        if proof.get("healthy") is not True or drift or roles:
+            raise ReconcileError("Live-overlay success proof is inconsistent")
+        return
+    selection = proof.get("repair_selection")
+    bounded_selection = (
+        isinstance(selection, dict)
+        and selection.get("cover_within_limit") is True
+        and selection.get("repair_roles") == roles
+        and 0 < len(roles) <= max_roles
+    )
+    owned_roles = len(set(roles)) == len(roles) and set(roles).issubset({item["role"] for item in identities})
+    if (
+        proof.get("healthy") is not False or not drift or not bounded_selection or not owned_roles
+    ):
+        raise ReconcileError("Live-overlay drift has no safe bounded repair plan")
+
+
+def recover_live_overlay(
+    clusters: List[Cluster], args: argparse.Namespace, summary: dict, runner: Runner,
+) -> Tuple[List[Cluster], List[Cluster]]:
+    """Run the established full-probe/rejoin/postproof sequence once, before pool PUTs."""
+
+    artifact_parent = os.path.dirname(os.path.abspath(args.summary_file))
+    os.makedirs(artifact_parent, exist_ok=True)
+    artifact_dir = tempfile.mkdtemp(prefix="live-overlay-", dir=artifact_parent)
+    evidence = {"status": "validating", "directory": artifact_dir}
+    summary["live_overlay_recovery"] = evidence
+    deadline = time.monotonic() + args.live_overlay_timeout_seconds
+    lease_required_until = datetime.now(timezone.utc) + timedelta(
+        seconds=args.live_overlay_timeout_seconds + LIVE_OVERLAY_CLEANUP_SECONDS,
+    )
+    evidence["lease_required_until"] = lease_required_until.isoformat()
+
+    def remaining() -> int:
+        seconds = math.ceil(deadline - time.monotonic())
+        if seconds <= 0:
+            raise ReconcileError("Early live-overlay recovery deadline exhausted")
+        return seconds
+
+    def bounded_read(command: Sequence[str], timeout: int) -> str:
+        return runner(command, min(timeout, remaining()))
+
+    def authority(
+        phase: str, current_clusters: List[Cluster], repair_roles: Sequence[str] = (),
+    ) -> List[dict]:
+        evidence[phase] = {}
+        write_json_atomic(args.summary_file, summary)
+        return read_live_overlay_authority(
+            current_clusters, args, bounded_read, evidence[phase],
+            os.path.join(artifact_dir, f"{phase}-identities.json"), lease_required_until, repair_roles,
+        )
+
+    def probe(phase: str, attempts: int, identities: List[dict]) -> int:
+        record = {
+            "summary_file": os.path.join(artifact_dir, f"{phase}.json"),
+            "roles_file": os.path.join(artifact_dir, f"{phase}-roles.txt"),
+            "log_file": os.path.join(artifact_dir, f"{phase}.log"),
+        }
+        evidence[phase] = record
+        write_json_atomic(args.summary_file, summary)
+        record["exit_code"] = run_live_overlay_command(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "preserved_live_overlay.py"),
+             "--clusters", os.path.join(artifact_dir, "clusters.json"),
+             "--summary-file", record["summary_file"], "--repair-roles-file", record["roles_file"],
+             "--attempts", str(attempts), "--retry-seconds", "30",
+             "--command-timeout-seconds", "30", "--max-concurrent", "10",
+             "--max-repair-roles", str(args.live_overlay_max_repair_roles)],
+            remaining(), record["log_file"],
+        )
+        try:
+            with open(record["summary_file"], encoding="utf-8") as handle:
+                record["proof"] = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ReconcileError(f"Live-overlay {phase} proof is unavailable: {error}") from error
+        validate_live_overlay_proof(
+            record["proof"], record["exit_code"], record["roles_file"],
+            identities, args.live_overlay_max_repair_roles,
+        )
+        return record["exit_code"]
+
+    try:
+        print("Early live-overlay recovery: validating full preserved n100 authority.", flush=True)
+        identities = authority("authority_before", clusters)
+        with tempfile.TemporaryDirectory(prefix="aks-overlay-credentials-") as credential_dir:
+            inventory = [
+                {"name": cluster.name, "rg": cluster.resource_group, "role": cluster.role,
+                 "resource_id": cluster.resource_id,
+                 "kubeconfig": os.path.join(credential_dir, f"{cluster.role}.config")}
+                for cluster in clusters
+            ]
+            write_json_atomic(os.path.join(artifact_dir, "clusters.json"), inventory)
+            evidence["status"] = "reading-credentials"
+            write_json_atomic(args.summary_file, summary)
+            print("Early live-overlay recovery: reading 100 private kubeconfigs.", flush=True)
+
+            def credentials(row: dict) -> None:
+                bounded_read(
+                    ["az", "aks", "get-credentials", "--resource-group", row["rg"],
+                     "--name", row["name"], "--file", row["kubeconfig"],
+                     "--subscription", args.expected_subscription,
+                     "--overwrite-existing", "--only-show-errors"],
+                    args.query_timeout_seconds,
+                )
+                if not os.path.isfile(row["kubeconfig"]) or os.path.getsize(row["kubeconfig"]) == 0:
+                    raise ReconcileError(f"{row['role']}: credentials are unavailable")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                list(executor.map(credentials, inventory))
+            evidence["status"] = "probing"
+            print("Early live-overlay recovery: probing every cluster and Cilium agent.", flush=True)
+            if probe("initial", 5, identities) == 0:
+                current, failed = read_quiescent_inventory(args, summary, "live_overlay_after_probe", bounded_read)
+                if authority("authority_after_probe", current) != identities:
+                    raise ReconcileError("Fleet Cilium identities changed during the healthy live-overlay proof")
+                evidence["status"] = "healthy"
+                print("Early live-overlay recovery: full peer proof healthy; no Fleet mutation.", flush=True)
+                return current, failed
+
+            current, _ = read_quiescent_inventory(args, summary, "live_overlay_before_repair", bounded_read)
+            repair_roles = evidence["initial"]["proof"]["repair_roles"]
+            if authority("authority_before_repair", current, repair_roles) != identities:
+                raise ReconcileError("Fleet Cilium identities changed during the live-overlay proof")
+            repair = {"attempts": 1, "log_file": os.path.join(artifact_dir, "fleet-repair.log")}
+            evidence["fleet_repair"] = repair
+            evidence["status"] = "repairing"
+            write_json_atomic(args.summary_file, summary)
+            print(
+                "Early live-overlay recovery: one bounded Fleet rejoin for "
+                + ",".join(repair_roles),
+                flush=True,
+            )
+            environment = os.environ.copy()
+            environment.update({
+                "CLUSTERMESH_DEBUG_TARGET_RUN_ID": args.resource_group,
+                "CLUSTERMESH_DEBUG_EXPECTED_CLUSTER_COUNT": str(LIVE_OVERLAY_CLUSTER_COUNT),
+                "CLUSTERMESH_DEBUG_FLEET_NAME": args.fleet_name,
+                "CLUSTERMESH_DEBUG_PROFILE_NAME": args.profile_name,
+                "CLUSTERMESH_DEBUG_MAX_REPAIR_MEMBERS": str(args.live_overlay_max_repair_roles),
+                "CLUSTERMESH_DEBUG_FORCE_REPAIR_ROLES_FILE": evidence["initial"]["roles_file"],
+                "CMP_MEMBER_LABEL_KEY": "mesh", "CMP_MEMBER_LABEL_VALUE": "true",
+                "CMP_MEMBER_REPAIR_LABEL_VALUE": "repairing",
+                "BUILD_ARTIFACTSTAGINGDIRECTORY": artifact_dir,
+            })
+            errors = []
+            try:
+                repair["exit_code"] = run_live_overlay_command(
+                    ["bash", str(Path(__file__).resolve().parents[4]
+                                 / "steps/topology/clustermesh-scale/reuse/repair-existing-fleet-overlay.sh")],
+                    remaining(), repair["log_file"], environment,
+                )
+                if repair["exit_code"] != 0:
+                    raise ReconcileError(f"Bounded Fleet repair failed (exit={repair['exit_code']})")
+            except ReconcileError as error:
+                repair["error"] = str(error)
+                errors.append(str(error))
+            evidence["status"] = "verifying"
+            write_json_atomic(args.summary_file, summary)
+            print("Early live-overlay recovery: requiring strict full-fleet postproof.", flush=True)
+            try:
+                if probe("after_repair", 40, identities) != 0:
+                    raise ReconcileError("Live overlay did not converge after the single bounded Fleet repair")
+                current, failed = read_quiescent_inventory(args, summary, "live_overlay_after_repair", bounded_read)
+                if authority("authority_after_repair", current, repair_roles) != identities:
+                    raise ReconcileError("Fleet Cilium identities changed after the bounded Fleet repair")
+            except ReconcileError as error:
+                evidence["post_repair_error"] = str(error)
+                evidence["post_repair_failure_evidence"] = error.evidence
+                errors.append(str(error))
+            if errors:
+                raise ReconcileError("; ".join(errors))
+            evidence["status"] = "repaired"
+            print("Early live-overlay recovery: repaired; original pool gates remain required.", flush=True)
+            return current, failed
+    except ReconcileError as error:
+        evidence.update({"status": "failed", "error": str(error), "failure_evidence": error.evidence})
+        raise
+    finally:
+        write_json_atomic(args.summary_file, summary)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1022,6 +1468,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--inventory-retry-seconds", type=int, default=15)
     parser.add_argument("--quiescence-timeout-seconds", type=int, default=900)
     parser.add_argument("--failed-pool-repair-enabled", action="store_true")
+    parser.add_argument("--live-overlay-repair-enabled", action="store_true")
+    parser.add_argument("--live-overlay-max-repair-roles", type=int, default=20)
+    parser.add_argument("--live-overlay-timeout-seconds", type=int, default=18000)
     parser.add_argument("--mutation-timeout-seconds", type=int, default=1800)
     parser.add_argument("--recovery-timeout-seconds", type=int, default=1800)
     parser.add_argument("--poll-seconds", type=int, default=30)
@@ -1036,6 +1485,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "inventory_attempts",
         "inventory_retry_seconds",
         "quiescence_timeout_seconds",
+        "live_overlay_max_repair_roles",
+        "live_overlay_timeout_seconds",
         "mutation_timeout_seconds",
         "recovery_timeout_seconds",
         "poll_seconds",
@@ -1043,6 +1494,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.live_overlay_max_repair_roles > MAX_LIVE_OVERLAY_REPAIR_ROLES:
+        parser.error("--live-overlay-max-repair-roles cannot exceed 20")
+    if args.live_overlay_repair_enabled and (
+        not args.failed_pool_repair_enabled or args.expected_count != LIVE_OVERLAY_CLUSTER_COUNT
+    ):
+        parser.error("--live-overlay-repair-enabled requires --failed-pool-repair-enabled and --expected-count 100")
     return args
 
 
@@ -1127,45 +1584,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         validate_fleet_members(fleet_members, clusters)
 
         failure_evidence: Dict[str, dict] = {}
+        summary["failure_evidence"] = failure_evidence
         with tempfile.TemporaryDirectory(prefix="aks-arm-reconcile-") as temp_dir:
             for cluster in failed:
-                exists = run_command(
-                    [
-                        "az",
-                        "group",
-                        "exists",
-                        "--name",
-                        cluster.node_resource_group,
-                        "--only-show-errors",
-                    ],
-                    args.query_timeout_seconds,
-                ).strip()
-                if exists.lower() != "true":
-                    raise ReconcileError(
-                        f"{cluster.role}: node resource group is missing"
+                failure_evidence[cluster.role] = read_failed_cluster_operation(
+                    cluster, run_command, args.query_timeout_seconds,
+                )
+            if args.live_overlay_repair_enabled and any(cluster.failed_pools for cluster in clusters):
+                clusters, failed = recover_live_overlay(clusters, args, summary, run_command)
+                summary["post_overlay_failure_evidence"] = {}
+                for cluster in failed:
+                    summary["post_overlay_failure_evidence"][cluster.role] = read_failed_cluster_operation(
+                        cluster, run_command, args.query_timeout_seconds,
                     )
-                latest_operation = parse_json(
-                    run_command(
-                        [
-                            "az",
-                            "aks",
-                            "operation",
-                            "show-latest",
-                            "--resource-group",
-                            cluster.resource_group,
-                            "--name",
-                            cluster.name,
-                            "--output",
-                            "json",
-                            "--only-show-errors",
-                        ],
-                        args.query_timeout_seconds,
-                    ),
-                    f"{cluster.role} latest AKS operation",
-                )
-                failure_evidence[cluster.role] = validate_latest_operation(
-                    cluster, latest_operation
-                )
+            for cluster in failed:
                 validate_cluster_data_plane(
                     cluster,
                     os.path.join(temp_dir, f"{cluster.role}.config"),
@@ -1174,7 +1606,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.query_timeout_seconds,
                 )
 
-        summary["failure_evidence"] = failure_evidence
         if failed:
             def reconcile_one(cluster: Cluster) -> ReconcileResult:
                 return reconcile_cluster(
@@ -1307,6 +1738,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "healthy": False,
                 "finished_at": utc_now(),
                 "fatal_error": str(exc),
+                "fatal_error_evidence": exc.evidence,
             }
         )
         write_json_atomic(args.summary_file, summary)

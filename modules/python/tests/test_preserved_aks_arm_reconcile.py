@@ -369,6 +369,17 @@ def test_upgrade_surge_never_allows_other_configuration_drift():
     assert arm.pool_configuration_matches(before, current) is False
 
 
+@pytest.mark.parametrize("field", ["osSKU", "osSku"])
+def test_upgrade_surge_rejects_os_sku_drift_for_both_payload_spellings(field):
+    before = pool_payload()
+    before["count"] = 2
+    before[field] = "Ubuntu"
+    current = copy.deepcopy(before)
+    current.update(provisioningState="Updating", count=3)
+    current[field] = "AzureLinux"
+    assert arm.pool_configuration_matches(before, current) is False
+
+
 def test_final_inventory_never_accepts_remaining_failed_pool(tmp_path, monkeypatch):
     fake_clock(monkeypatch)
     args = quiescence_args(tmp_path)
@@ -699,8 +710,14 @@ def test_cluster_update_is_observed_before_quiescence(tmp_path, monkeypatch):
 
 
 def test_job_publishes_diagnostics_without_masking_reconcile_failure():
-    template = (
+    job = (
         MODULE_PATH.parents[4] / "jobs/clustermesh-debug-resume.yml"
+    ).read_text(encoding="utf-8")
+    shared = "steps/topology/clustermesh-scale/reuse/reconcile-preserved-arm.yml"
+    assert f"- template: /{shared}" in job
+    assert "overlay_mode: ${{ parameters.overlay_mode }}" in job
+    template = (
+        MODULE_PATH.parents[4] / shared
     ).read_text(encoding="utf-8")
     start = template.index('      summary_dir="$(Build.ArtifactStagingDirectory)/n100-aks-arm-reconcile"')
     end = template.index('  - task: PublishPipelineArtifact@1', start)
@@ -709,6 +726,14 @@ def test_job_publishes_diagnostics_without_masking_reconcile_failure():
     assert 'reconcile_rc=0' in script
     assert "CLUSTERMESH_DEBUG_FAILED_POOL_REPAIR_ENABLED" in script
     assert "pool_repair_args=(--failed-pool-repair-enabled)" in script
+    assert "CLUSTERMESH_DEBUG_EARLY_LIVE_OVERLAY_REPAIR_ENABLED:-true" in script
+    assert 'CLUSTERMESH_LIVE_DATA_PLANE_REPAIR_ENABLED:-false' in script
+    assert 'CLUSTERMESH_FLEET_ENABLED:-true' in script
+    assert '[ "$OVERLAY_MODE" = "resume-existing" ]' in script
+    assert '[ "${{ parameters.expected_cluster_count }}" -eq 100 ]' in script
+    assert "--live-overlay-repair-enabled" in script
+    assert "--live-overlay-max-repair-roles" in script
+    assert "CLUSTERMESH_DEBUG_EARLY_LIVE_OVERLAY_TIMEOUT_SECONDS:-18000" in script
     assert '--summary-file "$summary_dir/aks-arm-reconcile.json" || reconcile_rc=$?' in script
     assert 'if [ -s "$summary_dir/aks-arm-reconcile.json" ]; then' in script
     assert script.index("task.uploadfile") < script.index('exit "$reconcile_rc"')
@@ -739,6 +764,8 @@ def test_fleet_members_must_be_exactly_connected():
     ]
 
     arm.validate_fleet_members(members, clusters)
+    with pytest.raises(arm.ReconcileError, match="exact inventory"):
+        arm.validate_fleet_members(members + [members[0]], clusters)
     members[1]["meshProperties"]["status"]["state"] = "Failed"
     with pytest.raises(arm.ReconcileError, match="not Connected"):
         arm.validate_fleet_members(members, clusters)

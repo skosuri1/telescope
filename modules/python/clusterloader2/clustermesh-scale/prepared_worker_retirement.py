@@ -186,7 +186,10 @@ def validate_pool_state(state: workers.ClusterState, node_name: str, before: boo
     return selected
 
 
-def validate_workloads(args, nodes: dict, pods: dict, controller: dict, daemonsets: dict):
+def validate_workloads(
+    args, nodes: dict, pods: dict, controller: dict, daemonsets: dict,
+    *, observe_retirement: bool = False,
+):
     """Require unchanged 100-agent/100-KWOK readiness and a genuinely drained source."""
 
     node_rows = mocks._items(nodes, "Node inventory")
@@ -235,9 +238,14 @@ def validate_workloads(args, nodes: dict, pods: dict, controller: dict, daemonse
     if source is not None:
         require(
             source["metadata"].get("uid") == args.node_uid
-            and not source["metadata"].get("deletionTimestamp")
+            and (
+                observe_retirement
+                or (
+                    not source["metadata"].get("deletionTimestamp")
+                    and workers.node_is_ready(source)
+                )
+            )
             and source.get("spec", {}).get("unschedulable") is True
-            and workers.node_is_ready(source)
             and mocks._node_pool_name(source) == "default"
             and "bounded-worker-retirement" in str(
                 (source["metadata"].get("annotations") or {}).get(HOLD_KEY, "")
@@ -258,8 +266,7 @@ def validate_workloads(args, nodes: dict, pods: dict, controller: dict, daemonse
         if pod["spec"].get("nodeName") != args.node_name:
             continue
         require(
-            source is not None
-            and pod["metadata"].get("namespace") == "kube-system"
+            pod["metadata"].get("namespace") == "kube-system"
             and not any("persistentVolumeClaim" in volume for volume in pod["spec"].get("volumes", []))
             and any(
                 owner.get("controller") is True and owner.get("kind") == "DaemonSet"
@@ -270,6 +277,10 @@ def validate_workloads(args, nodes: dict, pods: dict, controller: dict, daemonse
         )
     return {
         "source": source,
+        "source_pod_references": sorted(
+            f"{pod['metadata']['namespace']}/{pod['metadata']['name']}"
+            for pod in pod_rows if pod["spec"].get("nodeName") == args.node_name
+        ),
         "kwok_uids": fake_nodes,
         "agent_uids": {name: pod["metadata"]["uid"] for name, pod in agents.items()},
         "real_node_names": sorted(
@@ -338,7 +349,7 @@ def execute_retirement(args, summary: dict, runner=workers.run_command) -> None:
             "--request-timeout=45s",
         ]
 
-        def workloads():
+        def workloads(*, observe_retirement=False):
             nodes = read(prefix + ["get", "nodes", "-o", "json"])
             provider_scope = (
                 f"/subscriptions/{args.expected_subscription}/resourceGroups/"
@@ -374,6 +385,16 @@ def execute_retirement(args, summary: dict, runner=workers.run_command) -> None:
                     "kwok-node", "-o", "json",
                 ]),
                 read(prefix + ["-n", "kube-system", "get", "daemonsets", "-o", "json"]),
+                observe_retirement=observe_retirement,
+            )
+
+        def source_removed(snapshot):
+            if snapshot["source"] is not None or snapshot["source_pod_references"]:
+                return False
+            containers = read(prefix + ["get", "nnc", "-A", "-o", "json"])
+            return all(
+                row["metadata"]["name"] != args.node_name
+                for row in mocks._items(containers, "network-container inventory")
             )
 
         def cilium_runner(command, timeout):
@@ -443,6 +464,21 @@ def execute_retirement(args, summary: dict, runner=workers.run_command) -> None:
                 and identity[1] in pool_state.instance_ids,
                 "Source worker is not an exact live instance of the selected pool",
             )
+            summary["source_instance_id"] = identity[1]
+        else:
+            baseline = before
+            while not source_removed(before):
+                require(
+                    time.monotonic() < deadline,
+                    "Previously retired worker still has garbage-collection references",
+                )
+                time.sleep(min(15, max(0, deadline - time.monotonic())))
+                before = workloads(observe_retirement=True)
+                require(
+                    before["kwok_uids"] == baseline["kwok_uids"]
+                    and before["agent_uids"] == baseline["agent_uids"],
+                    "Workload identities changed while observing retirement cleanup",
+                )
         prove_peers(before, "cilium_before")
         summary["before"] = workers.state_to_dict(state)
         summary["pool_configuration_before"] = pool_configuration(pool_before)
@@ -451,15 +487,6 @@ def execute_retirement(args, summary: dict, runner=workers.run_command) -> None:
         }
         summary["status"] = "prepared" if exists else "already-absent"
         save()
-        if not exists:
-            containers = read(prefix + ["get", "nnc", "-A", "-o", "json"])
-            require(
-                all(
-                    row["metadata"]["name"] != args.node_name
-                    for row in mocks._items(containers, "network-container inventory")
-                ),
-                "Absent source worker still has a network-container record",
-            )
         if not exists or not args.execute:
             summary["success"] = True
             return
@@ -503,20 +530,30 @@ def execute_retirement(args, summary: dict, runner=workers.run_command) -> None:
                 current_pool.get("count") == TARGET_POOL_COUNT
                 and current_pool.get("provisioningState") == "Succeeded"
             ):
-                after = workloads()
-                if after["source"] is None:
-                    containers = read(prefix + ["get", "nnc", "-A", "-o", "json"])
-                    if all(
-                        row["metadata"]["name"] != args.node_name
-                        for row in mocks._items(containers, "network-container inventory")
-                    ):
-                        break
+                after = workloads(observe_retirement=True)
+                summary["pending_source_pod_references"] = after["source_pod_references"]
+                save()
+                if source_removed(after):
+                    break
             time.sleep(min(15, max(0, deadline - time.monotonic())))
         else:
             raise workers.ReconcileError("Prepared-worker retirement did not converge")
         final_state = workers.probe_cluster(cluster, run, 45)
         final_pool = validate_pool_state(final_state, args.node_name, False)
         prove_instances(final_pool)
+        require(
+            summary["source_instance_id"] not in final_pool.instance_ids,
+            "The retired source instance is still present in the VMSS",
+        )
+        final_configuration = az(*pool_args)
+        require(
+            final_configuration.get("count") == TARGET_POOL_COUNT
+            and final_configuration.get("provisioningState") == "Succeeded"
+            and (final_configuration.get("powerState") or {}).get("code") == "Running"
+            and pool_configuration(final_configuration) == pool_configuration(pool_before),
+            "Final pool configuration changed during retirement cleanup",
+        )
+        summary["last_pool"] = final_configuration
         require(
             after["kwok_uids"] == before["kwok_uids"]
             and after["agent_uids"] == before["agent_uids"],

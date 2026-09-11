@@ -52,6 +52,7 @@ at the bottom for the explicit scope statement.
 | `n100_worker_wave_budget_underflow` | n=100 outer scenario timeout expires before all nine 12-worker waves complete, or before the 5900s propagation host bound | true | scenario-specific | size large-tier budgets from successful n=2 per-wave timings, cap each wave worker separately, and use a 36h suite / 42h job inside the 48h lease | 73076, 74774 |
 | `aks_managed_clusters_quota_exhausted` | AKS create returns `QuotaExceeded` with `Maximum allowed`, `Current usage`, and `Additional requested` for managed clusters | false for current run | n/a | query the regional `ManagedClusters` usage before Terraform and require the full cluster count plus reserved headroom; choose another qualified region or raise quota | 74819 |
 | `fleet_apiserver_unavailable` | ClusterMeshProfile is `Succeeded` and Deployment/Service objects exist, but Deployment `Available=False` until the formation timeout | true at small N | half formation budget | treat non-Available the same as missing, capture pod/deployment/events, and run bounded profile delete/recreate at small N; large N uses surgical member rejoin | 74894 |
+| `preserved_failed_pool_live_peer_blocked` | Failed/Running pool reconciliation is blocked by an exact-name Cilium peer that is connected but has no retrieved configuration while Fleet remains Connected | one bounded member-repair attempt | 18000 | require full preserved n=100 authority, repair bounded Fleet peers before pool proof, then retain all original pool gates | 79742 |
 | `vmextension_error_k_*` | `VMExtensionError_K[A-Za-z]+` (kubelet/CRI failures) | false | n/a | abort + dump CSE logs; non-retryable | 68700 |
 
 ---
@@ -220,6 +221,96 @@ at the bottom for the explicit scope statement.
 
 **Linked builds**
 - 68700
+
+---
+
+### `preserved_failed_pool_live_peer_blocked`
+
+The early preserved ARM reconciler runs before the later live-overlay repair
+step. A stale directed peer can therefore block a failed pool's all-agent
+Cilium proof before the established recovery is reached. In build 79742,
+`mesh-60` had all 99 expected remote names but only 98 ready peers on each
+of its three real agents; remote name `mesh-5353` maps to Fleet role `mesh-53`,
+not to a role inferred from the remote name.
+
+For `resume-existing` with exactly 100 clusters, the resume job enables
+`--live-overlay-repair-enabled` only inside the existing ARM reconciliation,
+failed-pool repair, Fleet and live-data-plane repair enablement. It does no full-fleet
+work when there are no failed pools. Set
+`CLUSTERMESH_DEBUG_EARLY_LIVE_OVERLAY_REPAIR_ENABLED=false` to opt out; the
+original strict pool health gate still applies.
+
+For an explicit repair-only run on that same stage, set
+`scaleDebugArmRepairOnly=true`. It executes the shared
+`reconcile-preserved-arm.yml` through the normal service connection without
+attempting data-path smoke, mock handoff, CL2, or workload telemetry. It does
+not certify workload readiness, and it cannot be combined with
+`scaleDebugPreparedRetirementOnly`. Normal resume behavior remains the default
+when both maintenance flags are false.
+
+Before any early Fleet mutation, this path requires the preserved subscription,
+RG, region, tfvars digest and exact AKS ownership inventory; all 100 owned
+managed RGs with leases at least as long as the parent; a parent lease covering
+the recovery budget; and the exact idle, selected, Connected Fleet/profile
+membership. It obtains all 100 kubeconfigs through the normal service connection
+and runs the existing full-agent probe (5 attempts, 30-second retry/command
+limits, concurrency 10). Unreadable agents, partial inventory, authorization
+failures, or mismatched live/Fleet identities cannot authorize mutation, even if
+the probe emits repair roles.
+
+Only bounded drift invokes `repair-existing-fleet-overlay.sh`, once, with its
+existing selector-label rejoin and apply safeguards. The hard role ceiling is
+20; `--live-overlay-max-repair-roles` uses
+`CLUSTERMESH_DEBUG_MAX_REPAIR_MEMBERS` (default 20). A full postprobe uses 40
+attempts and must return healthy with the same identities. Inventory, leases
+and idle Fleet authority are reread around repair (also after an initially
+healthy probe). Latest provider operations for failed clusters/pools and selected
+repair members must be readable and terminal; stale-addon failure gates are
+rechecked before subsequent cluster ARM updates. A failed repair still gets
+read-only postproof when time remains, but can never be treated as successful.
+There are no local Cilium, apiserver or kvstoremesh restarts or overlay resets.
+
+`--live-overlay-timeout-seconds` uses
+`CLUSTERMESH_DEBUG_EARLY_LIVE_OVERLAY_TIMEOUT_SECONDS` (default 18000) as one
+shared early-phase deadline. Child commands receive TERM at the remaining
+deadline and have a bounded 300-second cleanup grace. Timeout/failure can leave
+a provider operation active; the phase stops rather than retrying a rejoin or
+starting pool updates. Missing or short leases fail closed here; lease extension
+remains in the established lifecycle path.
+
+Original probe JSON, selected roles, complete child logs, authority snapshots
+and postproof remain under a unique `live-overlay-*` directory alongside
+`aks-arm-reconcile.json` in the existing
+`n100-aks-arm-reconcile-<build>-<attempt>` artifact, including on failure.
+Kubeconfigs stay in a separate temporary directory and are not published.
+After recovery, the original exact worker/VMSS count, readiness, all-agent
+Cilium coverage, configuration-drift and final-count gates still run. A
+no-option pool update is **not harmless marker clearing**: it can resume a
+node-image upgrade and drain workers, and PDB/provider failures stop the phase
+once a pool update has started.
+
+ARM `Succeeded`, a current node image, or a healthy Fleet overlay does not
+certify mock or addon availability. Pending or ContainerCreating Pods can
+coexist with those states because of separate Azure CNI failures. This recovery
+does not repair those physical/CNI conditions or bypass the existing
+mock-readiness and workload gates. Pool post-update worker and Cilium health
+proofs remain mandatory even after ARM reaches `Succeeded`.
+
+### `retired_worker_pod_gc_pending`
+
+An accepted worker retirement can reach the exact target count and remove the
+Kubernetes Node before its old DaemonSet Pods disappear. Build 79753 reached
+default count three/Succeeded, but its original post-check mistook these
+temporary Pod references for an unsafe pre-drain state.
+
+The prepared-retirement helper now distinguishes strict pre-mutation readiness
+from bounded post-removal observation. It waits for the original Node, all
+verified source Pod references, and its network-container record to disappear;
+it does not delete lingering Pods or repeat the cloud retirement. A terminating
+source is acceptable only during observation, with the same pinned UID and
+repair ownership. Final worker count, VMSS instance absence, pool configuration,
+unchanged mock/KWOK identities, and full Cilium peer proof remain mandatory.
+An already absent source can be certified without another mutation.
 
 ---
 

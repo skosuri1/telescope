@@ -280,7 +280,10 @@ def test_unsafe_workload_or_drain_state_is_rejected(args, fault):
 @pytest.fixture(name="backend")
 def retirement_backend(args, monkeypatch):
     group, clusters, members = scope_data(args)
-    state = SimpleNamespace(deleted=False, denied=False, fail_final_peers=False, calls=[])
+    state = SimpleNamespace(
+        deleted=False, denied=False, fail_final_peers=False, calls=[],
+        orphan_pod_reads=0, terminating_node_reads=0, clock=0.0,
+    )
     node_group = {
         "managedBy": clusters[37]["id"], "location": args.expected_region,
         "tags": {"deletion_due_time": group["tags"]["deletion_due_time"]},
@@ -322,6 +325,18 @@ def retirement_backend(args, monkeypatch):
         if command[0] == "kubectl":
             kind = command[command.index("get") + 1]
             data = workload_data(args, deleted=state.deleted)
+            if state.deleted and kind == "nodes" and state.terminating_node_reads:
+                state.terminating_node_reads -= 1
+                source = next(
+                    row for row in workload_data(args)[0]["items"]
+                    if row["metadata"]["name"] == SOURCE
+                )
+                source["metadata"]["deletionTimestamp"] = "2026-09-01T00:00:00Z"
+                source["status"]["conditions"][0]["status"] = "False"
+                data[0]["items"].append(source)
+            if state.deleted and kind == "pods" and state.orphan_pod_reads:
+                state.orphan_pod_reads -= 1
+                data[1]["items"].append(workload_data(args)[1]["items"][-1])
             if kind == "nnc":
                 return '{"items":[]}'
             return json.dumps(data[{"nodes": 0, "pods": 1, "statefulset": 2, "daemonsets": 3}[kind]])
@@ -340,6 +355,10 @@ def retirement_backend(args, monkeypatch):
 
     monkeypatch.setattr(retirement.workers, "probe_cluster", lambda *_: pool_state(state.deleted))
     monkeypatch.setattr(retirement.cilium, "probe", peer_proof)
+    monkeypatch.setattr(retirement.time, "monotonic", lambda: state.clock)
+    monkeypatch.setattr(
+        retirement.time, "sleep", lambda seconds: setattr(state, "clock", state.clock + seconds)
+    )
     state.run = run
     return state
 
@@ -368,6 +387,27 @@ def test_already_absent_worker_is_never_deleted_again(args, backend):
     summary = {"success": False, "mutation_started": False}
     retirement.execute_retirement(args, summary, backend.run)
     assert summary["status"] == "already-absent"
+    assert not any("delete-machines" in call for call in backend.calls)
+
+
+def test_post_retirement_waits_for_node_and_daemonset_garbage_collection(args, backend):
+    backend.terminating_node_reads = 1
+    backend.orphan_pod_reads = 3
+    summary = {"success": False, "mutation_started": False, "request_accepted": False}
+    retirement.execute_retirement(args, summary, backend.run)
+    assert summary["success"] and summary["status"] == "retired"
+    assert summary["pending_source_pod_references"] == []
+    assert backend.clock >= 30
+    assert len([call for call in backend.calls if "delete-machines" in call]) == 1
+
+
+def test_idempotent_observation_waits_for_old_daemonset_pods_without_mutation(args, backend):
+    backend.deleted = True
+    backend.orphan_pod_reads = 3
+    summary = {"success": False, "mutation_started": False}
+    retirement.execute_retirement(args, summary, backend.run)
+    assert summary["success"] and summary["status"] == "already-absent"
+    assert backend.clock >= 30
     assert not any("delete-machines" in call for call in backend.calls)
 
 
@@ -441,7 +481,7 @@ def test_pipeline_wires_retirement_before_arm_recovery():
     )
     arm_index = next(
         index for index, step in enumerate(steps)
-        if step.get("displayName") == "Reconcile stale preserved AKS ARM states"
+        if step.get("template", "").endswith("/reconcile-preserved-arm.yml")
     )
     assert retirement_index < arm_index
     pipeline = yaml.safe_load(
@@ -466,7 +506,9 @@ def test_pipeline_wires_retirement_before_arm_recovery():
         "${{ parameters.scaleDebugPreparedRetirementUid }}"
     )
     assert job["jobs"][0]["condition"] == (
-        "and(succeeded(), ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'))"
+        "and(succeeded(), "
+        "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'), "
+        "ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'))"
     )
     retirement_jobs = stage["jobs"][0][
         "${{ if eq(parameters.scaleDebugPreparedRetirementOnly, true) }}"
@@ -476,10 +518,14 @@ def test_pipeline_wires_retirement_before_arm_recovery():
     )
 
 
-def test_maintenance_bootstrap_resolves_vendored_fleet_wheel():
+@pytest.mark.parametrize("job_name", [
+    "clustermesh-prepared-worker-retirement.yml",
+    "clustermesh-arm-repair.yml",
+])
+def test_maintenance_bootstrap_resolves_vendored_fleet_wheel(job_name):
     repository = MODULE_DIR.parents[3]
     maintenance = yaml.safe_load(
-        (repository / "jobs/clustermesh-prepared-worker-retirement.yml")
+        (repository / "jobs" / job_name)
         .read_text(encoding="utf-8")
     )
     setup = yaml.safe_load(

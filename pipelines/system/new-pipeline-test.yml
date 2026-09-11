@@ -70,6 +70,9 @@ parameters:
   - name: scaleDebugPreparedRetirementOnly
     type: boolean
     default: false
+  - name: scaleDebugArmRepairOnly
+    type: boolean
+    default: false
   - name: scaleDebugLeaseExtensionHours
     type: number
     default: 168
@@ -2937,6 +2940,7 @@ stages:
     displayName: "DEBUG scale resume preserved AKS clusters"
     variables:
       CLUSTERMESH_PREPARED_RETIREMENT_ONLY: ${{ parameters.scaleDebugPreparedRetirementOnly }}
+      CLUSTERMESH_ARM_REPAIR_ONLY: ${{ parameters.scaleDebugArmRepairOnly }}
       AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       CLUSTERMESH_REQUIRED_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
       MOCK_ACR_HOST: mockmeshshared11225.azurecr.io
@@ -3052,6 +3056,15 @@ stages:
               retirement_role: ${{ parameters.scaleDebugPreparedRetirementRole }}
               retirement_node: ${{ parameters.scaleDebugPreparedRetirementNode }}
               retirement_uid: ${{ parameters.scaleDebugPreparedRetirementUid }}
+      - ${{ if eq(parameters.scaleDebugArmRepairOnly, true) }}:
+          - template: /jobs/clustermesh-arm-repair.yml
+            parameters:
+              target_run_id: ${{ parameters.debugTargetRunId }}
+              expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
+              region: ${{ parameters.scaleDebugRegion }}
+              expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
+              tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
+              overlay_mode: ${{ parameters.debugMode }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}
