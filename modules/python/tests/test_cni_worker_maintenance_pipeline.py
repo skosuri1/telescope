@@ -32,6 +32,7 @@ SOURCE_ENV = {
     "RESUME_MANIFEST_JSON": "",
     "RECOVER_EMPTY_FRESH_NODE": "",
     "RECOVER_EMPTY_FRESH_UID": "",
+    "REPLACE_EMPTY_FRESH": "False",
 }
 RESUME_MANIFEST = {
     "schema_version": 1,
@@ -70,6 +71,7 @@ def template(path):
     ({"RECOVER_EMPTY_FRESH_NODE": "fresh-node"}, 1),
     ({"RECOVER_EMPTY_FRESH_UID": "fresh-uid"}, 1),
     ({"RECOVER_EMPTY_FRESH_NODE": "fresh-node", "RECOVER_EMPTY_FRESH_UID": "fresh-uid"}, 1),
+    ({"REPLACE_EMPTY_FRESH": "True"}, 1),
 ])
 def test_job_guard_rejects_incomplete_or_conflicting_modes(overrides, expected):
     script = template(JOB)["jobs"][0]["steps"][0]["script"]
@@ -133,6 +135,7 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
     assert invocation["parameters"]["resume_manifest_json"] == "${{ parameters.scaleDebugCniWorkerResumeManifestJson }}"
     assert invocation["parameters"]["recover_empty_fresh_node"] == "${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshNode }}"
     assert invocation["parameters"]["recover_empty_fresh_uid"] == "${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshUid }}"
+    assert invocation["parameters"]["replace_empty_fresh"] == "${{ parameters.scaleDebugCniWorkerReplaceEmptyFresh }}"
     assert stage["variables"]["CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY"] == (
         "${{ parameters.scaleDebugCniWorkerMaintenanceOnly }}"
     )
@@ -166,7 +169,7 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
     ("empty-inventory", 5, 0),
     ("ambiguous-inventory", 5, 0),
 ])
-@pytest.mark.parametrize("continuation", ["none", "resume", "host"])
+@pytest.mark.parametrize("continuation", ["none", "resume", "host", "replace"])
 def test_real_step_plans_then_executes_with_private_credentials(
     tmp_path, failure, expected, helper_calls, continuation,
 ):
@@ -252,6 +255,11 @@ def test_real_step_plans_then_executes_with_private_credentials(
         else:
             assert "--recover-empty-fresh-node" not in args
             assert "--recover-empty-fresh-uid" not in args
+        if os.environ["REPLACE_EMPTY_FRESH"].lower() == "true":
+            assert "--replace-empty-fresh" in args
+            assert args[args.index("--timeout-seconds") + 1] == "3600"
+        else:
+            assert "--replace-empty-fresh" not in args
         with open(os.environ["FAKE_TRACE"], "a", encoding="utf-8") as handle:
             handle.write(json.dumps(args) + "\\n")
         summary = Path(args[args.index("--summary-file") + 1])
@@ -278,8 +286,9 @@ def test_real_step_plans_then_executes_with_private_credentials(
         "RESUME_BUILD_ID": "42" if resuming else "0",
         "RESUME_MANIFEST_JSON": json.dumps(RESUME_MANIFEST) if resuming else "",
         "RESUME_INPUT_DIRECTORY": str(checkpoint),
-        "RECOVER_EMPTY_FRESH_NODE": "fresh-worker" if continuation == "host" else "",
-        "RECOVER_EMPTY_FRESH_UID": "fresh-uid" if continuation == "host" else "",
+        "RECOVER_EMPTY_FRESH_NODE": "fresh-worker" if continuation in ("host", "replace") else "",
+        "RECOVER_EMPTY_FRESH_UID": "fresh-uid" if continuation in ("host", "replace") else "",
+        "REPLACE_EMPTY_FRESH": "True" if continuation == "replace" else "False",
     }
     result = subprocess.run(
         ["bash", "-c", template(STEP)["steps"][0]["script"]],

@@ -516,6 +516,8 @@ def _validate_pre_scale_state(
     initial_pool_count: int,
     initial_pool_configuration: dict,
     initial_all_real_node_uids: Dict[str, str],
+    *,
+    additional_quarantined_node: str = "",
 ) -> None:
     default_pool = _pool_from_state(cluster_state, DEFAULT_POOL_NAME)
     require(default_pool.desired_count == initial_pool_count, "Default pool count changed before surge submission")
@@ -524,7 +526,9 @@ def _validate_pre_scale_state(
         "Default VMSS or Kubernetes worker state drifted before surge submission",
     )
     require(
-        default_pool.unschedulable_nodes == [args.node_name],
+        default_pool.unschedulable_nodes == sorted(
+            [args.node_name] + ([additional_quarantined_node] if additional_quarantined_node else [])
+        ),
         "Only the explicit source worker may be unschedulable before the surge",
     )
     require(
@@ -593,6 +597,10 @@ def _resume_options(args) -> bool:
     require(
         not any(recovery) or (all(recovery) and bool(values[0])),
         "Empty fresh-host recovery requires both target name/UID and an explicit resume checkpoint",
+    )
+    require(
+        not getattr(args, "replace_empty_fresh", False) or all(recovery),
+        "Empty-worker replacement requires the explicit fresh recovery target and checkpoint",
     )
     return bool(values[0])
 
@@ -733,6 +741,15 @@ def _load_resume(args) -> Optional[dict]:
                     and row.get("ready_probe_ips"),
                     "Only one unqualified fresh worker may undergo host recovery",
                 )
+        if getattr(args, "replace_empty_fresh", False):
+            previous = prior.get("empty_host_recovery") or {}
+            require(
+                previous.get("node_name") == target and previous.get("node_uid") == fresh[target]
+                and previous.get("request_accepted") is True
+                and previous.get("redeploy_completed") is True
+                and previous.get("success") is False and previous.get("cordon_retained") is True,
+                "Replacement requires the exact failed, quarantined post-redeploy target",
+            )
     require(
         isinstance(prior.get("initial_pool_configuration"), dict)
         and prior["initial_pool_configuration"]
@@ -752,16 +769,41 @@ def _load_resume(args) -> Optional[dict]:
     }
 
 
+def _require_failed_host_quarantine(args, nodes, resume) -> None:
+    name = args.recover_empty_fresh_node
+    target = nodes.get(name)
+    previous = resume["prior"]["empty_host_recovery"]
+    source_build = (resume["prior"].get("resume_provenance") or {}).get("source_build_id")
+    expected = f"unqualified-empty-host-recovery build={source_build} uid={args.recover_empty_fresh_uid}"
+    require(
+        target is not None and target["metadata"]["uid"] == args.recover_empty_fresh_uid
+        and previous["node_uid"] == args.recover_empty_fresh_uid
+        and target["spec"].get("unschedulable") is True
+        and _annotations(target).get(EMPTY_HOST_RECOVERY_KEY) == expected
+        and all(
+            isinstance(taint, dict)
+            and {key: value for key, value in taint.items() if key != "timeAdded" and value != ""}
+            == {"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}
+            for taint in _taints(target)
+        ),
+        "Failed empty-host quarantine does not match the original recovery provenance",
+    )
+
+
 def _empty_host_target(operator, args, selected, resume) -> Tuple[dict, str, str, Set[str]]:
     target_name = args.recover_empty_fresh_node
     nodes = _real_node_map(operator.kubectl_json(["get", "nodes", "-o", "json"]))
     target = nodes.get(target_name)
-    require(
-        target is not None and target["metadata"]["uid"] == args.recover_empty_fresh_uid
-        and workers.node_is_ready(target) and not target["spec"].get("unschedulable")
-        and not _taints(target) and EMPTY_HOST_RECOVERY_KEY not in _annotations(target),
-        "The exact empty fresh worker must be Ready, schedulable and unowned by another recovery",
-    )
+    if getattr(args, "replace_empty_fresh", False):
+        _require_failed_host_quarantine(args, nodes, resume)
+        require(workers.node_is_ready(target), "The quarantined replacement target is not Ready")
+    else:
+        require(
+            target is not None and target["metadata"]["uid"] == args.recover_empty_fresh_uid
+            and workers.node_is_ready(target) and not target["spec"].get("unschedulable")
+            and not _taints(target) and EMPTY_HOST_RECOVERY_KEY not in _annotations(target),
+            "The exact empty fresh worker must be Ready, schedulable and unowned by another recovery",
+        )
     _validate_real_node_scope(
         target, subscription=args.expected_subscription,
         node_resource_group=selected["nodeResourceGroup"],
@@ -927,6 +969,179 @@ def _recover_empty_fresh_host(operator, args, selected, initial, resume, summary
     raise workers.ReconcileError("Recovered host did not restore normal scheduling")
 
 
+def _observe_empty_replacement(operator, args, initial, retained, old_name, old_uid):
+    nodes = operator.kubectl_json(["get", "nodes", "-o", "json"])
+    real = _real_node_map(nodes)
+    for name, uid in retained.items():
+        require(
+            name in real and real[name]["metadata"]["uid"] == uid
+            and workers.node_is_ready(real[name])
+            and not real[name]["metadata"].get("deletionTimestamp")
+            and bool(real[name]["spec"].get("unschedulable")) == (name == args.node_name),
+            f"{name}: retained worker identity or health changed during empty replacement",
+        )
+    _require_resume_hold(args, {name: real[name] for name in retained})
+    if old_name in real:
+        require(real[old_name]["metadata"]["uid"] == old_uid, "Failed target UID changed before removal")
+    require(len(set(real) - set(retained)) <= 1, "More than one replacement worker appeared")
+    require(
+        {name: node["metadata"]["uid"] for name, node in _require_exact_kwok_nodes(nodes).items()}
+        == initial["kwok_uids"],
+        "Original KWOK identities changed during empty-worker replacement",
+    )
+    pods = operator.kubectl_json(["get", "pods", "-A", "-o", "json"])
+    agents = _require_exact_agents(pods, initial["controller_uid"])
+    require(
+        {name: pod["metadata"]["uid"] for name, pod in agents.items()} == initial["agent_uids"]
+        and all(mocks._pod_ready(agents[name]) and _readiness_condition_true(agents[name])
+                for name in initial["initial_ready_agent_uids"]),
+        "Original mock agents changed during empty-worker replacement",
+    )
+    return nodes, real, pods
+
+
+def _replace_empty_fresh_host(operator, args, selected, initial, resume, summary) -> None:
+    target, vmss_name, instance_id, _ = _empty_host_target(operator, args, selected, resume)
+    old_name, old_uid = target["metadata"]["name"], target["metadata"]["uid"]
+    original_manifest = resume["manifest"]
+    retained = {
+        name: uid for name, uid in {
+            **original_manifest["original_real_node_uids"], **original_manifest["fresh_node_uids"],
+        }.items() if name != old_name
+    }
+    budget = _phase_budget(
+        operator, maximum_seconds=EMPTY_HOST_RECOVERY_SECONDS,
+        reserve_after_seconds=RETIREMENT_MINIMUM_SECONDS + FINAL_QUALIFICATION_RESERVE_SECONDS,
+        minimum_seconds=args.request_timeout_seconds, description="one empty-worker replacement",
+    )
+    deadline = time.monotonic() + budget
+    record = summary["empty_worker_replacement"] = {
+        "old_node_name": old_name, "old_node_uid": old_uid, "old_instance_id": instance_id,
+        "old_network_container_id": original_manifest["fresh_network_container_ids"][old_name],
+        "delete_attempted": True, "delete_accepted": False,
+        "restore_attempted": False, "restore_accepted": False,
+        "replacement_completed": False, "success": False,
+    }
+    summary["status"] = "removing-unqualified-empty-worker"
+    _save(args.summary_file, summary)
+    operator.run([
+        "az", "aks", "nodepool", "delete-machines", "--resource-group", args.resource_group,
+        "--cluster-name", selected["name"], "--name", DEFAULT_POOL_NAME,
+        "--machine-names", old_name, "--no-wait", "--only-show-errors",
+    ], args.request_timeout_seconds)
+    record["delete_accepted"] = True
+    _save(args.summary_file, summary)
+    while time.monotonic() < deadline:
+        pool = _current_pool_payload(operator, args, selected["name"])
+        require(
+            pool.get("count") in (3, 4)
+            and pool.get("provisioningState") in ("DeletingMachines", "Succeeded")
+            and (pool.get("powerState") or {}).get("code") == "Running"
+            and _pool_configuration(pool) == initial["initial_pool_configuration"],
+            "Pool state or configuration drifted during exact empty-worker removal",
+        )
+        _, real, pods = _observe_empty_replacement(operator, args, initial, retained, old_name, old_uid)
+        require(set(real) <= set(retained) | {old_name}, "An unexpected worker appeared before restoration")
+        nnc = _nnc_map(operator.kubectl_json(["get", "nnc", "-A", "-o", "json"]))
+        removed = old_name not in real and old_name not in nnc and not any(
+            (pod.get("spec") or {}).get("nodeName") == old_name for pod in _items(pods, "target Pod references")
+        )
+        if pool.get("count") == 3 and pool.get("provisioningState") == "Succeeded" and removed:
+            state = workers.probe_cluster(
+                workers.Cluster(selected["name"], args.resource_group, args.role, args.kubeconfig),
+                lambda command, timeout: operator.run(command, timeout), args.request_timeout_seconds,
+            )
+            _validate_pre_scale_state(
+                args, selected, state, pool, operator.kubectl_json(["get", "nodes", "-o", "json"]),
+                3, initial["initial_pool_configuration"], retained,
+            )
+            require(instance_id not in _pool_from_state(state, DEFAULT_POOL_NAME).instance_ids,
+                    "The exact failed VMSS instance remains after machine deletion")
+            record["intermediate_pool_count"] = 3
+            break
+        time.sleep(min(args.poll_seconds, operator.remaining_seconds(args.poll_seconds)))
+    else:
+        raise workers.ReconcileError("The exact failed empty worker did not finish removal")
+    require(time.monotonic() < deadline, "No bounded time remains for replacement capacity")
+    record["restore_attempted"] = True
+    summary["status"] = "restoring-owned-replacement-capacity"
+    _save(args.summary_file, summary)
+    operator.run([
+        "az", "aks", "nodepool", "scale", "--resource-group", args.resource_group,
+        "--cluster-name", selected["name"], "--name", DEFAULT_POOL_NAME,
+        "--node-count", "4", "--no-wait", "--output", "none", "--only-show-errors",
+    ], args.request_timeout_seconds)
+    record["restore_accepted"] = True
+    _save(args.summary_file, summary)
+    observed_new = None
+    while time.monotonic() < deadline:
+        pool = _current_pool_payload(operator, args, selected["name"])
+        require(
+            pool.get("count") in (3, 4)
+            and pool.get("provisioningState") in ("Scaling", "Updating", "Succeeded")
+            and (pool.get("powerState") or {}).get("code") == "Running"
+            and _pool_configuration(pool) == initial["initial_pool_configuration"],
+            "Pool state or configuration drifted during bounded capacity restoration",
+        )
+        nodes, real, _ = _observe_empty_replacement(operator, args, initial, retained, old_name, old_uid)
+        require(old_name not in real, "The retired target reappeared instead of a new worker")
+        candidates = [node for name, node in real.items() if name not in retained]
+        if candidates:
+            new = candidates[0]
+            identity = _node_identity(new)
+            require(observed_new is None or observed_new == identity, "The observed replacement identity changed")
+            observed_new = identity
+            _validate_real_node_scope(new, subscription=args.expected_subscription, node_resource_group=selected["nodeResourceGroup"])
+            provider = workers.provider_identity(new)
+            require(
+                provider is not None and provider[0] == vmss_name and provider[1] != instance_id
+                and mocks._node_pool_name(new) == DEFAULT_POOL_NAME
+                and identity["uid"] not in set(retained.values()) | {old_uid}
+                and identity["image"] == pool.get("nodeImageVersion"),
+                "The new worker is not a distinct instance of the original default pool",
+            )
+            nnc = _nnc_map(operator.kubectl_json(["get", "nnc", "-A", "-o", "json"]))
+            new_name = new["metadata"]["name"]
+            network = nnc.get(new_name)
+            if (
+                pool.get("count") == 4 and pool.get("provisioningState") == "Succeeded"
+                and workers.node_is_ready(new) and not new["spec"].get("unschedulable")
+                and not _taints(new) and network is not None
+                and network["node_uid"] == identity["uid"]
+                and network["network_container_id"] != record["old_network_container_id"]
+            ):
+                state = workers.probe_cluster(
+                    workers.Cluster(selected["name"], args.resource_group, args.role, args.kubeconfig),
+                    lambda command, timeout: operator.run(command, timeout), args.request_timeout_seconds,
+                )
+                _validate_pre_scale_state(
+                    args, selected, state, pool, nodes, 4, initial["initial_pool_configuration"],
+                    {**retained, new_name: identity["uid"]},
+                )
+                manifest = dict(original_manifest)
+                manifest["fresh_node_uids"] = {
+                    name: uid for name, uid in original_manifest["fresh_node_uids"].items() if name != old_name
+                }
+                manifest["fresh_network_container_ids"] = {
+                    name: nc for name, nc in original_manifest["fresh_network_container_ids"].items() if name != old_name
+                }
+                manifest["fresh_node_uids"][new_name] = identity["uid"]
+                manifest["fresh_network_container_ids"][new_name] = network["network_container_id"]
+                resume["manifest"] = manifest
+                resume["replacement_completed"] = True
+                summary["replacement_derived_manifest"] = manifest
+                summary["resume_fresh_network_container_ids"] = manifest["fresh_network_container_ids"]
+                record.update({
+                    "node_name": new_name, "node_uid": identity["uid"], "new_instance_id": provider[1],
+                    "network_container_id": network["network_container_id"],
+                    "replacement_completed": True, "cordon_retained": False, "pool_count": 4,
+                })
+                _save(args.summary_file, summary)
+                return
+        time.sleep(min(args.poll_seconds, operator.remaining_seconds(args.poll_seconds)))
+    raise workers.ReconcileError("Replacement capacity did not return to exactly four healthy workers")
+
+
 def _require_resume_hold(args, nodes: dict) -> None:
     hold = {"key": HOLD_ANNOTATION, "value": HOLD_REASON, "effect": "NoSchedule"}
     cordon = {"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}
@@ -964,21 +1179,29 @@ def _validate_resume_state(
     original = manifest["original_real_node_uids"]
     fresh = manifest["fresh_node_uids"]
     union = {**original, **fresh}
+    replacement_target = (
+        args.recover_empty_fresh_node
+        if getattr(args, "replace_empty_fresh", False) and not resume.get("replacement_completed") else ""
+    )
+    real = _real_node_map(nodes_payload)
+    if replacement_target:
+        _require_failed_host_quarantine(args, real, resume)
     _validate_pre_scale_state(
         args, selected, cluster_state, pool_payload, nodes_payload,
         SURGE_POOL_COUNT, prior["initial_pool_configuration"], union,
+        additional_quarantined_node=replacement_target,
     )
-    real = _real_node_map(nodes_payload)
     require(
         len(_items(nodes_payload, "Node inventory")) == len(real) + 100,
         "Resume Node inventory contains unexpected identities",
     )
-    _require_resume_hold(args, real)
+    _require_resume_hold(args, {name: node for name, node in real.items() if name != replacement_target})
     for name, node in real.items():
         require(
             workers.node_is_ready(node)
             and not (node.get("metadata") or {}).get("deletionTimestamp")
-            and bool((node.get("spec") or {}).get("unschedulable")) == (name == args.node_name),
+            and bool((node.get("spec") or {}).get("unschedulable"))
+            == (name in {args.node_name, replacement_target}),
             f"{name}: resume real worker health or scheduling state changed",
         )
     default_pool = _pool_from_state(cluster_state, DEFAULT_POOL_NAME)
@@ -2820,6 +3043,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--resume-manifest", default="")
     parser.add_argument("--recover-empty-fresh-node", default="")
     parser.add_argument("--recover-empty-fresh-uid", default="")
+    parser.add_argument("--replace-empty-fresh", action="store_true")
     args = parser.parse_args(argv)
     try:
         if _resume_options(args):
@@ -3051,7 +3275,12 @@ def execute_maintenance(
 
         if resume and getattr(args, "recover_empty_fresh_node", ""):
             summary["mutation_started"] = True
-            _recover_empty_fresh_host(operator, args, selected, initial, resume, summary)
+            if getattr(args, "replace_empty_fresh", False):
+                _replace_empty_fresh_host(operator, args, selected, initial, resume, summary)
+                pool_payload = _current_pool_payload(operator, args, cluster_name)
+                nodes_payload = operator.kubectl_json(["get", "nodes", "-o", "json"])
+            else:
+                _recover_empty_fresh_host(operator, args, selected, initial, resume, summary)
             startup = _startup_operator(operator)
 
         baseline_config = initial["initial_pool_configuration"]
@@ -3133,6 +3362,10 @@ def execute_maintenance(
         if summary.get("empty_host_recovery"):
             summary["empty_host_recovery"]["success"] = True
             summary["empty_host_recovery"]["ip_growth_verified"] = True
+            _save(args.summary_file, summary)
+        if summary.get("empty_worker_replacement"):
+            summary["empty_worker_replacement"]["success"] = True
+            summary["empty_worker_replacement"]["ip_growth_verified"] = True
             _save(args.summary_file, summary)
         require(
             not mocks._tolerates(
@@ -3348,8 +3581,8 @@ def execute_maintenance(
             operator.cleanup_mode = True
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        host_recovery = summary.get("empty_host_recovery") or {}
-        if operator is not None and host_recovery.get("redeploy_completed") \
+        host_recovery = summary.get("empty_host_recovery") or summary.get("empty_worker_replacement") or {}
+        if operator is not None and (host_recovery.get("redeploy_completed") or host_recovery.get("replacement_completed")) \
                 and not host_recovery.get("success") and not host_recovery.get("cordon_retained"):
             try:
                 target = operator.kubectl_json(

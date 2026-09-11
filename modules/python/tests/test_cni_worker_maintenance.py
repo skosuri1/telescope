@@ -680,7 +680,10 @@ class Backend:
                     failed_instance_ids=[],
                     node_instance_ids=sorted(name[-1] for name in self.current_default_nodes()),
                     ready_instance_ids=sorted(name[-1] for name in self.current_default_nodes()),
-                    unschedulable_nodes=[SOURCE] if self.nodes.get(SOURCE, {}).get("spec", {}).get("unschedulable") else [],
+                    unschedulable_nodes=sorted(
+                        name for name, row in self.nodes.items()
+                        if row.get("spec", {}).get("unschedulable")
+                    ),
                     stale_instance_ids=[],
                 ),
                 prom_pool_state(),
@@ -1408,6 +1411,165 @@ def test_empty_host_recovery_requires_real_ip_growth_after_redeploy(args, monkey
     assert summary["empty_host_recovery"]["cordon_retained"] is True
     assert backend.nodes[FRESH_B]["spec"]["unschedulable"] is True
     assert summary["success"] is False and not summary["probe_cleanup_pending"]
+
+
+def prepare_empty_replacement(args, monkeypatch):
+    backend, prior, manifest, original_runner, _ = prepare_empty_host_recovery(args, monkeypatch)
+    args.replace_empty_fresh = True
+    prior["resume_provenance"] = {"source_build_id": 79800}
+    prior["empty_host_recovery"] = {
+        "node_name": FRESH_B, "node_uid": manifest["fresh_node_uids"][FRESH_B],
+        "request_accepted": True, "redeploy_completed": True,
+        "success": False, "cordon_retained": True,
+    }
+    Path(args.resume_summary).write_text(json.dumps(prior), encoding="utf-8")
+    backend.nodes[FRESH_B]["spec"]["unschedulable"] = True
+    backend.nodes[FRESH_B]["metadata"]["annotations"][maintenance.EMPTY_HOST_RECOVERY_KEY] = (
+        f"unqualified-empty-host-recovery build=79800 uid={args.recover_empty_fresh_uid}"
+    )
+    replacement_name = f"{VMSS}000005"
+    operations = {"deletes": [], "restores": [], "restored": False}
+    original_new_nodes = backend.expected_new_nodes
+    monkeypatch.setattr(
+        backend, "expected_new_nodes",
+        lambda: [FRESH_A, replacement_name] if operations["restored"] else original_new_nodes(),
+    )
+
+    def runner(command, timeout):
+        if command[:4] == ["az", "aks", "nodepool", "delete-machines"]:
+            assert command[command.index("--machine-names") + 1] == FRESH_B
+            operations["deletes"].append(command)
+            del backend.nodes[FRESH_B]
+            del backend.nnc[FRESH_B]
+            return ""
+        if command[:4] == ["az", "aks", "nodepool", "scale"]:
+            assert len(backend.nodes) == 3
+            assert command[command.index("--node-count") + 1] == "4"
+            operations["restores"].append(command)
+            operations["restored"] = True
+            backend.add_fresh_nodes()
+            backend.probe_growth[replacement_name] = True
+            return ""
+        assert command[:2] != ["az", "rest"], "Replacement must not repeat redeployment"
+        return original_runner(command, timeout)
+
+    return backend, prior, manifest, runner, operations, replacement_name
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_empty_replacement_preserves_workloads_and_never_exceeds_four(args, monkeypatch, execute):
+    backend, _, original_manifest, runner, operations, replacement_name = prepare_empty_replacement(args, monkeypatch)
+    args.execute = execute
+    summary = {}
+    maintenance.execute_maintenance(args, summary, runner)
+    assert summary["success"] is True
+    assert len(operations["deletes"]) == len(operations["restores"]) == int(execute)
+    if execute:
+        replacement = summary["empty_worker_replacement"]
+        assert replacement["intermediate_pool_count"] == 3 and replacement["pool_count"] == 4
+        assert replacement["replacement_completed"] is True and replacement["ip_growth_verified"] is True
+        assert replacement["node_name"] == replacement_name
+        assert FRESH_B not in summary["replacement_derived_manifest"]["fresh_node_uids"]
+        assert summary["replacement_derived_manifest"]["original_real_node_uids"] == original_manifest["original_real_node_uids"]
+        assert backend.retirement_calls == 1 and len(backend.nodes) == 3
+        assert SOURCE not in backend.nodes and FRESH_B not in backend.nodes
+        assert not summary["probe_cleanup_pending"] and not summary["cleanup_errors"]
+    else:
+        assert_no_mutations(backend)
+
+
+@pytest.mark.parametrize("drift", ["missing-failed-host", "successful-host", "wrong-quarantine", "target-workload"])
+def test_empty_replacement_refuses_unproven_or_nonempty_target(args, monkeypatch, drift):
+    backend, prior, _, runner, operations, _ = prepare_empty_replacement(args, monkeypatch)
+    if drift == "missing-failed-host":
+        prior.pop("empty_host_recovery")
+    elif drift == "successful-host":
+        prior["empty_host_recovery"]["success"] = True
+    elif drift == "wrong-quarantine":
+        backend.nodes[FRESH_B]["metadata"]["annotations"][maintenance.EMPTY_HOST_RECOVERY_KEY] = "foreign"
+    else:
+        original = backend.build_all_pods
+        monkeypatch.setattr(backend, "build_all_pods", lambda: {
+            "items": original()["items"] + [cilium_operator_pod(FRESH_B)],
+        })
+    Path(args.resume_summary).write_text(json.dumps(prior), encoding="utf-8")
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, {}, runner)
+    assert not operations["deletes"] and not operations["restores"]
+    assert not backend.deleted_agents
+
+
+def test_empty_replacement_does_not_restore_before_confirmed_removal(args, monkeypatch):
+    backend, _, _, runner, operations, _ = prepare_empty_replacement(args, monkeypatch)
+    monkeypatch.setattr(maintenance, "EMPTY_HOST_RECOVERY_SECONDS", 2)
+
+    def not_removed(command, timeout):
+        if command[:4] == ["az", "aks", "nodepool", "delete-machines"]:
+            operations["deletes"].append(command)
+            return ""
+        return runner(command, timeout)
+
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError, match="finish removal"):
+        maintenance.execute_maintenance(args, summary, not_removed)
+    assert len(operations["deletes"]) == 1 and not operations["restores"]
+    assert not backend.deleted_agents and summary["success"] is False
+
+
+def test_empty_replacement_restore_failure_never_deletes_a_retained_worker(args, monkeypatch):
+    backend, _, _, runner, operations, _ = prepare_empty_replacement(args, monkeypatch)
+
+    def restore_denied(command, timeout):
+        if command[:4] == ["az", "aks", "nodepool", "scale"]:
+            raise maintenance.workers.ReconcileError("AuthorizationFailed restoring capacity")
+        return runner(command, timeout)
+
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError, match="AuthorizationFailed"):
+        maintenance.execute_maintenance(args, summary, restore_denied)
+    assert len(operations["deletes"]) == 1 and len(backend.nodes) == 3
+    assert SOURCE in backend.nodes and OLD_A in backend.nodes and FRESH_A in backend.nodes
+    assert not backend.deleted_agents
+    assert summary["empty_worker_replacement"]["delete_accepted"] is True
+    assert summary["empty_worker_replacement"]["restore_accepted"] is False
+
+
+def test_empty_replacement_requires_new_network_container(args, monkeypatch):
+    backend, _, manifest, runner, operations, replacement_name = prepare_empty_replacement(args, monkeypatch)
+    monkeypatch.setattr(maintenance, "EMPTY_HOST_RECOVERY_SECONDS", 3)
+
+    def reused_network(command, timeout):
+        result = runner(command, timeout)
+        if command[:4] == ["az", "aks", "nodepool", "scale"]:
+            backend.nnc[replacement_name]["id"] = manifest["fresh_network_container_ids"][FRESH_B]
+        return result
+
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError, match="Replacement capacity"):
+        maintenance.execute_maintenance(args, summary, reused_network)
+    assert len(operations["deletes"]) == len(operations["restores"]) == 1
+    assert not backend.deleted_agents and summary["success"] is False
+
+
+def test_empty_replacement_still_requires_functional_new_ips(args, monkeypatch):
+    backend, _, _, runner, operations, replacement_name = prepare_empty_replacement(args, monkeypatch)
+    monkeypatch.setattr(maintenance, "IP_GROWTH_WAIT_SECONDS", 3)
+
+    def no_new_ips(command, timeout):
+        result = runner(command, timeout)
+        if command[:4] == ["az", "aks", "nodepool", "scale"]:
+            backend.probe_growth[replacement_name] = False
+        return result
+
+    summary = {}
+    with pytest.raises(maintenance.workers.ReconcileError):
+        maintenance.execute_maintenance(args, summary, no_new_ips)
+    assert len(operations["deletes"]) == len(operations["restores"]) == 1
+    assert not backend.deleted_agents
+    assert summary["empty_worker_replacement"]["replacement_completed"] is True
+    assert summary["empty_worker_replacement"]["success"] is False
+    assert summary["empty_worker_replacement"]["cordon_retained"] is True
+    assert backend.nodes[replacement_name]["spec"]["unschedulable"] is True
 
 
 @pytest.mark.parametrize("legacy", [False, True])

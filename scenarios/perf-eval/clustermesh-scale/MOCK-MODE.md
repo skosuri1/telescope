@@ -268,6 +268,24 @@ original checkpoint and manifest. They cannot select an original worker or a
 fresh worker whose prior IP qualification succeeded. All ordinary capacity,
 healthy-source evacuation, ownership and cleanup limits remain unchanged.
 
+If that exact empty worker remains IP-unqualified after a completed redeploy,
+`--replace-empty-fresh` (pipeline
+`scaleDebugCniWorkerReplaceEmptyFresh=true`) selects one explicitly recorded
+replacement, not another redeploy. It requires the failed post-redeploy
+checkpoint, its original UID manifest and the matching retained quarantine.
+The target must still contain only owned kube-system DaemonSet Pods and no mock
+agents or PVCs. Original and already qualified workers remain protected.
+
+Replacement deletes only the named failed machine, observes its VM, Node, Pod
+references and network container disappear at count three, then submits one
+restoration to four. It never requests five or uses an arbitrary scale-down.
+Exactly one distinct new instance, Node UID and network-container ID must appear;
+the derived manifest and identity transition are persisted without rewriting the
+input evidence. Real IP qualification and the original source evacuation and
+retirement still follow. The pipeline uses a bounded 60-minute helper budget for
+this explicit path, retaining the existing per-phase and cleanup limits. A
+failed or ambiguous request is recorded rather than retried automatically.
+
 The maintenance-only job obtains private, job-local credentials, runs the
 read-only plan, then invokes the same helper with `--execute` and fresh proof.
 Credentials are removed on exit and are never included in the

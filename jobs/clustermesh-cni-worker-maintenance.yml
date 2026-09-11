@@ -35,6 +35,9 @@ parameters:
   - name: recover_empty_fresh_uid
     type: string
     default: ""
+  - name: replace_empty_fresh
+    type: boolean
+    default: false
 
 jobs:
   - job: cni_worker_maintenance
@@ -82,6 +85,12 @@ jobs:
             echo "Empty-host recovery requires an explicit fresh node/UID and original checkpoint." >&2
             exit 1
           fi
+          if [ "${REPLACE_EMPTY_FRESH,,}" = "true" ] &&
+            { [ -z "$RECOVER_EMPTY_FRESH_NODE" ] || [ -z "$RECOVER_EMPTY_FRESH_UID" ] ||
+              [ "$RESUME_BUILD_ID" = "0" ]; }; then
+            echo "Empty-worker replacement requires its failed-host checkpoint and explicit target." >&2
+            exit 1
+          fi
         displayName: "Require one explicit existing-n100 CNI source"
         env:
           EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
@@ -98,6 +107,7 @@ jobs:
           RESUME_MANIFEST_JSON: ${{ parameters.resume_manifest_json }}
           RECOVER_EMPTY_FRESH_NODE: ${{ parameters.recover_empty_fresh_node }}
           RECOVER_EMPTY_FRESH_UID: ${{ parameters.recover_empty_fresh_uid }}
+          REPLACE_EMPTY_FRESH: "${{ parameters.replace_empty_fresh }}"
 
       - template: /steps/setup-tests.yml
         parameters:
@@ -136,3 +146,4 @@ jobs:
           resume_manifest_json: ${{ parameters.resume_manifest_json }}
           recover_empty_fresh_node: ${{ parameters.recover_empty_fresh_node }}
           recover_empty_fresh_uid: ${{ parameters.recover_empty_fresh_uid }}
+          replace_empty_fresh: ${{ parameters.replace_empty_fresh }}

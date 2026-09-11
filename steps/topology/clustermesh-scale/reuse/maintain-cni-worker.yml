@@ -31,6 +31,9 @@ parameters:
   - name: recover_empty_fresh_uid
     type: string
     default: ""
+  - name: replace_empty_fresh
+    type: boolean
+    default: false
 
 steps:
   - script: |
@@ -58,6 +61,12 @@ steps:
         { [ -z "$RECOVER_EMPTY_FRESH_NODE" ] || [ -z "$RECOVER_EMPTY_FRESH_UID" ] ||
           [ "$RESUME_BUILD_ID" = "0" ]; }; then
         echo "Empty-host recovery requires an explicit fresh node/UID and original checkpoint." >&2
+        exit 1
+      fi
+      if [ "${REPLACE_EMPTY_FRESH,,}" = "true" ] &&
+        { [ -z "$RECOVER_EMPTY_FRESH_NODE" ] || [ -z "$RECOVER_EMPTY_FRESH_UID" ] ||
+          [ "$RESUME_BUILD_ID" = "0" ]; }; then
+        echo "Empty-worker replacement requires its failed-host checkpoint and explicit target." >&2
         exit 1
       fi
       summary_dir="$ARTIFACT_STAGING_DIRECTORY/n100-cni-worker-maintenance"
@@ -126,6 +135,9 @@ steps:
           --recover-empty-fresh-uid "$RECOVER_EMPTY_FRESH_UID"
         )
       fi
+      if [ "${REPLACE_EMPTY_FRESH,,}" = "true" ]; then
+        common+=(--replace-empty-fresh --timeout-seconds 3600)
+      fi
       echo "Qualifying the explicit source with the read-only maintenance plan."
       python3 -u "$helper" "${common[@]}" --summary-file "$summary_dir/plan.json"
       echo "Executing the same bounded single-source maintenance with fresh live proof."
@@ -148,6 +160,7 @@ steps:
       RESUME_INPUT_DIRECTORY: $(Pipeline.Workspace)/n100-cni-worker-resume-${{ parameters.resume_build_id }}
       RECOVER_EMPTY_FRESH_NODE: ${{ parameters.recover_empty_fresh_node }}
       RECOVER_EMPTY_FRESH_UID: ${{ parameters.recover_empty_fresh_uid }}
+      REPLACE_EMPTY_FRESH: "${{ parameters.replace_empty_fresh }}"
       SOURCE_ROOT: $(Pipeline.Workspace)/s
       TFVARS_PATH: ${{ parameters.tfvars_path }}
       ARTIFACT_STAGING_DIRECTORY: $(Build.ArtifactStagingDirectory)

@@ -103,6 +103,9 @@ parameters:
   - name: scaleDebugCniWorkerRecoverEmptyFreshUid
     type: string
     default: ""
+  - name: scaleDebugCniWorkerReplaceEmptyFresh
+    type: boolean
+    default: false
   - name: scaleDebugLeaseExtensionHours
     type: number
     default: 168
@@ -3115,6 +3118,7 @@ stages:
               resume_manifest_json: ${{ parameters.scaleDebugCniWorkerResumeManifestJson }}
               recover_empty_fresh_node: ${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshNode }}
               recover_empty_fresh_uid: ${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshUid }}
+              replace_empty_fresh: ${{ parameters.scaleDebugCniWorkerReplaceEmptyFresh }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}
