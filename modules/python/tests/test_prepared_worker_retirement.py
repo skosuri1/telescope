@@ -420,6 +420,83 @@ def test_authorization_failure_is_not_retried(args, backend):
     assert len([call for call in backend.calls if "delete-machines" in call]) == 1
 
 
+def test_transient_read_timeout_is_reobserved_without_repeating_deletion(args, backend):
+    reads = {"group": 0}
+
+    def transient(command, timeout):
+        if command[:3] == ["az", "group", "show"] and args.resource_group in command:
+            reads["group"] += 1
+            if reads["group"] == 1:
+                raise retirement.workers.ReconcileError("command timed out after 45s: az group show")
+        return backend.run(command, timeout)
+
+    summary = {"success": False, "mutation_started": False, "request_accepted": False}
+    retirement.execute_retirement(args, summary, transient)
+    assert summary["success"] is True and reads["group"] == 2
+    assert len([call for call in backend.calls if "delete-machines" in call]) == 1
+
+
+def test_authorization_failure_on_read_is_never_retried(args, backend):
+    reads = []
+
+    def denied(command, timeout):
+        if command[:3] == ["az", "group", "show"]:
+            reads.append(command)
+            raise retirement.workers.ReconcileError("AuthorizationFailed")
+        return backend.run(command, timeout)
+
+    with pytest.raises(retirement.workers.ReconcileError, match="AuthorizationFailed"):
+        retirement.execute_retirement(args, {"success": False}, denied)
+    assert len(reads) == 1 and not backend.deleted
+
+
+@pytest.mark.parametrize("fault", ["converges", "exhausted", "identity", "foreign", "other-error", "malformed-error"])
+def test_fleet_partial_observation_keeps_all_identity_and_connected_gates(args, backend, fault):
+    observed = {"profile": 0}
+
+    def fleet_reads(command, timeout):
+        initial = command[:4] == ["az", "fleet", "member", "list"]
+        profile = command[:4] == ["az", "fleet", "clustermeshprofile", "list-members"]
+        if not initial and not profile:
+            return backend.run(command, timeout)
+        members = scope_data(args)[2]
+        if profile:
+            observed["profile"] += 1
+        if initial or fault != "converges" or observed["profile"] == 1:
+            members[21]["meshProperties"]["status"] = {
+                "state": "Disconnected", "error": {"code": "PartialConnectivity"},
+            }
+        if fault == "foreign":
+            members[21]["clusterResourceId"] = "foreign"
+        if fault == "identity" and profile:
+            members[21]["meshProperties"]["ciliumProperties"]["name"] = "changed-name"
+        if fault == "other-error":
+            members[21]["meshProperties"]["status"]["error"]["code"] = "ConnectivityTimeout"
+        if fault == "malformed-error":
+            members[21]["meshProperties"]["status"]["error"] = "unreadable"
+        return json.dumps(members)
+
+    summary = {"success": False, "mutation_started": False, "request_accepted": False}
+    if fault == "converges":
+        retirement.execute_retirement(args, summary, fleet_reads)
+        assert summary["success"] is True and observed["profile"] == 2
+        assert summary["initial_unhealthy_fleet_roles"] == ["mesh-22"]
+        assert summary["initial_fleet_members"][21]["meshProperties"]["status"]["state"] != "Connected"
+        assert summary["retirement_fleet_members"][21]["meshProperties"]["status"]["state"] == "Connected"
+        assert len([call for call in backend.calls if "delete-machines" in call]) == 1
+    else:
+        with pytest.raises(retirement.workers.ReconcileError):
+            retirement.execute_retirement(args, summary, fleet_reads)
+        assert not backend.deleted and not summary["mutation_started"]
+        assert summary["initial_fleet_members"]
+        if fault in ("foreign", "other-error", "malformed-error"):
+            assert observed["profile"] == 0
+        if fault == "exhausted":
+            assert observed["profile"] == 4
+        if fault == "identity":
+            assert observed["profile"] == 1
+
+
 def test_failed_final_peer_proof_is_preserved_and_fatal(args, backend):
     backend.fail_final_peers = True
     summary = {"success": False, "mutation_started": False, "request_accepted": False}

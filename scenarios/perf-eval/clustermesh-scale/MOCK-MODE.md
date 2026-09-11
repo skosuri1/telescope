@@ -119,6 +119,14 @@ useful when local permissions prevent finishing an already drained replacement.
 It does not count as a workload run. Diagnostics are published as
 `n100-prepared-worker-retirement-<build>-<attempt>`.
 
+Prepared retirement preserves the initial Fleet member payload and names any
+unhealthy members. Structurally valid `PartialConnectivity` is observed read-only
+through the existing bounded Fleet observer, but every member must actually
+return to Connected with unchanged authoritative identities before retirement.
+Other health errors, foreign identities and exhausted observations remain fatal.
+Transient read timeouts have bounded retries; deletion requests and authorization
+failures are never retried automatically.
+
 ### Planned single-worker CNI maintenance
 
 `cni_worker_maintenance.py` provides the local operator path for one explicitly

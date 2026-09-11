@@ -22,6 +22,7 @@ from typing import Optional, Sequence
 
 import cilium_agent_health as cilium
 import mock_cni_recovery as mocks
+import preserved_aks_arm_reconcile as arm
 import preserved_worker_reconcile as workers
 
 
@@ -33,6 +34,16 @@ VOLATILE_POOL_FIELDS = {
     "count", "eTag", "etag", "powerState", "provisioningState", "status",
     "systemData", "virtualMachineNodesStatus",
 }
+
+class FleetNotConnected(workers.ReconcileError):
+    """Structurally validated membership still has an unhealthy live status."""
+
+    def __init__(self, members, identities):
+        super().__init__(
+            "Fleet members are not Connected: " + ", ".join(row["name"] for row in members)
+        )
+        self.members = members
+        self.identities = identities
 
 
 def require(condition: bool, message: str) -> None:
@@ -113,6 +124,7 @@ def validate_scope(args, group: dict, clusters: list, members: list) -> tuple:
         "Expected exactly 100 existing Fleet members",
     )
     identities = []
+    unhealthy = []
     roles, names, cluster_ids = set(), set(), set()
     fleet_scope = f"{scope}/providers/Microsoft.ContainerService/fleets/clustermesh-flt"
     for member in members:
@@ -131,13 +143,17 @@ def validate_scope(args, group: dict, clusters: list, members: list) -> tuple:
             )
             and member.get("provisioningState") == "Succeeded"
             and (member.get("labels") or {}).get("mesh") == "true"
-            and (mesh.get("status") or {}).get("state") == "Connected"
             and isinstance(name, str) and bool(name) and name not in names
             and isinstance(cluster_id, int) and not isinstance(cluster_id, bool)
             and cluster_id > 0
             and cluster_id not in cluster_ids,
-            "Fleet ownership, live membership, or Cilium identity is not exact",
+            f"{role}: Fleet ownership or Cilium identity is not exact",
         )
+        status = mesh.get("status")
+        require(isinstance(status, dict) and isinstance(status.get("state"), str),
+                f"{role}: Fleet member health is unreadable")
+        if status["state"] != "Connected":
+            unhealthy.append(member)
         roles.add(role)
         names.add(name)
         cluster_ids.add(cluster_id)
@@ -151,6 +167,8 @@ def validate_scope(args, group: dict, clusters: list, members: list) -> tuple:
         and bool(selected.get("nodeResourceGroup")),
         "Selected AKS cluster is not safely quiescent",
     )
+    if unhealthy:
+        raise FleetNotConnected(unhealthy, identities)
     return selected, identities
 
 
@@ -304,7 +322,19 @@ def execute_retirement(args, summary: dict, runner=workers.run_command) -> None:
         return runner(command, min(timeout, remaining))
 
     def read(command):
-        return workers.parse_json(run(command), "prepared retirement")
+        def safe_read(arguments, timeout):
+            try:
+                return run(arguments, timeout)
+            except workers.ReconcileError as error:
+                raise arm.ReconcileError(str(error)) from error
+
+        try:
+            output = arm.run_read_with_retries(
+                command, safe_read, timeout_seconds=45, attempts=3, retry_seconds=5,
+            )
+        except arm.ReconcileError as error:
+            raise workers.ReconcileError(str(error)) from error
+        return workers.parse_json(output, "prepared retirement")
 
     def az(*command):
         return read(["az", *command, "--output", "json", "--only-show-errors"])
@@ -323,7 +353,60 @@ def execute_retirement(args, summary: dict, runner=workers.run_command) -> None:
         "fleet", "member", "list", "--resource-group", args.resource_group,
         "--fleet-name", "clustermesh-flt",
     )
-    selected, identities = validate_scope(args, group, clusters, members)
+    summary["initial_fleet_members"] = members
+    save()
+    try:
+        selected, identities = validate_scope(args, group, clusters, members)
+    except FleetNotConnected as error:
+        summary["initial_unhealthy_fleet_roles"] = [row["name"] for row in error.members]
+        save()
+        require(
+            all(
+                isinstance(row["meshProperties"]["status"].get("error"), dict)
+                and row["meshProperties"]["status"]["error"].get("code") == "PartialConnectivity"
+                for row in error.members
+            ),
+            str(error),
+        )
+        expected_identities = {row["role"]: (row["cluster_name"], row["cluster_id"]) for row in error.identities}
+        observation_args = argparse.Namespace(
+            resource_group=args.resource_group, fleet_name="clustermesh-flt",
+            profile_name="clustermesh-cmp", summary_file=args.summary_file,
+            quiescence_timeout_seconds=max(1, min(180, int(deadline - time.monotonic()))),
+            inventory_attempts=4, inventory_timeout_seconds=45, inventory_retry_seconds=15,
+        )
+        inventory = [
+            arm.Cluster(
+                row["name"], row["tags"]["role"], args.resource_group, row["id"],
+                row["nodeResourceGroup"], row["provisioningState"], row["powerState"]["code"],
+            )
+            for row in clusters
+        ]
+
+        def observe(command, timeout):
+            try:
+                output = run(command, timeout)
+            except workers.ReconcileError as failure:
+                raise arm.ReconcileError(str(failure)) from failure
+            current = workers.parse_json(output, "retirement Fleet reobservation")
+            try:
+                _, current_identities = validate_scope(args, group, clusters, current)
+            except FleetNotConnected as status_error:
+                current_identities = status_error.identities
+            require(
+                {row["role"]: (row["cluster_name"], row["cluster_id"]) for row in current_identities}
+                == expected_identities,
+                "Fleet identities changed during read-only Connected observation",
+            )
+            return output
+
+        try:
+            members = arm.read_connected_fleet_members(
+                observation_args, inventory, summary, observe, phase="retirement",
+            )
+        except arm.ReconcileError as failure:
+            raise workers.ReconcileError(str(failure)) from failure
+        selected, identities = validate_scope(args, group, clusters, members)
     node_group = az("group", "show", "--name", selected["nodeResourceGroup"])
     require(
         resource_equal(node_group.get("managedBy"), selected["id"])
