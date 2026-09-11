@@ -119,6 +119,41 @@ useful when local permissions prevent finishing an already drained replacement.
 It does not count as a workload run. Diagnostics are published as
 `n100-prepared-worker-retirement-<build>-<attempt>`.
 
+### Planned single-worker CNI maintenance
+
+`cni_worker_maintenance.py` provides the local operator path for one explicitly
+identified default worker with UID-matched Azure CNI exhaustion evidence. Its
+default mode only validates a plan; add `--execute` to perform maintenance.
+Supply the preserved scope and tfvars fingerprint, the role, source Node name
+and UID, exact provider ID and network-container ID, and a private kubeconfig:
+
+```bash
+python3 modules/python/clusterloader2/clustermesh-scale/cni_worker_maintenance.py \
+  --resource-group "$RUN_ID" --confirm-resource-group "$RUN_ID" \
+  --expected-subscription "$SUBSCRIPTION_ID" --expected-region "$REGION" \
+  --expected-tfvars-sha "$TFVARS_SHA256" \
+  --role "$ROLE" --node-name "$NODE_NAME" --node-uid "$NODE_UID" \
+  --source-provider-id "$PROVIDER_ID" --source-network-container-id "$NC_ID" \
+  --kubeconfig "$KUBECONFIG_FILE" --context "$CONTEXT" \
+  --summary-file "$OUTPUT_DIR/cni-worker-maintenance.json"
+```
+
+The initial default pool must be quiescent at two or three workers, with exact
+preserved ownership and full real-agent 99-peer proof. The helper submits one
+temporary scale to four workers, proves fresh IP-batch growth on every new
+worker, and moves only the source's proven Pending agents one at a time. Healthy
+source evacuation is limited to 25 agents, with a 99-Ready floor and a
+100-Ready barrier between moves. Per-move capacity, actual memory, destination
+identity, controller ownership and Pod UID checks remain mandatory.
+
+Only known, live-controller-owned, PVC-free system/framework Pods may be drained;
+PDBs are honored. The helper then reuses prepared retirement to return to exactly
+three healthy workers. Probe and scheduling cleanup are UID/ownership scoped,
+and incomplete operations retain their failure evidence instead of reporting
+success. It refuses multiple broken sources, image/operation drift, unknown
+workloads and larger healthy-source evacuations. It does not raise the generic
+mock-reconciliation guard or automatic capacity-repair limit.
+
 ## Running via the telescope pipeline
 
 Add a stage to `pipelines/perf-eval/Network Benchmark/clustermesh-scale.yml` that
