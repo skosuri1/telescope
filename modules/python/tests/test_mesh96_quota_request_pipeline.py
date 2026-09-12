@@ -76,7 +76,7 @@ def test_quota_mode_is_exclusive_and_does_not_allocate_capacity():
     assert invocation["parameters"]["native_build_id"] == "${{ parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId }}"
     assert invocation["parameters"]["confirm_resume"] == "${{ parameters.debugConfirmResume }}"
     assert job()["steps"][0]["env"] == {"QUOTA_SCOPE_JSON": "${{ convertToJson(parameters) }}"}
-    for parameter in ("scaleDebugUnreachableWorkerRecoveryOnly", "scaleDebugUnreachableWorkerQuotaObserveOnly",
+    for parameter in ("scaleDebugModernPromRecovery", "scaleDebugUnreachableWorkerRecoveryOnly", "scaleDebugUnreachableWorkerQuotaObserveOnly",
                       "scaleDebugArmRepairOnly", "scaleDebugPreparedRetirementOnly",
                       "scaleDebugPreparedRetirementObserveOnly", "scaleDebugCniWorkerMaintenanceOnly"):
         assert f"not(parameters.{parameter})" in invocation["parameters"]["exclusive_modes"]

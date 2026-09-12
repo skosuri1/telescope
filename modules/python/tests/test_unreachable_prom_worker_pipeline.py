@@ -36,6 +36,7 @@ ENVIRONMENT = {
     "REPLACE_FAILED_HOST_BUILD_ID": "0",
     "RESUME_REPLACEMENT_BUILD_ID": "0",
     "QUOTA_OBSERVE_ONLY": "False",
+    "MODERN_PROM_RECOVERY": "False",
     "REIMAGE_FAILED_OS": "False",
 }
 
@@ -72,6 +73,9 @@ def template(path):
     {"RESUME_REPLACEMENT_BUILD_ID": "-1"},
     {"QUOTA_OBSERVE_ONLY": "True"},
     {"RESUME_REPLACEMENT_BUILD_ID": "79894", "QUOTA_OBSERVE_ONLY": "True"},
+    {"MODERN_PROM_RECOVERY": "True"},
+    {"MODERN_PROM_RECOVERY": "True", "RESUME_REPLACEMENT_BUILD_ID": "79894",
+     "REPLACE_FAILED_HOST_BUILD_ID": "79880", "QUOTA_OBSERVE_ONLY": "True"},
 ])
 def test_recovery_job_requires_complete_exclusive_mode(changes):
     result = subprocess.run(
@@ -91,6 +95,8 @@ def test_recovery_job_requires_complete_exclusive_mode(changes):
      "QUOTA_OBSERVE_ONLY": "True", "RECOVERY_PLAN_JSON": ""},
     {"RESUME_REPLACEMENT_BUILD_ID": "79894", "REPLACE_FAILED_HOST_BUILD_ID": "79880",
      "RECOVERY_PLAN_JSON": ""},
+    {"RESUME_REPLACEMENT_BUILD_ID": "79894", "REPLACE_FAILED_HOST_BUILD_ID": "79880",
+     "MODERN_PROM_RECOVERY": "True", "RECOVERY_PLAN_JSON": ""},
 ])
 def test_recovery_job_accepts_distinct_checkpoint_modes(changes):
     result = subprocess.run(
@@ -114,7 +120,7 @@ def test_recovery_mode_excludes_other_mutation_paths():
     key = (
         "${{ if and(eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), "
         "eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), "
-        "or(ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "
+        "or(parameters.scaleDebugModernPromRecovery, ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "
         "ne(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), "
         "parameters.scaleDebugUnreachableWorkerQuotaObserveOnly, "
         "and(parameters.scaleDebugUnreachableWorkerRecoveryOnly, "
@@ -131,11 +137,13 @@ def test_recovery_mode_excludes_other_mutation_paths():
     for key in stage["jobs"][1:3]:
         assert "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)" in next(iter(key))
     for key in stage["jobs"][:3]:
+        assert "not(parameters.scaleDebugModernPromRecovery)" in next(iter(key))
         assert "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)" in next(iter(key))
         assert "eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0)" in next(iter(key))
         assert "not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)" in next(iter(key))
     normal = template("jobs/clustermesh-debug-resume.yml")["jobs"][0]
     assert "ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY'], 'true')" in normal["condition"]
+    assert "ne(variables['CLUSTERMESH_MODERN_PROM_RECOVERY'], 'true')" in normal["condition"]
     assert "eq(variables['CLUSTERMESH_UNREACHABLE_WORKER_REPLACE_FAILED_HOST_BUILD_ID'], '0')" in normal["condition"]
     assert "eq(variables['CLUSTERMESH_UNREACHABLE_WORKER_RESUME_REPLACEMENT_BUILD_ID'], '0')" in normal["condition"]
     assert "ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_QUOTA_OBSERVE_ONLY'], 'true')" in normal["condition"]
@@ -182,6 +190,7 @@ def test_recovery_mode_excludes_other_mutation_paths():
     ("resume-native", 2, 0),
     ("missing-native-checkpoint", 0, 1),
     ("mutate-native-checkpoint", 1, 1),
+    ("modern-prom", 2, 0),
 ])
 @pytest.mark.parametrize("reimage_failed_os", ["False", "True"])
 def test_recovery_step_plans_before_exact_execution(
@@ -258,6 +267,7 @@ def test_recovery_step_plans_before_exact_execution(
         "replace", "missing-replacement-checkpoint", "mutate-checkpoint",
         "artifact-plan", "missing-artifact-plan",
         "resume-native", "missing-native-checkpoint", "mutate-native-checkpoint",
+        "modern-prom",
     )
     if replacing:
         environment["REPLACE_FAILED_HOST_BUILD_ID"] = "79880"
@@ -271,12 +281,14 @@ def test_recovery_step_plans_before_exact_execution(
                 (checkpoint.parent / "input-plan.json").write_text(json.dumps(PLAN), encoding="utf-8")
         if failure in ("artifact-plan", "missing-artifact-plan"):
             environment["RECOVERY_PLAN_JSON"] = ""
-        if failure in ("resume-native", "missing-native-checkpoint", "mutate-native-checkpoint"):
+        if failure in ("resume-native", "missing-native-checkpoint", "mutate-native-checkpoint", "modern-prom"):
             environment["RESUME_REPLACEMENT_BUILD_ID"] = "79894"
             if failure != "missing-native-checkpoint":
                 native = tmp_path / "workspace" / "native-host-action-79894" / "recovery.json"
                 native.parent.mkdir(parents=True)
                 native.write_text('{"native_checkpoint": true}', encoding="utf-8")
+        if failure == "modern-prom":
+            environment["MODERN_PROM_RECOVERY"] = "True"
     result = subprocess.run(
         ["bash", "-c", script], env=environment, capture_output=True,
         text=True, check=False, timeout=10,
@@ -304,8 +316,10 @@ def test_recovery_step_plans_before_exact_execution(
             assert "--replace-failed-host" in calls[0]
             assert "--observe-accepted-action" not in calls[0]
             assert "--reimage-failed-os" not in calls[0]
-        if failure in ("resume-native", "mutate-native-checkpoint"):
+        if failure in ("resume-native", "mutate-native-checkpoint", "modern-prom"):
             assert "--resume-replacement" in calls[0]
+        if failure == "modern-prom":
+            assert "--modern-prom-recovery" in calls[0]
     if len(calls) == 2:
         assert calls[1][-1] == "--execute"
         assert calls[0][:calls[0].index("--summary-file")] == calls[1][:calls[1].index("--summary-file")]

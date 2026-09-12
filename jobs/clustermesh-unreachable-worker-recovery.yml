@@ -30,6 +30,9 @@ parameters:
   - name: quota_observe_only
     type: boolean
     default: false
+  - name: modern_prom_recovery
+    type: boolean
+    default: false
 
 jobs:
   - job: unreachable_worker_recovery
@@ -80,6 +83,13 @@ jobs:
             echo "An explicit bounded identity plan or the failed-host source artifact is required." >&2
             exit 1
           fi
+          if [ "${MODERN_PROM_RECOVERY,,}" = "true" ] &&
+            { [ "$RESUME_REPLACEMENT_BUILD_ID" = "0" ] ||
+              [ "${QUOTA_OBSERVE_ONLY,,}" != "false" ] ||
+              [ "${REIMAGE_FAILED_OS,,}" != "false" ] || [ "$OBSERVE_BUILD_ID" != "0" ]; }; then
+            echo "Supported-family recovery requires the original native checkpoint and no observer or reimage mode." >&2
+            exit 1
+          fi
           if [ -n "$RECOVERY_PLAN_JSON" ]; then
             jq -e \
               'type == "object" and .schema_version == 1
@@ -104,6 +114,7 @@ jobs:
           RESUME_REPLACEMENT_BUILD_ID: "${{ parameters.resume_replacement_build_id }}"
           QUOTA_OBSERVE_ONLY: "${{ parameters.quota_observe_only }}"
           REIMAGE_FAILED_OS: "${{ parameters.reimage_failed_os }}"
+          MODERN_PROM_RECOVERY: "${{ parameters.modern_prom_recovery }}"
 
       - template: /steps/setup-tests.yml
         parameters:
@@ -174,3 +185,4 @@ jobs:
               observe_build_id: ${{ parameters.observe_build_id }}
               replace_failed_host_build_id: ${{ parameters.replace_failed_host_build_id }}
               resume_replacement_build_id: ${{ parameters.resume_replacement_build_id }}
+              modern_prom_recovery: ${{ parameters.modern_prom_recovery }}

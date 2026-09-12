@@ -23,6 +23,9 @@ parameters:
   - name: resume_replacement_build_id
     type: number
     default: 0
+  - name: modern_prom_recovery
+    type: boolean
+    default: false
 
 steps:
   - script: |
@@ -112,6 +115,19 @@ steps:
         native_sha=$(sha256sum "$summary_dir/native-action.json" | awk '{print $1}')
         args+=(--resume-replacement "$summary_dir/native-action.json")
       fi
+      modern_prom="${MODERN_PROM_RECOVERY:-false}"
+      case "${modern_prom,,}" in
+        true)
+          if [ "$resume_build_id" = "0" ] || [ "$observe_build_id" != "0" ] ||
+            [ "${reimage_failed_os,,}" != "false" ]; then
+            echo "Supported-family recovery requires immutable original/native receipts and no reimage/observer." >&2
+            exit 1
+          fi
+          args+=(--modern-prom-recovery)
+          ;;
+        false) ;;
+        *) echo "MODERN_PROM_RECOVERY must be true or false." >&2; exit 1 ;;
+      esac
       args+=(--timeout-seconds "$timeout_seconds")
       if [ "$observe_build_id" != "0" ]; then
         accepted="$(Pipeline.Workspace)/accepted-host-action-$observe_build_id/recovery.json"
@@ -158,6 +174,7 @@ steps:
       OBSERVE_BUILD_ID: "${{ parameters.observe_build_id }}"
       REPLACE_FAILED_HOST_BUILD_ID: "${{ parameters.replace_failed_host_build_id }}"
       RESUME_REPLACEMENT_BUILD_ID: "${{ parameters.resume_replacement_build_id }}"
+      MODERN_PROM_RECOVERY: "${{ parameters.modern_prom_recovery }}"
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish unreachable-worker recovery evidence"

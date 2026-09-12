@@ -265,6 +265,20 @@ without `--execute`. It reads only the scoped quota state and bounded Azure
 Activity Log evidence; it cannot submit another PUT. The resulting inspection
 status is distinct from approved quota or available worker capacity.
 
+### Explicit supported-family recovery baseline
+
+`scaleDebugModernPromRecovery=true` selects the separate monitoring recovery
+path with the original accepted-action and native-removal checkpoints. It does
+not resize or restart the healthy default workers. The supported replacement is
+an explicitly owned `promv5` User pool with one `Standard_D8s_v5` worker,
+the monitoring placement label, and a separately recorded configuration/identity
+delta. The original empty monitoring pool may be retired only after replacement
+and framework readiness are proved.
+
+This is monitoring-only recovery, not workload qualification. The remaining
+CNI-worker recovery and an explicit current-baseline handoff are still required
+before the preserved workload suite may resume.
+
 ### Planned single-worker CNI maintenance
 
 `cni_worker_maintenance.py` provides the local operator path for one explicitly

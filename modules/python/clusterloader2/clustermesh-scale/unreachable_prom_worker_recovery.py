@@ -319,6 +319,9 @@ def validate_args(args) -> None:
     ), "Failed-host replacement cannot be combined with observation or another reimage")
     require(not getattr(args, "resume_replacement", None) or bool(getattr(args, "replace_failed_host", None)),
             "Capacity continuation requires the original accepted reimage lineage")
+    require(not getattr(args, "modern_prom_recovery", False) or (
+        bool(getattr(args, "replace_failed_host", None)) and bool(getattr(args, "resume_replacement", None))
+    ), "Supported-family monitoring recovery requires both original action receipts")
     quota_wait = getattr(args, "quota_wait_seconds", 900)
     require(integer(quota_wait) and 0 <= quota_wait <= 900, "Quota observation is bounded to 0..900 seconds")
 
@@ -498,6 +501,7 @@ class Recovery(maintenance.ClusterOperator):
         self.host_action = "reimage" if getattr(args, "reimage_failed_os", False) else "restart"
         self.host_node = PROM_NODE
         self.host_provider_id = PROVIDER
+        self.host_pool_name = "prompool"
         self.real_uids = dict(REAL_UIDS)
         self.system_origin_node = PROM_NODE
         self.targets = [{
@@ -920,7 +924,7 @@ class Recovery(maintenance.ClusterOperator):
                     instance = "1" if name == f"{DEFAULT_VMSS}000001" else "0"
                     exact_provider = workers.provider_identity(node) == (DEFAULT_VMSS, instance)
                 require(exact_provider
-                        and mocks._node_pool_name(node) == ("prompool" if name == self.host_node else "default"),
+                        and mocks._node_pool_name(node) == (self.host_pool_name if name == self.host_node else "default"),
                         f"{name}: real provider or pool identity changed")
             else:
                 require((node["metadata"].get("labels") or {}).get("type") == "kwok",
@@ -1897,6 +1901,9 @@ def execute_recovery(args, summary: dict, runner=workers.run_command, delete_pod
             if getattr(args, "resume_replacement", None):
                 from failed_prom_capacity_resume import CapacityResumeRecovery  # pylint: disable=import-outside-toplevel,cyclic-import
                 operator_type = CapacityResumeRecovery
+                if getattr(args, "modern_prom_recovery", False):
+                    from modern_prom_recovery import ModernPromRecovery  # pylint: disable=import-outside-toplevel,cyclic-import
+                    operator_type = ModernPromRecovery
         operator = operator_type(args, plan, summary, runner, delete_pod or mocks.delete_pod_with_uid_precondition)
         operator.execute()
     finally:
@@ -1955,6 +1962,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--replace-failed-host")
     parser.add_argument("--resume-replacement")
     parser.add_argument("--quota-wait-seconds", type=int, default=900)
+    parser.add_argument("--modern-prom-recovery", action="store_true")
     return parser.parse_args(argv)
 
 
