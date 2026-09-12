@@ -1,6 +1,8 @@
 parameters:
   - name: target_run_id
     type: string
+  - name: confirm_resume
+    type: string
   - name: expected_subscription_id
     type: string
   - name: expected_region
@@ -15,6 +17,8 @@ parameters:
     type: number
   - name: quota_limit
     type: number
+  - name: exclusive_modes
+    type: boolean
 
 jobs:
   - job: bounded_quota_request
@@ -31,41 +35,22 @@ jobs:
     steps:
       - script: |
           set -euo pipefail
-          if [ "$RUN_ID" != "78751-f36f3d5a" ] ||
-            [ "$CONFIRM_RESUME" != "$RUN_ID" ] ||
-            [ "$SUBSCRIPTION" != "37deca37-c375-4a14-b90a-043849bd2bf1" ] ||
-            [ "$REGION" != "eastus2euap" ] ||
-            [ "$CLUSTER_COUNT" != "100" ] ||
-            [ "$OVERLAY_MODE" != "resume-existing" ] ||
-            [ "${RUN_WORKLOAD,,}" != "false" ] ||
-            [ "$QUOTA_LIMIT" != "5500" ] ||
-            [ "$NATIVE_BUILD_ID" != "79894" ] ||
-            [ "${RECOVERY_ONLY,,}" != "false" ] ||
-            [ "${QUOTA_OBSERVE_ONLY,,}" != "false" ] ||
-            [ "${ARM_ONLY,,}" != "false" ] ||
-            [ "${RETIREMENT_ONLY,,}" != "false" ] ||
-            [ "${RETIREMENT_OBSERVE_ONLY,,}" != "false" ] ||
-            [ "${CNI_ONLY,,}" != "false" ]; then
+          if ! jq -e '
+            .target_run_id == "78751-f36f3d5a" and .confirm_resume == .target_run_id
+            and .expected_subscription_id == "37deca37-c375-4a14-b90a-043849bd2bf1"
+            and .expected_region == "eastus2euap" and .expected_cluster_count == 100
+            and .overlay_mode == "resume-existing" and .run_workload == false
+            and .quota_limit == 5500 and .native_build_id == 79894
+            and .exclusive_modes == true' <<< "$QUOTA_SCOPE_JSON" >/dev/null; then
             echo "Quota request requires the exact fixed limit/scope/checkpoint and no workload or repair mode." >&2
+            jq '{target_run_id,confirm_resume,expected_subscription_id,expected_region,
+              expected_cluster_count,overlay_mode,run_workload,quota_limit,native_build_id,
+              exclusive_modes}' <<< "$QUOTA_SCOPE_JSON" >&2
             exit 1
           fi
         displayName: "Require one bounded quota request and no capacity mutations"
         env:
-          RUN_ID: ${{ parameters.target_run_id }}
-          CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
-          SUBSCRIPTION: ${{ parameters.expected_subscription_id }}
-          REGION: ${{ parameters.expected_region }}
-          CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
-          OVERLAY_MODE: ${{ parameters.overlay_mode }}
-          RUN_WORKLOAD: "${{ parameters.run_workload }}"
-          QUOTA_LIMIT: "${{ parameters.quota_limit }}"
-          NATIVE_BUILD_ID: "${{ parameters.native_build_id }}"
-          RECOVERY_ONLY: $(CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY)
-          QUOTA_OBSERVE_ONLY: $(CLUSTERMESH_UNREACHABLE_WORKER_QUOTA_OBSERVE_ONLY)
-          ARM_ONLY: $(CLUSTERMESH_ARM_REPAIR_ONLY)
-          RETIREMENT_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_ONLY)
-          RETIREMENT_OBSERVE_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY)
-          CNI_ONLY: $(CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY)
+          QUOTA_SCOPE_JSON: ${{ convertToJson(parameters) }}
 
       - template: /steps/setup-tests.yml
         parameters:
@@ -114,7 +99,7 @@ jobs:
         retryCountOnTaskFailure: 0
         env:
           RUN_ID: ${{ parameters.target_run_id }}
-          CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
+          CONFIRM_RESUME: ${{ parameters.confirm_resume }}
           SUBSCRIPTION: ${{ parameters.expected_subscription_id }}
           REGION: ${{ parameters.expected_region }}
           NATIVE_BUILD_ID: "${{ parameters.native_build_id }}"

@@ -3177,6 +3177,7 @@ stages:
           - template: /jobs/clustermesh-quota-request.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
+              confirm_resume: ${{ parameters.debugConfirmResume }}
               expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
               expected_region: ${{ parameters.scaleDebugRegion }}
               expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
@@ -3184,6 +3185,7 @@ stages:
               run_workload: ${{ parameters.scaleDebugRunWorkload }}
               native_build_id: ${{ parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId }}
               quota_limit: ${{ parameters.scaleDebugDv3QuotaRequestLimit }}
+              exclusive_modes: ${{ and(not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), not(parameters.scaleDebugArmRepairOnly), not(parameters.scaleDebugPreparedRetirementOnly), not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugCniWorkerMaintenanceOnly)) }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}

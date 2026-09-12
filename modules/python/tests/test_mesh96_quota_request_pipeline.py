@@ -36,9 +36,21 @@ def job():
     {"CNI_ONLY": "True"},
 ])
 def test_request_requires_exact_scope_limit_and_no_other_modes(changes):
+    values = {**ENVIRONMENT, **changes}
+    scope = {
+        "target_run_id": values["RUN_ID"], "confirm_resume": values["CONFIRM_RESUME"],
+        "expected_subscription_id": values["SUBSCRIPTION"], "expected_region": values["REGION"],
+        "expected_cluster_count": int(values["CLUSTER_COUNT"]), "overlay_mode": values["OVERLAY_MODE"],
+        "run_workload": values["RUN_WORKLOAD"].lower() == "true", "quota_limit": int(values["QUOTA_LIMIT"]),
+        "native_build_id": int(values["NATIVE_BUILD_ID"]),
+        "exclusive_modes": all(values[key].lower() == "false" for key in (
+            "RECOVERY_ONLY", "QUOTA_OBSERVE_ONLY", "ARM_ONLY", "RETIREMENT_ONLY",
+            "RETIREMENT_OBSERVE_ONLY", "CNI_ONLY",
+        )),
+    }
     result = subprocess.run(
         ["bash", "-c", job()["steps"][0]["script"]],
-        env={**os.environ, **ENVIRONMENT, **changes},
+        env={**os.environ, "QUOTA_SCOPE_JSON": json.dumps(scope)},
         text=True, capture_output=True, check=False, timeout=10,
     )
     assert (result.returncode == 0) is (not changes), result.stderr
@@ -55,6 +67,12 @@ def test_quota_mode_is_exclusive_and_does_not_allocate_capacity():
     invocation = next(row[key][0] for row in stage["jobs"] if key in row)
     assert invocation["template"] == "/jobs/clustermesh-quota-request.yml"
     assert invocation["parameters"]["native_build_id"] == "${{ parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId }}"
+    assert invocation["parameters"]["confirm_resume"] == "${{ parameters.debugConfirmResume }}"
+    assert job()["steps"][0]["env"] == {"QUOTA_SCOPE_JSON": "${{ convertToJson(parameters) }}"}
+    for parameter in ("scaleDebugUnreachableWorkerRecoveryOnly", "scaleDebugUnreachableWorkerQuotaObserveOnly",
+                      "scaleDebugArmRepairOnly", "scaleDebugPreparedRetirementOnly",
+                      "scaleDebugPreparedRetirementObserveOnly", "scaleDebugCniWorkerMaintenanceOnly"):
+        assert f"not(parameters.{parameter})" in invocation["parameters"]["exclusive_modes"]
     for row in stage["jobs"][:4]:
         assert "eq(parameters.scaleDebugDv3QuotaRequestLimit, 0)" in next(iter(row))
     normal = yaml.safe_load((ROOT / "jobs/clustermesh-debug-resume.yml").read_text(encoding="utf-8"))["jobs"][0]
