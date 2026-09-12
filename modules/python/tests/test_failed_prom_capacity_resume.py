@@ -396,6 +396,44 @@ def test_nonempty_busy_unknown_or_drifted_zero_never_restores(environment, fault
     summary = base.receipt()
     assert summary["capacity_resume"]["fresh_state"]["outcome"] == "not-proven"
     assert summary["capacity_resume"]["previous_restore_disambiguation"] is None
+    if fault in ("controller", "pdb"):
+        drift = summary["capacity_resume"]["pin_drift"]
+        kind = "controllers" if fault == "controller" else "pdbs"
+        assert len(drift[kind]) == 1
+        changed = next(iter(drift[kind].values()))
+        assert changed["expected"]["uid"] == changed["observed"]["uid"]
+        assert changed["expected"]["spec_sha256"] != changed["observed"]["spec_sha256"]
+        if fault == "controller":
+            configuration = next(iter(drift["current_controller_configuration"].values()))
+            assert configuration["replicas"] == 2
+            assert all(set(row) == {"name", "image", "resources"} for row in configuration["containers"])
+        else:
+            assert next(iter(drift["current_pdb_specs"].values()))["minAvailable"] == 0
+    no_writes(fake)
+
+
+@pytest.mark.parametrize("change", ["added", "removed", "uid"])
+def test_controller_pin_drift_preserves_inventory_evidence(environment, change):
+    _, _, fake = environment
+    row = fake.get_controller("grafana")
+    key = f"{row['kind']}/{row['metadata']['namespace']}/{row['metadata']['name']}"
+    if change == "removed":
+        fake.controllers.remove(row)
+    elif change == "added":
+        row = copy.deepcopy(row)
+        row["metadata"]["name"] = "new-unapproved-controller"
+        row["metadata"]["uid"] = base.uid("new-unapproved-controller")
+        fake.controllers.append(row)
+        key = f"{row['kind']}/{row['metadata']['namespace']}/{row['metadata']['name']}"
+    else:
+        row["metadata"]["uid"] = base.uid("replaced-controller")
+    with pytest.raises(recovery.workers.ReconcileError, match="controller/PDB pins changed"):
+        run(environment, execute=True)
+    drift = base.receipt()["capacity_resume"]["pin_drift"]
+    assert list(drift["controllers"]) == [key]
+    assert not drift["pdbs"]
+    assert (drift["controllers"][key]["observed"] is None) is (change == "removed")
+    assert (drift["controllers"][key]["expected"] is None) is (change == "added")
     no_writes(fake)
 
 

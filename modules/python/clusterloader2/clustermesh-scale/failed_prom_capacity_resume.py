@@ -320,9 +320,56 @@ class CapacityResumeRecovery(replacement.ReplacementRecovery):
             self.open_cluster()
             self.cluster_open = True
         snapshot = self.snapshot()
-        require(recovery.frozen_controllers(snapshot) == self.native["controller_pins"]
-                and recovery.frozen_pdbs(snapshot) == self.native["pdb_pins"],
-                "Original native-run controller/PDB pins changed")
+        current_pins = {
+            "controllers": recovery.frozen_controllers(snapshot),
+            "pdbs": recovery.frozen_pdbs(snapshot),
+        }
+        expected_pins = {"controllers": self.native["controller_pins"], "pdbs": self.native["pdb_pins"]}
+        drift = {
+            kind: {
+                key: {"expected": expected_pins[kind].get(key), "observed": observed.get(key)}
+                for key in sorted(set(expected_pins[kind]) | set(observed))
+                if expected_pins[kind].get(key) != observed.get(key)
+            }
+            for kind, observed in current_pins.items()
+        }
+        if any(drift.values()):
+            configurations = {}
+            for row in snapshot["controllers"]["items"]:
+                meta, spec = row["metadata"], row["spec"]
+                key = f"{row['kind']}/{meta['namespace']}/{meta['name']}"
+                if key not in drift["controllers"]:
+                    continue
+                template = spec.get("template") or {}
+                configurations[key] = {
+                    "replicas": spec.get("replicas"),
+                    "owner_references": meta.get("ownerReferences") or [],
+                    "spec_without_replicas_sha256": recovery.digest(
+                        {name: value for name, value in spec.items() if name != "replicas"}
+                    ),
+                    "template_sha256": recovery.digest(template),
+                    "containers": [
+                        {name: container.get(name) for name in ("name", "image", "resources")}
+                        for container in (template.get("spec") or {}).get("containers") or []
+                    ],
+                    "managers": [
+                        {name: entry.get(name) for name in ("manager", "operation", "time", "subresource")}
+                        for entry in meta.get("managedFields") or []
+                    ],
+                }
+            self.continuation["pin_drift"] = {
+                "observed_at": recovery.workers.utc_now(), **drift,
+                "current_controller_configuration": configurations,
+                "current_pdb_specs": {
+                    f"{row['metadata']['namespace']}/{row['metadata']['name']}": row.get("spec")
+                    for row in snapshot["pdbs"]["items"]
+                    if f"{row['metadata']['namespace']}/{row['metadata']['name']}" in drift["pdbs"]
+                },
+            }
+            self.save()
+        require(not any(drift.values()),
+                "Original native-run controller/PDB pins changed: "
+                f"controllers={list(drift['controllers'])}, pdbs={list(drift['pdbs'])}")
         _, agents = self.guard(snapshot, host_optional=True)
         require(self.stage == "empty" and self.live["empty"] and self.old_resources_absent(snapshot),
                 "Previous scale is not disambiguated: requires quiescent zero and native old-resource GC")
