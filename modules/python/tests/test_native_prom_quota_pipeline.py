@@ -18,7 +18,7 @@ SUBSCRIPTION = "37deca37-c375-4a14-b90a-043849bd2bf1"
 
 @pytest.mark.parametrize("fault", [
     "none", "scope", "checkpoint", "absent", "forbidden", "timeout", "foreign-cluster", "bad-counter",
-    "managed-absent", "managed-forbidden",
+    "managed-absent", "managed-forbidden", "health-forbidden", "kube-forbidden", "cluster-scope",
 ])
 @pytest.mark.parametrize("family,total", [(32, 100), (8, 100), (0, 100), (100, 0), (-16, 100)])
 @pytest.mark.parametrize("counter_type", ["number", "string"])
@@ -103,7 +103,34 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
             elif args[:2] == ["aks", "show"]:
                 assert arg("--name") == "clustermesh-96" and arg("--resource-group") == "78751-f36f3d5a"
                 value = {"id": prefix + "78751-f36f3d5a/providers/Microsoft.ContainerService/managedClusters/clustermesh-96",
-                         "name": "clustermesh-96", "provisioningState": "Succeeded"}
+                         "name": "clustermesh-96", "provisioningState": "Succeeded",
+                         "location": "eastus2euap", "tags": {"role": "mesh-96"},
+                         "nodeResourceGroup": "mc_78751-f36f3d5a_clustermesh-96_eastus2euap"}
+                if fault == "cluster-scope":
+                    value["nodeResourceGroup"] = "foreign-group"
+            elif args[:2] == ["aks", "get-credentials"]:
+                assert arg("--name") == "clustermesh-96" and arg("--resource-group") == "78751-f36f3d5a"
+                assert arg("--context") == "clustermesh-96"
+                target = Path(arg("--file"))
+                assert target.parent.parent == Path(os.environ["AGENT_TEMP_DIRECTORY"])
+                target.write_text("private-test-credentials", encoding="utf-8")
+                sys.exit(0)
+            elif args[:2] == ["vmss", "get-instance-view"]:
+                assert arg("--name") == "aks-default-28928250-vmss" and arg("--instance-id") in ("0", "1")
+                value = {"statuses": [{"code": "PowerState/running"}], "extensions": [],
+                         "maintenanceRedeployStatus": {"isCustomerInitiatedMaintenanceAllowed": False}}
+            elif args[0] == "rest":
+                assert arg("--method") == "get"
+                assert arg("--url") == (
+                    f"https://management.azure.com/subscriptions/{sub}/resourceGroups/"
+                    "mc_78751-f36f3d5a_clustermesh-96_eastus2euap/providers/Microsoft.Compute/"
+                    "virtualMachineScaleSets/aks-default-28928250-vmss/virtualMachines/1/providers/"
+                    "Microsoft.ResourceHealth/availabilityStatuses/current?api-version=2025-05-01"
+                )
+                if fault == "health-forbidden":
+                    print("ERROR: (AuthorizationFailed) Resource Health is not readable", file=sys.stderr)
+                    sys.exit(1)
+                value = {"properties": {"availabilityState": "Unavailable", "reasonType": "PlatformInitiated"}}
             elif args[:2] == ["aks", "list"]:
                 assert arg("--resource-group") == "79825-24946a3a"
                 names = ["foreign"] if fault == "foreign-cluster" else ["clustermesh-1", "clustermesh-2"]
@@ -121,7 +148,7 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                           "capabilities": [{"name": "vCPUs", "value": "8"}, {"name": "MemoryGB", "value": "32"}]}]
             else:
                 assert args[:2] == ["vmss", "list-instances"]
-                assert arg("--name") == "aks-prompool-38822163-vmss"
+                assert arg("--name") in ("aks-prompool-38822163-vmss", "aks-default-28928250-vmss")
                 value = []
             if "--query" in args:
                 value = jmespath.search(arg("--query"), value)
@@ -131,6 +158,40 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
         encoding="utf-8",
     )
     fake.chmod(0o755)
+    kube = tmp_path / "kubectl"
+    kube.write_text(
+        f"#!{sys.executable}\n" + textwrap.dedent(
+            """
+            import json
+            import os
+            import sys
+            from pathlib import Path
+
+            args = sys.argv[1:]
+            assert args[:1] == ["--kubeconfig"]
+            config = Path(args[1])
+            assert config.read_text() == "private-test-credentials"
+            assert config.stat().st_mode & 0o777 == 0o600
+            assert args[2:6] == ["--context", "clustermesh-96", "--request-timeout=20s", "get"]
+            assert args[6] in ("nodes", "pods", "events", "deployments,replicasets,daemonsets,statefulsets",
+                               "pdb", "nodenetworkconfigs")
+            assert args[-2:] == ["-o", "json"]
+            assert not set(args) & {"apply", "patch", "delete", "cordon", "taint", "exec"}
+            if os.environ["FAULT"] == "kube-forbidden":
+                print("Forbidden: node state is not readable", file=sys.stderr)
+                sys.exit(1)
+            print(json.dumps({"kind": "List", "items": [
+                {"metadata": {"name": "original-worker"}, "status": {"conditions": [
+                    {"type": "Ready", "status": "Unknown"},
+                    {"type": "VMEventScheduled", "status": "True", "reason": "Freeze"}
+                ]}}
+            ]}))
+            """
+        ), encoding="utf-8",
+    )
+    kube.chmod(0o755)
+    private_root = tmp_path / "private"
+    private_root.mkdir()
     calls_file = tmp_path / "calls.jsonl"
     environment = {
         **os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}",
@@ -138,6 +199,7 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
         "EXPECTED_SUBSCRIPTION_ID": SUBSCRIPTION, "EXPECTED_REGION": "eastus2euap",
         "EXPECTED_CLUSTER_COUNT": "100", "NATIVE_BUILD_ID": "79894",
         "NATIVE_INPUT_DIRECTORY": str(native), "ARTIFACT_STAGING_DIRECTORY": str(tmp_path / "artifacts"),
+        "AGENT_TEMP_DIRECTORY": str(private_root),
         "CALLS": str(calls_file), "FAULT": fault, "FAMILY": str(family), "TOTAL": str(total),
         "COUNTER_TYPE": counter_type,
     }
@@ -152,6 +214,11 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
     if success:
         summary = json.loads((directory / "quota-observation.json").read_text(encoding="utf-8"))
         assert summary["observation_only"] and not summary["mutation_started"] and not summary["workloads_ready"]
+        assert summary["worker_state_collected"] and summary["resource_health_complete"]
+        current = json.loads((directory / "current-nodes.json").read_text(encoding="utf-8"))
+        assert current["items"][0]["status"]["conditions"][0]["status"] == "Unknown"
+        assert json.loads((directory / "default-1-resource-health.json").read_text(encoding="utf-8")) \
+            ["properties"]["availabilityState"] == "Unavailable"
         assert summary["headroom_for_restore"] is (min(family, total) >= 8)
         assert summary["headroom_for_restore_and_cni"] is (min(family, total) >= 24)
         assert summary["prom_instances"] == []
@@ -166,8 +233,17 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
             for name in ("clustermesh-1", "clustermesh-2"):
                 assert json.loads((directory / f"accidental-{name}-node-group.json").read_text(encoding="utf-8"))["absent"]
                 assert not (directory / f"accidental-{name}-vmsses.json").exists()
+    elif fault == "health-forbidden":
+        summary = json.loads((directory / "quota-observation.json").read_text(encoding="utf-8"))
+        assert not summary["observation_complete"] and not summary["resource_health_complete"]
+        assert not summary["mutation_started"] and not summary["workloads_ready"]
+        assert (directory / "current-nodes.json").is_file()
     else:
         assert not (directory / "quota-observation.json").exists()
+    assert not list(private_root.iterdir())
+    if fault == "cluster-scope":
+        calls = [json.loads(row) for row in calls_file.read_text(encoding="utf-8").splitlines()]
+        assert not any(row[:2] == ["aks", "get-credentials"] for row in calls)
     if fault in ("scope", "checkpoint"):
         assert not calls_file.exists()
 

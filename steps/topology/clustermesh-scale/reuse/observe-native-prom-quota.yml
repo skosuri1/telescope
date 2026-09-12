@@ -75,6 +75,12 @@ steps:
         --resource-group "$RUN_ID" --name clustermesh-96 \
         --query '{id:id,name:name,location:location,nodeResourceGroup:nodeResourceGroup,tags:tags,provisioningState:provisioningState,powerState:powerState}' \
         --output json --only-show-errors > "$directory/cluster.json"
+      cluster_id="/subscriptions/$EXPECTED_SUBSCRIPTION_ID/resourceGroups/$RUN_ID/providers/Microsoft.ContainerService/managedClusters/clustermesh-96"
+      jq -e --arg id "$cluster_id" '
+        (.id | ascii_downcase) == ($id | ascii_downcase)
+        and .nodeResourceGroup == "mc_78751-f36f3d5a_clustermesh-96_eastus2euap"
+        and .location == "eastus2euap" and .tags.role == "mesh-96"' \
+        "$directory/cluster.json" >/dev/null
       az aks operation show-latest --subscription "$EXPECTED_SUBSCRIPTION_ID" \
         --resource-group "$RUN_ID" --name clustermesh-96 \
         --query '{name:name,status:status,operationType:operationType,startTime:startTime,endTime:endTime,errorCode:error.code}' \
@@ -95,6 +101,42 @@ steps:
         --resource-group "$node_group" --name aks-prompool-38822163-vmss \
         --query '[].{id:id,instanceId:instanceId,vmId:vmId,computerName:osProfile.computerName,provisioningState:provisioningState}' \
         --output json --only-show-errors > "$directory/prom-instances.json"
+      az vmss list-instances --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-group "$node_group" --name aks-default-28928250-vmss \
+        --query '[].{id:id,instanceId:instanceId,vmId:vmId,computerName:osProfile.computerName,provisioningState:provisioningState}' \
+        --output json --only-show-errors > "$directory/default-instances.json"
+      for instance in 0 1; do
+        timeout 60 az vmss get-instance-view --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+          --resource-group "$node_group" --name aks-default-28928250-vmss --instance-id "$instance" \
+          --query '{statuses:statuses,vmAgent:vmAgent,maintenanceRedeployStatus:maintenanceRedeployStatus,extensions:extensions[].{name:name,statuses:statuses}}' \
+          --output json --only-show-errors > "$directory/default-$instance-instance-view.json"
+      done
+      private=$(mktemp -d "$AGENT_TEMP_DIRECTORY/native-worker-observe.XXXXXX")
+      cleanup() {
+        rm -f -- "$private/cluster.config"
+        rmdir -- "$private"
+      }
+      trap cleanup EXIT
+      timeout 90 az aks get-credentials --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-group "$RUN_ID" --name clustermesh-96 --context clustermesh-96 \
+        --file "$private/cluster.config" --only-show-errors
+      chmod 600 "$private/cluster.config"
+      kube=(kubectl --kubeconfig "$private/cluster.config" --context clustermesh-96 --request-timeout=20s)
+      for resource in nodes pods events; do
+        timeout 45 "${kube[@]}" get "$resource" -A -o json > "$directory/current-$resource.json"
+      done
+      timeout 45 "${kube[@]}" get deployments,replicasets,daemonsets,statefulsets -A -o json \
+        > "$directory/current-controllers.json"
+      timeout 45 "${kube[@]}" get pdb -A -o json > "$directory/current-pdbs.json"
+      timeout 45 "${kube[@]}" get nodenetworkconfigs -n kube-system -o json > "$directory/current-nnc.json"
+      resource_health_complete=true
+      vm_id="/subscriptions/$EXPECTED_SUBSCRIPTION_ID/resourceGroups/$node_group/providers/Microsoft.Compute/virtualMachineScaleSets/aks-default-28928250-vmss/virtualMachines/1"
+      if ! timeout 60 az rest --subscription "$EXPECTED_SUBSCRIPTION_ID" --method get \
+        --url "https://management.azure.com$vm_id/providers/Microsoft.ResourceHealth/availabilityStatuses/current?api-version=2025-05-01" \
+        --output json --only-show-errors > "$directory/default-1-resource-health.json" \
+        2> "$directory/default-1-resource-health-read.log"; then
+        resource_health_complete=false
+      fi
       accidental_group="79825-24946a3a"
       if az group show --subscription "$EXPECTED_SUBSCRIPTION_ID" --name "$accidental_group" \
         --query '{id:id,name:name,location:location,tags:tags,provisioningState:properties.provisioningState}' \
@@ -132,15 +174,21 @@ steps:
         echo "Accidental-group read failed; absence is not proved. No resource writes were attempted." >&2
         exit 1
       fi
-      jq -n --argjson build "$NATIVE_BUILD_ID" --slurpfile quota "$directory/quota.json" \
+      jq -n --argjson build "$NATIVE_BUILD_ID" --argjson health_complete "$resource_health_complete" \
+        --slurpfile quota "$directory/quota.json" \
         --slurpfile pools "$directory/pools.json" --slurpfile instances "$directory/prom-instances.json" \
         '{observation_only:true,mutation_started:false,workloads_ready:false,
-          source_native_build:$build,observation_complete:true,quota:$quota[0],
+          source_native_build:$build,observation_complete:$health_complete,
+          worker_state_collected:true,resource_health_complete:$health_complete,quota:$quota[0],
           headroom_for_restore:(all($quota[0][]; .remaining >= 8)),
           headroom_for_restore_and_cni:(all($quota[0][]; .remaining >= 24)),
           pools:$pools[0],prom_instances:$instances[0]}' > "$directory/quota-observation.json"
+      if [ "$resource_health_complete" != "true" ]; then
+        echo "Resource Health could not be read; captured worker state does not prove maintenance completion." >&2
+        exit 1
+      fi
       echo "Completed read-only native-outcome and quota observation; no repair or cleanup was submitted."
-    displayName: "Observe native outcome and quota without resource changes"
+    displayName: "Observe worker maintenance, native outcome and quota without changes"
     retryCountOnTaskFailure: 0
     env:
       RUN_ID: ${{ parameters.target_run_id }}
@@ -151,6 +199,7 @@ steps:
       NATIVE_BUILD_ID: "${{ parameters.native_build_id }}"
       NATIVE_INPUT_DIRECTORY: $(Pipeline.Workspace)/native-host-action-${{ parameters.native_build_id }}
       ARTIFACT_STAGING_DIRECTORY: $(Build.ArtifactStagingDirectory)
+      AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish read-only quota and native-outcome evidence"
