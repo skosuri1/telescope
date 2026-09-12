@@ -19,6 +19,9 @@ parameters:
     type: number
   - name: exclusive_modes
     type: boolean
+  - name: receipt_build_id
+    type: number
+    default: 0
 
 jobs:
   - job: bounded_quota_request
@@ -41,6 +44,7 @@ jobs:
             and .expected_region == "eastus2euap" and .expected_cluster_count == 100
             and .overlay_mode == "resume-existing" and .run_workload == false
             and .quota_limit == 5500 and .native_build_id == 79894
+            and (.receipt_build_id | type == "number" and . >= 0 and floor == .)
             and .exclusive_modes == true' <<< "$QUOTA_SCOPE_JSON" >/dev/null; then
             echo "Quota request requires the exact fixed limit/scope/checkpoint and no workload or repair mode." >&2
             jq '{target_run_id,confirm_resume,expected_subscription_id,expected_region,
@@ -72,6 +76,19 @@ jobs:
           artifactName: n100-unreachable-worker-recovery-${{ parameters.native_build_id }}-1
           targetPath: $(Pipeline.Workspace)/native-quota-source-${{ parameters.native_build_id }}
 
+      - ${{ if gt(parameters.receipt_build_id, 0) }}:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download the prior quota request journal without resubmitting"
+            inputs:
+              buildType: specific
+              project: $(System.TeamProjectId)
+              definition: $(System.DefinitionId)
+              specificBuildWithTriggering: false
+              buildVersionToDownload: specific
+              pipelineId: ${{ parameters.receipt_build_id }}
+              artifactName: n100-quota-request-${{ parameters.receipt_build_id }}-1
+              targetPath: $(Pipeline.Workspace)/prior-quota-request-${{ parameters.receipt_build_id }}
+
       - script: |
           set -euo pipefail
           umask 077
@@ -87,6 +104,12 @@ jobs:
             --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
             --native-checkpoint "$directory/native-checkpoint.json" --timeout-seconds 900
           )
+          if [ "$RECEIPT_BUILD_ID" != "0" ]; then
+            cp "$(Pipeline.Workspace)/prior-quota-request-$RECEIPT_BUILD_ID/request_mesh96_quota.attempt.json" \
+              "$directory/request_mesh96_quota.attempt.json"
+            python3 -u "$helper" "${args[@]}" --summary-file "$directory/inspection.json" --inspect-rejection
+            exit 0
+          fi
           python3 -u "$helper" "${args[@]}" --summary-file "$directory/plan.json"
           jq -e '.execute == false and .mutation_started == false
             and (.plan_valid == true or .success == true)' "$directory/plan.json" >/dev/null
@@ -103,6 +126,7 @@ jobs:
           SUBSCRIPTION: ${{ parameters.expected_subscription_id }}
           REGION: ${{ parameters.expected_region }}
           NATIVE_BUILD_ID: "${{ parameters.native_build_id }}"
+          RECEIPT_BUILD_ID: "${{ parameters.receipt_build_id }}"
 
       - task: PublishPipelineArtifact@1
         displayName: "Publish quota request and approval evidence"

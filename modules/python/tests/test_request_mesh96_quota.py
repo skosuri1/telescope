@@ -710,3 +710,71 @@ def test_arm_client_has_no_redirects_retries_or_credential_output(monkeypatch, c
     with pytest.raises(quota.Blocked):
         client.request("PUT", quota.USAGE_URL, timeout=5, body={})
     assert len(sent) == 1
+
+
+def test_unknown_provider_error_identifier_is_preserved_without_private_payload(options):
+    options.execute = True
+    azure = FakeAzure(options)
+    azure.put_reply = quota.Reply(400, {"error": {
+        "code": "QuotaRequestNotEnabledForRegion", "message": PRIVATE,
+    }}, {})
+    result = azure.run()
+    assert result["request"]["provider_error_code"] == "QuotaRequestNotEnabledForRegion"
+    assert PRIVATE not in json.dumps(result) and len(azure.puts) == 1
+
+
+@pytest.mark.parametrize("private_message", [False, True])
+def test_rejected_request_inspection_preserves_journal_and_never_resubmits(options, private_message):
+    options.execute = True
+    azure = FakeAzure(options)
+    azure.put_reply = quota.Reply(400, {"error": {"code": "InvalidQuotaRequest"}}, {})
+    original = azure.run()
+    journal = Path(original["attempt_journal"])
+    before = journal.read_bytes()
+    options.execute = False
+    options.inspect_rejection = True
+    options.summary_file = str(Path(options.summary_file).with_name("inspection.json"))
+    event = {
+        "resourceId": f"{quota.QUOTA_ROOT}/quotas/{quota.FAMILY}",
+        "eventTimestamp": original["request"]["attempted_at"], "eventDataId": REQUEST_ID,
+        "correlationId": REQUEST_ID, "status": "Failed",
+        "statusMessage": json.dumps({"error": {
+            "code": "QuotaRequestNotSupported",
+            "message": PRIVATE if private_message else "Quota increases are not supported for this resource.",
+        }}),
+    }
+    azure.read_override[("monitor", "activity-log")] = [event]
+    result = azure.run()
+    assert result["success"] and result["inspection_only"] and result["status"] == "rejection_inspected"
+    assert not result["mutation_started"] and result["request"]["accepted"] is False
+    assert len(azure.puts) == 1 and journal.read_bytes() == before
+    error = result["rejection_activity"][0]["errors"][0]
+    assert error["code"] == "QuotaRequestNotSupported"
+    assert error["message"] == ("[redacted]" if private_message else
+                                "Quota increases are not supported for this resource.")
+    assert PRIVATE not in json.dumps(result)
+    command = next(row for row in azure.commands if row[1:3] == ["monitor", "activity-log"])
+    assert command[command.index("--resource-id") + 1] == f"{quota.QUOTA_ROOT}/quotas/{quota.FAMILY}"
+    assert command[command.index("--max-events") + 1] == "100"
+
+
+@pytest.mark.parametrize("fault", ["execute", "no-journal", "foreign-resource", "wrong-time"])
+def test_rejection_inspection_cannot_authorize_a_new_request_or_unscoped_reads(options, fault):
+    azure = FakeAzure(options)
+    if fault != "no-journal":
+        options.execute = True
+        azure.put_reply = quota.Reply(400, None, {})
+        original = azure.run()
+        azure.read_override[("monitor", "activity-log")] = [{
+            "resourceId": f"{quota.QUOTA_ROOT}/quotas/{quota.FAMILY}",
+            "eventTimestamp": original["request"]["attempted_at"],
+            "statusMessage": None,
+        }]
+    options.execute = fault == "execute"
+    options.inspect_rejection = True
+    if fault == "foreign-resource":
+        azure.read_override[("monitor", "activity-log")][0]["resourceId"] = quota.GROUP_ID
+    if fault == "wrong-time":
+        azure.read_override[("monitor", "activity-log")][0]["eventTimestamp"] = "2000-01-01T00:00:00Z"
+    before = len(azure.puts)
+    assert not azure.run()["success"] and len(azure.puts) == before

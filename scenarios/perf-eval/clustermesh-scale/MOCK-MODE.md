@@ -253,6 +253,12 @@ The `n100-quota-request-<build>-<attempt>` artifact includes the adjacent
 `request_mesh96_quota.attempt.json` journal. Preserve that journal with its
 checkpoint when inspecting or continuing a request on another agent. An
 ambiguous request must not be resubmitted using a new empty artifact directory.
+For a definitely rejected request, set `scaleDebugQuotaRequestReceiptBuildId`
+to its quota-request build while retaining the fixed limit and original native
+checkpoint. This downloads the attempt journal and selects `--inspect-rejection`
+without `--execute`. It reads only the scoped quota state and bounded Azure
+Activity Log evidence; it cannot submit another PUT. The resulting inspection
+status is distinct from approved quota or available worker capacity.
 
 ### Planned single-worker CNI maintenance
 

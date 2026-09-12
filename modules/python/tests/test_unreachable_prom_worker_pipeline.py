@@ -113,6 +113,7 @@ def test_recovery_mode_excludes_other_mutation_paths():
     )
     key = (
         "${{ if and(eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), "
+        "eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), "
         "or(ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "
         "ne(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), "
         "parameters.scaleDebugUnreachableWorkerQuotaObserveOnly, "

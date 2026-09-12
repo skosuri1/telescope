@@ -63,6 +63,7 @@ ERROR_CODES = {
     "MissingSubscriptionRegistration", "SubscriptionNotRegistered", "RequestDisallowedByPolicy",
     "InvalidResourceName", "QuotaExceeded", "TooManyRequests", "OperationNotAllowed",
 }
+SENSITIVE_TEXT = re.compile(r"authorization|bearer|token|secret|password|credential|private.key|[?&]sig=|://[^/\s]+@", re.I)
 
 
 class Blocked(Exception):
@@ -88,6 +89,30 @@ def unsigned(value):
 
 def same_id(value, expected):
     return isinstance(value, str) and value.lower() == expected.lower()
+
+
+def provider_code(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", value) is not None \
+        and (value in ERROR_CODES or SENSITIVE_TEXT.search(value) is None)
+
+
+def error_details(value):
+    result = []
+    if isinstance(value, dict):
+        code = value.get("code")
+        if provider_code(code):
+            row = {"code": code}
+            message = value.get("message")
+            if isinstance(message, str) and len(message) <= 2048:
+                row["message"] = "[redacted]" if SENSITIVE_TEXT.search(message) else message
+            result.append(row)
+        for key in ("error", "details", "innererror"):
+            if key in value:
+                result.extend(error_details(value[key]))
+    elif isinstance(value, list):
+        for row in value[:100]:
+            result.extend(error_details(row))
+    return result
 
 
 def utc_now():
@@ -563,6 +588,44 @@ class Request:
         if "retry-after" in reply.headers:
             self.delay = max(5, unsigned(reply.headers["retry-after"]))
 
+    def inspect_rejection(self):
+        receipt = self.summary["request"]
+        require(not self.args.execute and receipt["attempted"] and receipt["accepted"] is False
+                and receipt["ambiguous"] is False and receipt.get("state") in FAILED,
+                "inspection_requires_definitely_rejected_journal")
+        attempted = timestamp(receipt["attempted_at"])
+        start = attempted - timedelta(minutes=2)
+        end = min(datetime.now(timezone.utc), attempted + timedelta(minutes=15))
+        rows = self.az(
+            "monitor", "activity-log", "list", "--resource-id", f"{QUOTA_ROOT}/quotas/{FAMILY}",
+            "--start-time", start.isoformat(), "--end-time", end.isoformat(), "--max-events", "100",
+            "--query", "[].{eventDataId:eventDataId,eventTimestamp:eventTimestamp,correlationId:correlationId,"
+            "resourceId:resourceId,operation:operationName.value,status:status.value,statusMessage:properties.statusMessage}",
+        )
+        require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows), "invalid_activity_log")
+        observations = []
+        for row in rows:
+            require(same_id(row.get("resourceId"), f"{QUOTA_ROOT}/quotas/{FAMILY}"),
+                    "activity_log_scope_mismatch")
+            event_time = timestamp(row.get("eventTimestamp"))
+            require(start <= event_time <= end, "activity_log_time_mismatch")
+            raw = row.get("statusMessage")
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    raw = None
+            observations.append({
+                "at": event_time.isoformat(),
+                "status": row.get("status") if row.get("status") in {"Started", "Accepted", "Succeeded", "Failed"} else "Unknown",
+                "event_id": row.get("eventDataId") if re.fullmatch(GUID, str(row.get("eventDataId", ""))) else None,
+                "correlation_id": row.get("correlationId") if re.fullmatch(GUID, str(row.get("correlationId", ""))) else None,
+                "errors": error_details(raw),
+            })
+        self.summary["rejection_activity"] = observations
+        self.summary["inspection_only"] = True
+        self.result("rejection_inspected", success=True)
+
     def submit(self):
         receipt = self.summary["request"]
         receipt.update(attempted=True, accepted=None, ambiguous=True, attempted_at=utc_now(),
@@ -578,7 +641,7 @@ class Request:
             receipt["provider_request_id"] = request_id
         if isinstance(reply.payload, dict) and isinstance(reply.payload.get("error"), dict):
             code = reply.payload["error"].get("code")
-            if isinstance(code, str) and code in ERROR_CODES:
+            if provider_code(code):
                 receipt["provider_error_code"] = code
         if reply.status not in {200, 202}:
             if reply.status in {400, 401, 403, 404, 409, 422}:
@@ -608,6 +671,8 @@ class Request:
         require(isinstance(args.timeout_seconds, int) and not isinstance(args.timeout_seconds, bool)
                 and 0 < args.timeout_seconds <= 1800,
                 "timeout_out_of_bounds")
+        require(not getattr(args, "inspect_rejection", False) or not args.execute,
+                "rejection_inspection_is_read_only")
         checkpoint, output = Path(args.native_checkpoint), Path(args.summary_file)
         require(not output.is_symlink() and not checkpoint.is_symlink() and not self.journal.is_symlink()
                 and len({checkpoint.resolve(), output.resolve(), self.journal.resolve()}) == 3,
@@ -647,7 +712,7 @@ class Request:
             for key in ("http_status", "response_limit"):
                 if key in receipt:
                     self.summary["request"][key] = unsigned(receipt[key])
-            if receipt.get("provider_error_code") in ERROR_CODES:
+            if provider_code(receipt.get("provider_error_code")):
                 self.summary["request"]["provider_error_code"] = receipt["provider_error_code"]
             provider_id = receipt.get("provider_request_id")
             if isinstance(provider_id, str) and re.fullmatch(GUID, provider_id):
@@ -656,6 +721,9 @@ class Request:
         self.can_replace_summary = True
         self.scope()
         evidence, records = self.current(), self.history()
+        if getattr(args, "inspect_rejection", False):
+            self.inspect_rejection()
+            return
         if self.summary["request"]["attempted"]:
             self.observe()
             return
@@ -720,6 +788,7 @@ def parse_args(argv=None):
     parser.add_argument("--summary-file", required=True)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--timeout-seconds", type=int, default=900)
+    parser.add_argument("--inspect-rejection", action="store_true")
     return parser.parse_args(argv)
 
 

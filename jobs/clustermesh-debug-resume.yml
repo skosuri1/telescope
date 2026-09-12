@@ -97,6 +97,7 @@ jobs:
     eq(variables['CLUSTERMESH_UNREACHABLE_WORKER_RESUME_REPLACEMENT_BUILD_ID'], '0'),
     ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_QUOTA_OBSERVE_ONLY'], 'true'),
     eq(variables['CLUSTERMESH_DV3_QUOTA_REQUEST_LIMIT'], '0'),
+    eq(variables['CLUSTERMESH_QUOTA_REQUEST_RECEIPT_BUILD_ID'], '0'),
     ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'),
     ne(variables['CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY'], 'true'))
   variables:
