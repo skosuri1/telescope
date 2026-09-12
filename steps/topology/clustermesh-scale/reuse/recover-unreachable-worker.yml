@@ -11,6 +11,9 @@ parameters:
     type: string
   - name: plan_json
     type: string
+  - name: reimage_failed_os
+    type: boolean
+    default: false
 
 steps:
   - script: |
@@ -43,6 +46,12 @@ steps:
         --plan-file "$summary_dir/input-plan.json"
         --timeout-seconds 1800
       )
+      reimage_failed_os="${REIMAGE_FAILED_OS:-false}"
+      case "${reimage_failed_os,,}" in
+        true) args+=(--reimage-failed-os) ;;
+        false) ;;
+        *) echo "REIMAGE_FAILED_OS must be true or false." >&2; exit 1 ;;
+      esac
       python3 "$helper" "${args[@]}" \
         --summary-file "$summary_dir/plan-only.json"
       jq -e '.execute == false and .mutation_started == false
@@ -61,6 +70,7 @@ steps:
       CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
       EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
       RECOVERY_PLAN_JSON: ${{ parameters.plan_json }}
+      REIMAGE_FAILED_OS: "${{ parameters.reimage_failed_os }}"
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish unreachable-worker recovery evidence"

@@ -48,6 +48,8 @@ REAL_UIDS = {
     f"{DEFAULT_VMSS}000001": "c673a142-17ac-44c7-92cc-32efc0d34c61",
 }
 SOURCE_NC = "ffd9a896-50c2-4070-97e8-040d4c06361f"
+FAILED_PROM_VM_ID = "d731b838-501d-438d-a087-fd4545f1d607"
+OS_FAILURE_CODE = "ProvisioningState/failed/OSProvisioningClientError"
 PROVIDER = (
     f"azure:///subscriptions/{SUBSCRIPTION}/resourceGroups/{NODE_GROUP}/"
     f"providers/Microsoft.Compute/virtualMachineScaleSets/{PROM_VMSS}/virtualMachines/0"
@@ -427,6 +429,7 @@ class Recovery(maintenance.ClusterOperator):
         self.probe = None
         self.exclusions = []
         self.cleanup_done = False
+        self.host_action = "reimage" if getattr(args, "reimage_failed_os", False) else "restart"
         self.targets = [{
             "namespace": "kube-system", "pod_name": plan["api_pod_name"], "pod_uid": plan["api_pod_uid"],
             "replica_set_name": plan["api_replica_set_name"], "replica_set_uid": plan["api_replica_set_uid"],
@@ -534,7 +537,7 @@ class Recovery(maintenance.ClusterOperator):
         self.save()
         return selected, connected
 
-    def models(self, *, restarting=False):
+    def models(self, *, restarting=False, allow_failed_os=False):
         operation = self.az_json(
             "aks", "operation", "show-latest", "--resource-group", RESOURCE_GROUP,
             "--name", CLUSTER, "--query", OPERATION_QUERY,
@@ -559,6 +562,7 @@ class Recovery(maintenance.ClusterOperator):
                 and {row.get("name") for row in vmsses} == {DEFAULT_VMSS, PROM_VMSS},
                 "VMSS inventory is not exactly the original two scale sets")
         stable = True
+        self.summary["os_reimage_eligible"] = False
         for pool in pools:
             pool_name = pool["name"]
             count = 1 if pool_name == "prompool" else 2
@@ -576,6 +580,8 @@ class Recovery(maintenance.ClusterOperator):
                 "provisioning_state": vmss.get("provisioningState"), "sku": vmss.get("sku"),
             }
             self.save()
+            reimaging = restarting and self.host_action == "reimage" and pool_name == "prompool"
+            known_os_failure = False
             if pool_name == "prompool" and vmss.get("provisioningState") == "Failed":
                 require(
                     prepared.resource_equal(vmss.get("id"), vmss_id)
@@ -584,6 +590,39 @@ class Recovery(maintenance.ClusterOperator):
                     "Failed prompool VMSS ownership is not exact",
                 )
                 self.capture_failed_prom_instance(evidence, vmss_id)
+                diagnostic = evidence["failed_prom_instance_diagnostics"]
+                failed_instances = diagnostic["instances"]
+                status_codes = {row.get("code") for row in diagnostic.get("statuses", [])}
+                known_os_failure = (
+                    self.host_action == "reimage"
+                    and (allow_failed_os or reimaging)
+                    and len(failed_instances) == 1
+                    and str(failed_instances[0].get("instanceId")) == "0"
+                    and failed_instances[0].get("vmId") == FAILED_PROM_VM_ID
+                    and failed_instances[0].get("provisioningState") == "Failed"
+                    and failed_instances[0].get("latestModelApplied") is True
+                    and OS_FAILURE_CODE in status_codes and "PowerState/running" in status_codes
+                    and any(row.get("code") == OS_FAILURE_CODE
+                            for row in diagnostic.get("scale_set_statuses", []))
+                )
+                if known_os_failure and not reimaging:
+                    failures = [row for row in diagnostic["statuses"] if row.get("code") == OS_FAILURE_CODE]
+                    require(all(
+                        (datetime.now(timezone.utc) - timestamp(row.get("time"), "OS provisioning failure"))
+                        .total_seconds() >= 300 for row in failures
+                    ), "The diagnosed OS provisioning failure is not stably terminal")
+                if known_os_failure and reimaging:
+                    requested = timestamp(self.summary["restart"]["requested_at"], "OS reimage request")
+                    failures = [row for row in diagnostic["statuses"] if row.get("code") == OS_FAILURE_CODE]
+                    require(all(timestamp(row.get("time"), "OS provisioning failure") < requested for row in failures),
+                            "The single OS reimage returned a new provisioning failure")
+                self.summary["os_reimage_eligible"] = known_os_failure
+                self.save()
+            vmss_states = {"Succeeded"}
+            if known_os_failure:
+                vmss_states.add("Failed")
+            if reimaging:
+                vmss_states.update(("Updating", "Creating"))
             require(
                 integer(pool.get("count")) and pool["count"] == count
                 and pool.get("enableAutoScaling") is False
@@ -592,7 +631,7 @@ class Recovery(maintenance.ClusterOperator):
                 and prepared.resource_equal(pool.get("id"), f"{self.authority_pin['clusters'][ROLE]}/agentPools/{pool_name}")
                 and prepared.resource_equal(vmss.get("id"), vmss_id)
                 and str(vmss.get("location", "")).lower() == REGION
-                and vmss.get("provisioningState") == "Succeeded"
+                and vmss.get("provisioningState") in vmss_states
                 and vmss.get("orchestrationMode") == "Uniform"
                 and workers.vmss_pool_name(vmss) == pool_name
                 and integer((vmss.get("sku") or {}).get("capacity"))
@@ -638,28 +677,52 @@ class Recovery(maintenance.ClusterOperator):
                 power = [code for code in codes if isinstance(code, str) and code.startswith("PowerState/")]
                 provisioning = [code for code in codes if isinstance(code, str) and code.startswith("ProvisioningState/")]
                 allowed_transition = restarting and name == PROM_NODE
+                failed_os_vm = known_os_failure and name == PROM_NODE
+                instance_states = {"Succeeded"}
+                power_states = {"PowerState/running"}
+                provisioning_states = {"ProvisioningState/succeeded"}
+                if allowed_transition:
+                    instance_states.add("Updating")
+                    power_states.add("PowerState/starting")
+                    provisioning_states.add("ProvisioningState/updating")
+                if reimaging:
+                    instance_states.add("Creating")
+                    power_states.update(("PowerState/stopping", "PowerState/stopped"))
+                    provisioning_states.add("ProvisioningState/creating")
+                if failed_os_vm:
+                    instance_states.add("Failed")
+                    provisioning_states.add(OS_FAILURE_CODE)
                 require(
                     len(power) == len(provisioning) == 1
-                    and instance.get("provisioningState") in (("Succeeded", "Updating") if allowed_transition else ("Succeeded",))
-                    and power[0] in (("PowerState/running", "PowerState/starting") if allowed_transition else ("PowerState/running",))
-                    and provisioning[0] in (
-                        ("ProvisioningState/succeeded", "ProvisioningState/updating")
-                        if allowed_transition else ("ProvisioningState/succeeded",)
-                    ),
+                    and instance.get("provisioningState") in instance_states
+                    and power[0] in power_states and provisioning[0] in provisioning_states
+                    and (not failed_os_vm or instance["vmId"] == FAILED_PROM_VM_ID),
                     f"{name}: VM is stopped, failed, busy, or not safely Running/Succeeded",
                 )
                 extensions = view.get("extensions") or []
                 require(isinstance(extensions, list), f"{name}: extension state is malformed")
+                pending_extensions = failed_os_vm or (reimaging and name == PROM_NODE)
+                extension_states = {"ProvisioningState/succeeded"}
+                if pending_extensions:
+                    extension_states.update(("ProvisioningState/creating", "ProvisioningState/updating",
+                                             "ProvisioningState/transitioning"))
                 require(all(
-                    isinstance(row, dict) and isinstance(row.get("statuses"), list) and row["statuses"]
-                    and all(status.get("code") == "ProvisioningState/succeeded" for status in row["statuses"])
+                    isinstance(row, dict) and isinstance(row.get("statuses"), list)
+                    and (row["statuses"] or pending_extensions)
+                    and all(status.get("code") in extension_states for status in row["statuses"])
                     for row in extensions
                 ), f"{name}: VM extension operations are not safely Succeeded")
-                is_stable = instance["provisioningState"] == "Succeeded" and {
-                    "PowerState/running", "ProvisioningState/succeeded",
-                } <= set(codes)
+                is_stable = (
+                    vmss.get("provisioningState") == "Succeeded"
+                    and instance["provisioningState"] == "Succeeded"
+                    and {"PowerState/running", "ProvisioningState/succeeded"} <= set(codes)
+                    and all(row["statuses"] and all(status.get("code") == "ProvisioningState/succeeded"
+                                                   for status in row["statuses"]) for row in extensions)
+                )
                 stable = stable and is_stable
-        pin = {"pools": evidence["pools"], "vmsses": evidence["vmsses"],
+        pin = {"pools": evidence["pools"],
+               "vmsses": {name: {key: value for key, value in row.items() if key != "provisioning_state"}
+                          for name, row in evidence["vmsses"].items()},
                "instances": {name: (row["id"], row["vm_id"]) for name, row in evidence["instances"].items()}}
         require(self.model_pin is None or pin == self.model_pin, "Pool configuration or VM model/count changed")
         self.model_pin = pin
@@ -1092,7 +1155,7 @@ class Recovery(maintenance.ClusterOperator):
             raise workers.ReconcileError("Foreign/malformed restart marker must not be cleared") from error
         require(
             isinstance(marker, dict) and marker.get("owner") == OWNER and marker.get("schema_version") == 1
-            and marker.get("action") == "single-instance-restart"
+            and marker.get("action") == f"single-instance-{self.host_action}"
             and marker.get("node_uid") == REAL_UIDS[PROM_NODE] and marker.get("provider_id") == PROVIDER
             and marker.get("plan_sha256") == self.summary["plan_sha256"]
             and isinstance(marker.get("token"), str) and maintenance.UUID_RE.fullmatch(marker["token"])
@@ -1112,12 +1175,15 @@ class Recovery(maintenance.ClusterOperator):
         nodes, _ = self.guard(snapshot)
         host = nodes[PROM_NODE]
         record = self.summary["restart"]
+        record["action"] = self.host_action
         resumed = self.prior_marker(host)
         if not resumed and workers.node_is_ready(host):
             record["skipped_reason"] = "host-already-ready"
         elif not resumed:
             self.authority()
-            self.models()
+            self.models(allow_failed_os=self.host_action == "reimage")
+            require(self.host_action != "reimage" or self.summary["os_reimage_eligible"],
+                    "OS reimage requires the exact pinned OSProvisioningClientError VM")
             snapshot = self.snapshot()
             nodes, _ = self.guard(snapshot, host_unready=True)
             host = nodes[PROM_NODE]
@@ -1129,7 +1195,7 @@ class Recovery(maintenance.ClusterOperator):
                 "schema_version": 1, "owner": OWNER, "token": str(uuid.uuid4()),
                 "node_uid": REAL_UIDS[PROM_NODE], "provider_id": PROVIDER,
                 "previous_boot_id": previous, "plan_sha256": self.summary["plan_sha256"],
-                "recorded_at": workers.utc_now(), "action": "single-instance-restart",
+                "recorded_at": workers.utc_now(), "action": f"single-instance-{self.host_action}",
             }
             self.marker = json.dumps(marker, sort_keys=True, separators=(",", ":"))
             record.update({"previous_boot_id": previous, "marker": marker, "marker_write_attempted": True})
@@ -1142,7 +1208,9 @@ class Recovery(maintenance.ClusterOperator):
                 {"op": "add", "path": "/metadata/annotations", "value": annotations},
             ])])
             self.authority()
-            self.models()
+            self.models(allow_failed_os=self.host_action == "reimage")
+            require(self.host_action != "reimage" or self.summary["os_reimage_eligible"],
+                    "The pinned OS provisioning failure changed before reimage")
             latest = self.snapshot()
             latest_nodes, _ = self.guard(latest, host_unready=True)
             require(maintenance._annotations(latest_nodes[PROM_NODE]).get(MARKER_KEY) == self.marker,
@@ -1151,7 +1219,7 @@ class Recovery(maintenance.ClusterOperator):
             record.update({"attempted": True, "accepted": None, "ambiguous": True, "requested_at": workers.utc_now()})
             self.save()
             self.write([
-                "az", "vmss", "restart", "--resource-group", NODE_GROUP, "--name", PROM_VMSS,
+                "az", "vmss", self.host_action, "--resource-group", NODE_GROUP, "--name", PROM_VMSS,
                 "--instance-ids", "0", "--no-wait", "--only-show-errors", "--output", "none",
             ])
             record.update({"accepted": True, "ambiguous": False})
@@ -1598,7 +1666,7 @@ class Recovery(maintenance.ClusterOperator):
 
     def execute(self):
         self.authority()
-        self.models()
+        self.models(allow_failed_os=self.host_action == "reimage")
         super().run([
             "az", "aks", "get-credentials", "--resource-group", RESOURCE_GROUP, "--name", CLUSTER,
             "--file", self.args.kubeconfig, "--context", CLUSTER, "--only-show-errors",
@@ -1611,6 +1679,8 @@ class Recovery(maintenance.ClusterOperator):
         self.prior_marker(nodes[PROM_NODE])
         if not workers.node_is_ready(nodes[PROM_NODE]):
             self.guard(self.initial, host_unready=True)
+            require(self.host_action != "reimage" or self.summary["os_reimage_eligible"],
+                    "OS reimage is restricted to the exact diagnosed OS provisioning failure")
         decisions = []
         for target in self.targets:
             state, _ = self.target_state(self.initial, target)
@@ -1622,6 +1692,7 @@ class Recovery(maintenance.ClusterOperator):
             "plan_valid": True, "effective_targets": self.targets,
             "planned_actions": {
                 "restart_required": not workers.node_is_ready(nodes[PROM_NODE]),
+                "host_action": self.host_action,
                 "vmss_name": PROM_VMSS, "instance_ids": ["0"], "pods": decisions,
             },
             "controller_pins": frozen_controllers(self.initial), "pdb_pins": frozen_pdbs(self.initial),
@@ -1728,6 +1799,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--summary-file", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--reimage-failed-os", action="store_true")
     return parser.parse_args(argv)
 
 

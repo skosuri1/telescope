@@ -171,6 +171,19 @@ the pinned VM's status/extension codes before refusing mutation. Failed models
 are never accepted as restart-ready, and private model or extension settings
 are not included in this diagnostic capture.
 
+`scaleDebugUnreachableWorkerReimageFailedOs=true` selects a separate, explicit
+OS-reimage action for the captured mesh-96 VM ID and
+`OSProvisioningClientError` only. It never restarts a Failed VM as though it
+were healthy. The failure must be stably terminal, the target host must still
+have no Ready or PVC-backed Pods, and all existing identity, controller,
+healthy-default, and KWOK protections remain required. Only instance `0` of
+the pinned prompool scale set is reimaged once; no OS-model, data-disk, pool
+count, or default-worker changes are requested. Owned in-flight provisioning
+states can be observed after that accepted action, but success still requires
+fully Succeeded/Running models, a new boot, Ready Pods, and strict peer/Fleet
+postproof. A new provisioning failure or ambiguous request retains the marker
+and fails without another reimage.
+
 ### Planned single-worker CNI maintenance
 
 `cni_worker_maintenance.py` provides the local operator path for one explicitly

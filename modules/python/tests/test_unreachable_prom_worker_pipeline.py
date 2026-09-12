@@ -84,6 +84,7 @@ def test_recovery_mode_excludes_other_mutation_paths():
     assert invocation["template"] == f"/{JOB}"
     assert invocation["parameters"]["plan_json"] == "${{ parameters.scaleDebugUnreachableWorkerPlanJson }}"
     assert invocation["parameters"]["run_workload"] == "${{ parameters.scaleDebugRunWorkload }}"
+    assert invocation["parameters"]["reimage_failed_os"] == "${{ parameters.scaleDebugUnreachableWorkerReimageFailedOs }}"
     for key in stage["jobs"][1:3]:
         assert "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)" in next(iter(key))
     normal = template("jobs/clustermesh-debug-resume.yml")["jobs"][0]
@@ -108,7 +109,10 @@ def test_recovery_mode_excludes_other_mutation_paths():
     ("confirm", 0, 1),
     ("malformed", 0, 1),
 ])
-def test_recovery_step_plans_before_exact_execution(tmp_path, failure, expected_calls, expected_code):
+@pytest.mark.parametrize("reimage_failed_os", ["False", "True"])
+def test_recovery_step_plans_before_exact_execution(
+    tmp_path, failure, expected_calls, expected_code, reimage_failed_os,
+):
     script = template(STEP)["steps"][0]["script"]
     script = script.replace("$(Build.ArtifactStagingDirectory)", str(tmp_path / "artifacts"))
     script = script.replace("$(Pipeline.Workspace)/s", str(REPOSITORY))
@@ -155,6 +159,7 @@ def test_recovery_step_plans_before_exact_execution(tmp_path, failure, expected_
     environment = {
         **os.environ, **ENVIRONMENT, "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "CALLS_FILE": str(calls_file), "FAKE_FAILURE": failure,
+        "REIMAGE_FAILED_OS": reimage_failed_os,
     }
     if failure == "confirm":
         environment["CONFIRM_RESUME"] = "different"
@@ -171,6 +176,7 @@ def test_recovery_step_plans_before_exact_execution(tmp_path, failure, expected_
     assert len(calls) == expected_calls
     if calls:
         assert "--execute" not in calls[0]
+        assert ("--reimage-failed-os" in calls[0]) is (reimage_failed_os == "True")
         assert calls[0][0].endswith("/unreachable_prom_worker_recovery.py")
         assert calls[0][calls[0].index("--resource-group") + 1] == ENVIRONMENT["RUN_ID"]
         assert calls[0][calls[0].index("--expected-subscription") + 1] == "test-subscription"

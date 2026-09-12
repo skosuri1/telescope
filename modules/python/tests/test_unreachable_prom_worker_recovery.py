@@ -226,6 +226,10 @@ class FakeCloud:
             }]},
         } for name, row_uid in recovery.REAL_UIDS.items()]
         self.make_scope()
+        self.scale_view = {
+            "statuses": [{"code": "ProvisioningState/failed", "message": "must-not-be-published"}],
+            "virtualMachines": [{"code": "ProvisioningState/failed", "count": 1}],
+        }
 
     def make_scope(self):
         scope = f"/subscriptions/{recovery.SUBSCRIPTION}/resourceGroups/{recovery.RESOURCE_GROUP}"
@@ -413,11 +417,7 @@ class FakeCloud:
         if route == ["vmss", "get-instance-view"]:
             if "--instance-id" not in command:
                 assert self.value(command, "--query") == recovery.SCALE_VIEW_QUERY
-                return {
-                    "statuses": [{"code": "ProvisioningState/failed",
-                                  "message": "must-not-be-published"}],
-                    "virtualMachines": [{"code": "ProvisioningState/failed", "count": 1}],
-                }
+                return self.scale_view
             assert self.value(command, "--query") == recovery.VIEW_QUERY
             return self.views[(self.value(command, "--name"), self.value(command, "--instance-id"))]
         if route == ["aks", "get-credentials"]:
@@ -428,7 +428,7 @@ class FakeCloud:
             assert tempfile.tempdir == str(path.parent.resolve())
             path.write_text("fake offline kubeconfig", encoding="utf-8")
             return ""
-        if route == ["vmss", "restart"]:
+        if route in (["vmss", "restart"], ["vmss", "reimage"]):
             self.writes.append(command)
             assert self.value(command, "--resource-group") == recovery.NODE_GROUP
             assert self.value(command, "--name") == recovery.PROM_VMSS
@@ -439,6 +439,14 @@ class FakeCloud:
             assert recovery.MARKER_KEY in self.nodes[recovery.PROM_NODE]["metadata"]["annotations"]
             if self.restart_error:
                 raise recovery.workers.ReconcileError(self.restart_error)
+            if route == ["vmss", "reimage"]:
+                assert getattr(self.args, "reimage_failed_os", False)
+                self.vmsses[1]["provisioningState"] = "Succeeded"
+                self.instances[recovery.PROM_VMSS][0]["provisioningState"] = "Succeeded"
+                self.views[(recovery.PROM_VMSS, "0")] = {
+                    "statuses": [{"code": "ProvisioningState/succeeded"}, {"code": "PowerState/running"}],
+                    "extensions": [{"name": "vmssCSE", "statuses": [{"code": "ProvisioningState/succeeded"}]}],
+                }
             self.recover_host()
             if self.restart_callback:
                 self.restart_callback()
@@ -811,6 +819,108 @@ def test_failed_prom_parent_records_missing_original_vm(environment):
     observed = receipt()["arm_metadata"]["failed_prom_instance_diagnostics"]
     assert observed["instances"] == [] and "absent" in observed["error"]
     assert not fake.writes and not fake.deleted
+
+
+def diagnosed_os_failure(environment):
+    args, _, fake = environment
+    args.reimage_failed_os = True
+    old = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
+    fake.vmsses[1]["provisioningState"] = "Failed"
+    fake.instances[recovery.PROM_VMSS][0].update(
+        provisioningState="Failed", vmId=recovery.FAILED_PROM_VM_ID,
+    )
+    fake.scale_view["statuses"] = [{"code": recovery.OS_FAILURE_CODE, "time": old}]
+    fake.views[(recovery.PROM_VMSS, "0")] = {
+        "statuses": [{"code": recovery.OS_FAILURE_CODE, "time": old}, {"code": "PowerState/running"}],
+        "extensions": [{"name": "vmssCSE", "statuses": []}],
+    }
+    return fake
+
+
+def test_exact_os_failure_plan_is_read_only_and_names_reimage(environment):
+    fake = diagnosed_os_failure(environment)
+    summary = run(environment, execute=False)
+    assert summary["plan_valid"] and not summary["mutation_started"]
+    assert summary["planned_actions"]["host_action"] == "reimage"
+    assert summary["os_reimage_eligible"]
+    assert not fake.writes and not fake.deleted
+
+
+def test_exact_os_failure_reimages_one_vm_then_requires_full_postproof(environment):
+    fake = diagnosed_os_failure(environment)
+    summary = run(environment, execute=True)
+    operations = [command for command in fake.writes if command[0] == "az"]
+    assert len(operations) == 1 and operations[0][1:3] == ["vmss", "reimage"]
+    assert fake.value(operations[0], "--instance-ids") == "0"
+    assert summary["restart"]["action"] == "reimage" and summary["restart"]["accepted"]
+    assert summary["repaired"] and summary["restart"]["marker_removed"]
+
+
+@pytest.mark.parametrize("fault", ["no-opt-in", "vm-id", "error-code", "power-stopped", "default-failed"])
+def test_reimage_does_not_waive_unrelated_failed_state_guards(environment, fault):
+    args, _, _ = environment
+    fake = diagnosed_os_failure(environment)
+    if fault == "no-opt-in":
+        args.reimage_failed_os = False
+    elif fault == "vm-id":
+        fake.instances[recovery.PROM_VMSS][0]["vmId"] = uid("different-vm")
+    elif fault == "error-code":
+        fake.views[(recovery.PROM_VMSS, "0")]["statuses"][0]["code"] = "ProvisioningState/failed/OtherError"
+    elif fault == "power-stopped":
+        fake.views[(recovery.PROM_VMSS, "0")]["statuses"][1]["code"] = "PowerState/stopped"
+    else:
+        fake.vmsses[0]["provisioningState"] = "Failed"
+    with pytest.raises(recovery.workers.ReconcileError):
+        run(environment, execute=True)
+    assert not fake.writes and not fake.deleted
+
+
+def test_ambiguous_os_reimage_retains_durable_marker_without_retry(environment):
+    fake = diagnosed_os_failure(environment)
+    fake.restart_error = "command timed out after 45s"
+    with pytest.raises(recovery.workers.ReconcileError, match="timed out"):
+        run(environment, execute=True)
+    operations = [command for command in fake.writes if command[1:3] == ["vmss", "reimage"]]
+    assert len(operations) == 1
+    assert receipt()["restart"]["ambiguous"] and receipt()["restart"]["accepted"] is None
+    assert recovery.MARKER_KEY in fake.nodes[recovery.PROM_NODE]["metadata"]["annotations"]
+    assert not fake.deleted
+
+
+def test_reimage_never_runs_against_a_healthy_model_without_the_os_fault(environment):
+    args, _, fake = environment
+    args.reimage_failed_os = True
+    with pytest.raises(recovery.workers.ReconcileError, match="exact diagnosed"):
+        run(environment, execute=True)
+    assert not fake.writes and not fake.deleted
+
+
+def test_recent_os_failure_is_not_reimaged(environment):
+    fake = diagnosed_os_failure(environment)
+    fake.views[(recovery.PROM_VMSS, "0")]["statuses"][0]["time"] = now()
+    with pytest.raises(recovery.workers.ReconcileError, match="stably terminal"):
+        run(environment, execute=True)
+    assert not fake.writes and not fake.deleted
+
+
+def test_failed_reimage_is_not_repeated_or_accepted_as_healthy(environment):
+    fake = diagnosed_os_failure(environment)
+
+    def fail_again():
+        fake.nodes[recovery.PROM_NODE]["status"]["conditions"][0]["status"] = "Unknown"
+        fake.vmsses[1]["provisioningState"] = "Failed"
+        fake.instances[recovery.PROM_VMSS][0]["provisioningState"] = "Failed"
+        fake.views[(recovery.PROM_VMSS, "0")]["statuses"] = [
+            {"code": recovery.OS_FAILURE_CODE, "time": now()}, {"code": "PowerState/running"},
+        ]
+
+    fake.restart_callback = fail_again
+    with pytest.raises(recovery.workers.ReconcileError, match="new provisioning failure"):
+        run(environment, execute=True)
+    assert len([row for row in fake.writes if row[1:3] == ["vmss", "reimage"]]) == 1
+    assert not receipt()["success"] and not receipt()["repaired"]
+    assert recovery.MARKER_KEY in fake.nodes[recovery.PROM_NODE]["metadata"]["annotations"]
+    assert not fake.deleted
 
 
 @pytest.mark.parametrize("fault", [
