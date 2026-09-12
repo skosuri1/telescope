@@ -226,6 +226,19 @@ AKS operation, and the previously audited accidental n2 resource group in the
 same subscription. It never retries restoration, raises quota, or deletes
 resources. Its completed observation is not host recovery or workload readiness.
 
+Capacity continuation uses the same original accepted-action and native-operation
+builds, with `scaleDebugUnreachableWorkerQuotaObserveOnly=false`. It accepts only
+the recorded quota rejection after native zero, then freshly requires the empty
+User pool, unchanged healthy default workers, original mock/KWOK identities,
+controller/PDB pins, and no later provider operation or replacement. Both the
+family and total-regional quota must have eight free cores before any write.
+An exclusive UID/token-guarded ConfigMap journals one new scale-to-one attempt;
+the old ambiguous receipt remains unchanged alongside its fresh disambiguation.
+No deletion, reimage, quota update, or resource cleanup is replayed. The journal
+is retained as a non-workload audit record, including on failure, and later
+retries cannot simply overwrite it. New-host and framework recovery still need
+the full scheduling, actual-IP, memory, applicable-DaemonSet, and peer/Fleet proof.
+
 ### Planned single-worker CNI maintenance
 
 `cni_worker_maintenance.py` provides the local operator path for one explicitly

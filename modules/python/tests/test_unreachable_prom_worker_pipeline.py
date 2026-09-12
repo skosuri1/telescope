@@ -72,7 +72,6 @@ def template(path):
     {"RESUME_REPLACEMENT_BUILD_ID": "-1"},
     {"QUOTA_OBSERVE_ONLY": "True"},
     {"RESUME_REPLACEMENT_BUILD_ID": "79894", "QUOTA_OBSERVE_ONLY": "True"},
-    {"RESUME_REPLACEMENT_BUILD_ID": "79894", "REPLACE_FAILED_HOST_BUILD_ID": "79880"},
 ])
 def test_recovery_job_requires_complete_exclusive_mode(changes):
     result = subprocess.run(
@@ -90,6 +89,8 @@ def test_recovery_job_requires_complete_exclusive_mode(changes):
     {"OBSERVE_BUILD_ID": "79880", "REIMAGE_FAILED_OS": "True"},
     {"RESUME_REPLACEMENT_BUILD_ID": "79894", "REPLACE_FAILED_HOST_BUILD_ID": "79880",
      "QUOTA_OBSERVE_ONLY": "True", "RECOVERY_PLAN_JSON": ""},
+    {"RESUME_REPLACEMENT_BUILD_ID": "79894", "REPLACE_FAILED_HOST_BUILD_ID": "79880",
+     "RECOVERY_PLAN_JSON": ""},
 ])
 def test_recovery_job_accepts_distinct_checkpoint_modes(changes):
     result = subprocess.run(
@@ -176,6 +177,9 @@ def test_recovery_mode_excludes_other_mutation_paths():
     ("mutate-checkpoint", 1, 1),
     ("artifact-plan", 2, 0),
     ("missing-artifact-plan", 0, 1),
+    ("resume-native", 2, 0),
+    ("missing-native-checkpoint", 0, 1),
+    ("mutate-native-checkpoint", 1, 1),
 ])
 @pytest.mark.parametrize("reimage_failed_os", ["False", "True"])
 def test_recovery_step_plans_before_exact_execution(
@@ -219,6 +223,9 @@ def test_recovery_step_plans_before_exact_execution(
             if failure == "mutate-checkpoint" and not execute:
                 checkpoint = Path(args[args.index("--replace-failed-host") + 1])
                 checkpoint.write_text("{}", encoding="utf-8")
+            if failure == "mutate-native-checkpoint" and not execute:
+                checkpoint = Path(args[args.index("--resume-replacement") + 1])
+                checkpoint.write_text("{}", encoding="utf-8")
             if failure == "plan" and not execute:
                 sys.exit(7)
             if failure == "execute" and execute:
@@ -248,6 +255,7 @@ def test_recovery_step_plans_before_exact_execution(
     replacing = failure in (
         "replace", "missing-replacement-checkpoint", "mutate-checkpoint",
         "artifact-plan", "missing-artifact-plan",
+        "resume-native", "missing-native-checkpoint", "mutate-native-checkpoint",
     )
     if replacing:
         environment["REPLACE_FAILED_HOST_BUILD_ID"] = "79880"
@@ -261,6 +269,12 @@ def test_recovery_step_plans_before_exact_execution(
                 (checkpoint.parent / "input-plan.json").write_text(json.dumps(PLAN), encoding="utf-8")
         if failure in ("artifact-plan", "missing-artifact-plan"):
             environment["RECOVERY_PLAN_JSON"] = ""
+        if failure in ("resume-native", "missing-native-checkpoint", "mutate-native-checkpoint"):
+            environment["RESUME_REPLACEMENT_BUILD_ID"] = "79894"
+            if failure != "missing-native-checkpoint":
+                native = tmp_path / "workspace" / "native-host-action-79894" / "recovery.json"
+                native.parent.mkdir(parents=True)
+                native.write_text('{"native_checkpoint": true}', encoding="utf-8")
     result = subprocess.run(
         ["bash", "-c", script], env=environment, capture_output=True,
         text=True, check=False, timeout=10,
@@ -288,6 +302,8 @@ def test_recovery_step_plans_before_exact_execution(
             assert "--replace-failed-host" in calls[0]
             assert "--observe-accepted-action" not in calls[0]
             assert "--reimage-failed-os" not in calls[0]
+        if failure in ("resume-native", "mutate-native-checkpoint"):
+            assert "--resume-replacement" in calls[0]
     if len(calls) == 2:
         assert calls[1][-1] == "--execute"
         assert calls[0][:calls[0].index("--summary-file")] == calls[1][:calls[1].index("--summary-file")]

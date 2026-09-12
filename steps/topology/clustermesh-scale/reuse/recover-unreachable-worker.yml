@@ -20,6 +20,9 @@ parameters:
   - name: replace_failed_host_build_id
     type: number
     default: 0
+  - name: resume_replacement_build_id
+    type: number
+    default: 0
 
 steps:
   - script: |
@@ -81,6 +84,7 @@ steps:
       fi
       timeout_seconds=1800
       accepted_sha=""
+      native_sha=""
       if [ "$replace_build_id" != "0" ]; then
         accepted="$(Pipeline.Workspace)/accepted-failed-host-$replace_build_id/recovery.json"
         if [ ! -s "$accepted" ]; then
@@ -91,6 +95,22 @@ steps:
         accepted_sha=$(sha256sum "$summary_dir/accepted-action.json" | awk '{print $1}')
         args+=(--replace-failed-host "$summary_dir/accepted-action.json")
         timeout_seconds=3600
+      fi
+      resume_build_id="${RESUME_REPLACEMENT_BUILD_ID:-0}"
+      if ! [[ "$resume_build_id" =~ ^(0|[1-9][0-9]*)$ ]] ||
+        { [ "$resume_build_id" != "0" ] && [ "$replace_build_id" = "0" ]; }; then
+        echo "Capacity continuation requires a canonical native checkpoint and original accepted-action source." >&2
+        exit 1
+      fi
+      if [ "$resume_build_id" != "0" ]; then
+        native="$(Pipeline.Workspace)/native-host-action-$resume_build_id/recovery.json"
+        if [ ! -s "$native" ]; then
+          echo "The native removal/restoration outcome is required for capacity continuation." >&2
+          exit 1
+        fi
+        cp "$native" "$summary_dir/native-action.json"
+        native_sha=$(sha256sum "$summary_dir/native-action.json" | awk '{print $1}')
+        args+=(--resume-replacement "$summary_dir/native-action.json")
       fi
       args+=(--timeout-seconds "$timeout_seconds")
       if [ "$observe_build_id" != "0" ]; then
@@ -120,6 +140,11 @@ steps:
         echo "The accepted-action lineage changed during read-only planning." >&2
         exit 1
       fi
+      if [ -n "$native_sha" ] &&
+        [ "$(sha256sum "$summary_dir/native-action.json" | awk '{print $1}')" != "$native_sha" ]; then
+        echo "The native-action checkpoint changed during read-only planning." >&2
+        exit 1
+      fi
       python3 "$helper" "${args[@]}" \
         --summary-file "$summary_dir/recovery.json" --execute
     displayName: "Plan then recover the exact unreachable worker and failed framework pods"
@@ -132,6 +157,7 @@ steps:
       REIMAGE_FAILED_OS: "${{ parameters.reimage_failed_os }}"
       OBSERVE_BUILD_ID: "${{ parameters.observe_build_id }}"
       REPLACE_FAILED_HOST_BUILD_ID: "${{ parameters.replace_failed_host_build_id }}"
+      RESUME_REPLACEMENT_BUILD_ID: "${{ parameters.resume_replacement_build_id }}"
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish unreachable-worker recovery evidence"

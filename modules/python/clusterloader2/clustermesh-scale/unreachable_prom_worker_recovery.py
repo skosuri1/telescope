@@ -293,7 +293,7 @@ def load_plan(path: str) -> dict:
 def validate_paths(args) -> None:
     require(Path(args.plan_file).resolve() != Path(args.summary_file).resolve(),
             "Plan and summary must be different files")
-    for name in ("observe_accepted_action", "replace_failed_host"):
+    for name in ("observe_accepted_action", "replace_failed_host", "resume_replacement"):
         checkpoint = getattr(args, name, None)
         require(not checkpoint or Path(checkpoint).resolve() not in {
             Path(args.plan_file).resolve(), Path(args.summary_file).resolve(),
@@ -317,6 +317,10 @@ def validate_args(args) -> None:
     require(not getattr(args, "replace_failed_host", None) or not (
         getattr(args, "observe_accepted_action", None) or getattr(args, "reimage_failed_os", False)
     ), "Failed-host replacement cannot be combined with observation or another reimage")
+    require(not getattr(args, "resume_replacement", None) or bool(getattr(args, "replace_failed_host", None)),
+            "Capacity continuation requires the original accepted reimage lineage")
+    quota_wait = getattr(args, "quota_wait_seconds", 900)
+    require(integer(quota_wait) and 0 <= quota_wait <= 900, "Quota observation is bounded to 0..900 seconds")
 
 
 def validate_accepted_reimage(prior, plan_sha256):
@@ -515,6 +519,7 @@ class Recovery(maintenance.ClusterOperator):
             allowed = command[1:3] in (
                 ["account", "show"], ["group", "show"], ["aks", "list"],
                 ["vmss", "list"], ["vmss", "list-instances"], ["vmss", "get-instance-view"],
+                ["vm", "list-usage"],
             ) or command[1:4] in (
                 ["fleet", "member", "list"], ["aks", "nodepool", "list"],
                 ["aks", "operation", "show-latest"],
@@ -1889,6 +1894,9 @@ def execute_recovery(args, summary: dict, runner=workers.run_command, delete_pod
             # The subclass is loaded only after this base module is fully initialized.
             from failed_prom_worker_replacement import ReplacementRecovery  # pylint: disable=import-outside-toplevel,cyclic-import
             operator_type = ReplacementRecovery
+            if getattr(args, "resume_replacement", None):
+                from failed_prom_capacity_resume import CapacityResumeRecovery  # pylint: disable=import-outside-toplevel,cyclic-import
+                operator_type = CapacityResumeRecovery
         operator = operator_type(args, plan, summary, runner, delete_pod or mocks.delete_pod_with_uid_precondition)
         operator.execute()
     finally:
@@ -1945,6 +1953,8 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--reimage-failed-os", action="store_true")
     parser.add_argument("--observe-accepted-action")
     parser.add_argument("--replace-failed-host")
+    parser.add_argument("--resume-replacement")
+    parser.add_argument("--quota-wait-seconds", type=int, default=900)
     return parser.parse_args(argv)
 
 
