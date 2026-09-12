@@ -347,7 +347,16 @@ class CapacityResumeRecovery(replacement.ReplacementRecovery):
                     "spec_without_replicas_sha256": recovery.digest(
                         {name: value for name, value in spec.items() if name != "replicas"}
                     ),
+                    "spec_without_template_sha256": recovery.digest(
+                        {name: value for name, value in spec.items() if name != "template"}
+                    ),
                     "template_sha256": recovery.digest(template),
+                    "template_metadata": copy.deepcopy(template.get("metadata") or {}),
+                    "pod_spec_sha256": recovery.digest(template.get("spec") or {}),
+                    "init_containers": [
+                        {name: container.get(name) for name in ("name", "image", "resources")}
+                        for container in (template.get("spec") or {}).get("initContainers") or []
+                    ],
                     "containers": [
                         {name: container.get(name) for name in ("name", "image", "resources")}
                         for container in (template.get("spec") or {}).get("containers") or []

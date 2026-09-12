@@ -405,7 +405,10 @@ def test_nonempty_busy_unknown_or_drifted_zero_never_restores(environment, fault
         assert changed["expected"]["spec_sha256"] != changed["observed"]["spec_sha256"]
         if fault == "controller":
             configuration = next(iter(drift["current_controller_configuration"].values()))
+            template = fake.get_controller("grafana")["spec"]["template"]
             assert configuration["replicas"] == 2
+            assert configuration["template_metadata"] == template.get("metadata", {})
+            assert configuration["pod_spec_sha256"] == recovery.digest(template["spec"])
             assert all(set(row) == {"name", "image", "resources"} for row in configuration["containers"])
         else:
             assert next(iter(drift["current_pdb_specs"].values()))["minAvailable"] == 0
