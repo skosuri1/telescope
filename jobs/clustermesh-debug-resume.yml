@@ -34,6 +34,12 @@ parameters:
 - name: expected_pool_count
   type: number
   default: 201
+- name: modern_baseline_build_id
+  type: number
+  default: 0
+- name: retained_worker_restart_build_id
+  type: number
+  default: 0
 - name: lease_extension_hours
   type: number
   default: 168
@@ -90,10 +96,12 @@ jobs:
 - job: azure
   condition: >-
     and(succeeded(),
+    eq(${{ parameters.retained_worker_restart_build_id }}, 0),
     ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'),
     ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY'], 'true'),
     ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY'], 'true'),
     ne(variables['CLUSTERMESH_MODERN_PROM_RECOVERY'], 'true'),
+    eq(variables['CLUSTERMESH_MODERN_CNI_PROM_BUILD_ID'], '0'),
     eq(variables['CLUSTERMESH_UNREACHABLE_WORKER_REPLACE_FAILED_HOST_BUILD_ID'], '0'),
     eq(variables['CLUSTERMESH_UNREACHABLE_WORKER_RESUME_REPLACEMENT_BUILD_ID'], '0'),
     ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_QUOTA_OBSERVE_ONLY'], 'true'),
@@ -118,6 +126,58 @@ jobs:
       run_id: ${{ parameters.target_run_id }}
       credential_type: ${{ parameters.credential_type }}
       ssh_key_enabled: false
+
+  - ${{ if gt(parameters.modern_baseline_build_id, 0) }}:
+    - script: |
+        set -euo pipefail
+        if [ "${RUN_WORKLOAD,,}" != "true" ] ||
+          [ "$PRESERVATION_MODE" != "none" ] ||
+          [ "$EXPECTED_POOLS" != "202" ]; then
+          echo "A modern baseline receipt is only valid for the explicit 202-pool workload handoff." >&2
+          exit 1
+        fi
+      displayName: "Require explicit modern hardware-baseline handoff"
+      env:
+        RUN_WORKLOAD: "${{ parameters.run_workload }}"
+        PRESERVATION_MODE: ${{ parameters.mock_preservation_mode }}
+        EXPECTED_POOLS: "${{ parameters.expected_pool_count }}"
+    - task: DownloadPipelineArtifact@2
+      displayName: "Download completed mesh96 modern CNI baseline proof"
+      inputs:
+        buildType: specific
+        project: $(System.TeamProjectId)
+        definition: $(System.DefinitionId)
+        specificBuildWithTriggering: false
+        buildVersionToDownload: specific
+        pipelineId: ${{ parameters.modern_baseline_build_id }}
+        artifactName: n100-modern-cni-${{ parameters.modern_baseline_build_id }}-1
+        targetPath: $(Pipeline.Workspace)/modern-pool-baseline
+    - script: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import json
+        import os
+        import sys
+
+        sys.path.insert(0, os.environ["MODERN_BASELINE_MODULE_DIR"])
+        import modern_pool_baseline
+
+        with open(os.environ["MODERN_BASELINE_PROOF"], encoding="utf-8") as handle:
+            receipt = json.load(handle)
+        modern_pool_baseline.validate_receipt(
+            receipt, run_id=os.environ["EXPECTED_RUN_ID"],
+            subscription_id=os.environ["EXPECTED_SUBSCRIPTION_ID"],
+            expected_pool_count=int(os.environ["EXPECTED_POOL_COUNT"]),
+        )
+        print("Completed mesh96 modern-pool receipt matches the explicit workload baseline.")
+        PY
+      displayName: "Validate modern pool baseline before general reconciliation"
+      env:
+        MODERN_BASELINE_MODULE_DIR: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale
+        MODERN_BASELINE_PROOF: $(Pipeline.Workspace)/modern-pool-baseline/recovery.json
+        EXPECTED_RUN_ID: ${{ parameters.target_run_id }}
+        EXPECTED_SUBSCRIPTION_ID: ${{ parameters.expected_subscription_id }}
+        EXPECTED_POOL_COUNT: "${{ parameters.expected_pool_count }}"
 
   - ${{ if or(eq(parameters.mock_preservation_mode, 'verify'), and(parameters.run_workload, eq(parameters.mock_preservation_mode, 'none'), eq(parameters.topology, 'clustermesh-scale-mock'))) }}:
     - script: |
@@ -480,6 +540,8 @@ jobs:
         mock_handoff_expected_cluster_count: ${{ parameters.expected_cluster_count }}
         mock_handoff_expected_mock_count: 100
         mock_handoff_expected_pool_count: ${{ parameters.expected_pool_count }}
+        ${{ if gt(parameters.modern_baseline_build_id, 0) }}:
+          mock_handoff_modern_baseline_proof: $(Pipeline.Workspace)/modern-pool-baseline/recovery.json
 
   - ${{ if and(parameters.run_workload, parameters.publish_results, eq(parameters.mock_preservation_mode, 'none')) }}:
     - template: /steps/publish-results.yml

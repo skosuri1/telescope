@@ -15,6 +15,7 @@ if SCRIPT_DIR not in sys.path:
 
 import preserved_mock_capture as capture  # pylint: disable=wrong-import-position
 import preserved_mock_verify as verify  # pylint: disable=wrong-import-position
+import modern_pool_baseline as modern_baseline  # pylint: disable=wrong-import-position
 
 
 class HandoffError(Exception):
@@ -196,6 +197,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--expected-cluster-count", type=int, required=True)
     parser.add_argument("--expected-mock-count", type=int, required=True)
     parser.add_argument("--expected-pool-count", type=int, required=True)
+    parser.add_argument("--modern-baseline-proof")
     parser.add_argument("--fleet-name", default="clustermesh-flt")
     parser.add_argument("--profile-name", default="clustermesh-cmp")
     parser.add_argument("--max-concurrent", type=int, default=8)
@@ -246,6 +248,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     verify.write_json_atomic(summary_path, summary)
     stage = "loading_artifact_chain"
     try:
+        modern_layout = None
+        historical_pool_count = args.expected_pool_count
+        if getattr(args, "modern_baseline_proof", None):
+            modern_layout = modern_baseline.validate_receipt(
+                _load_object(args.modern_baseline_proof, "completed modern CNI baseline receipt"),
+                run_id=args.run_id, subscription_id=args.expected_subscription_id,
+                expected_pool_count=args.expected_pool_count,
+            )
+            historical_pool_count = modern_baseline.ORIGINAL_POOL_COUNT
+            summary["modern_pool_layout"] = modern_layout
+            summary["historical_verified_pool_count"] = historical_pool_count
+            summary["intentional_hardware_baseline_change"] = True
         _, baseline_by_role = verify.load_baseline(
             args.baseline_dir,
             args.run_id,
@@ -259,7 +273,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             baseline_build_id=args.baseline_build_id,
             expected_cluster_count=args.expected_cluster_count,
             expected_mock_count=args.expected_mock_count,
-            expected_pool_count=args.expected_pool_count,
+            expected_pool_count=historical_pool_count,
         )
         clusters = capture.load_clusters(
             args.clusters,
@@ -295,15 +309,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise HandoffError("pre-suite reconcile cluster count mismatch")
 
         stage = "validating_live_pre_suite_layer"
-        platform = verify.validate_platform_state(
-            clusters,
-            subscription_id=args.expected_subscription_id,
-            run_id=args.run_id,
-            expected_pool_count=args.expected_pool_count,
-            fleet_name=args.fleet_name,
-            profile_name=args.profile_name,
-            runner=capture.run_command,
-        )
+        platform_args = {
+            "subscription_id": args.expected_subscription_id, "run_id": args.run_id,
+            "expected_pool_count": args.expected_pool_count, "fleet_name": args.fleet_name,
+            "profile_name": args.profile_name, "runner": capture.run_command,
+        }
+        if modern_layout is not None:
+            platform_args["modern_pool_layout"] = modern_layout
+        platform = verify.validate_platform_state(clusters, **platform_args)
         expected_cilium_names = {
             role: str(row["cluster_name"]) for role, row in baseline_by_role.items()
         }
@@ -386,7 +399,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             flush=True,
         )
         return 0
-    except (HandoffError, verify.VerificationError, capture.CaptureError) as exc:
+    except (HandoffError, verify.VerificationError, capture.CaptureError, modern_baseline.BaselineError) as exc:
         summary.update(
             {
                 "finished_at": verify.utc_now(),

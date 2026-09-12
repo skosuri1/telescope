@@ -267,6 +267,16 @@ status is distinct from approved quota or available worker capacity.
 
 ### Explicit supported-family recovery baseline
 
+`scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
+recovery using a read-only worker-state artifact. It permits at most one
+receipt-bound normal restart of the exact unresponsive mesh-96 default worker,
+not a pool-wide restart or deletion. An already healthy worker is not restarted.
+The source artifact is frozen between planning and execution, credentials remain
+outside published artifacts, and accepted or ambiguous requests are never blindly
+replayed. This mode preserves the healthy worker and original KWOK Node identities;
+controller-recreated mock Pods already terminating on the failed worker receive
+an explicit new identity record. Host recovery alone is not workload qualification.
+
 `scaleDebugModernPromRecovery=true` selects the separate monitoring recovery
 path with the original accepted-action and native-removal checkpoints. It does
 not resize or restart the healthy default workers. The supported replacement is
@@ -275,9 +285,22 @@ the monitoring placement label, and a separately recorded configuration/identity
 delta. The original empty monitoring pool may be retired only after replacement
 and framework readiness are proved.
 
-This is monitoring-only recovery, not workload qualification. The remaining
-CNI-worker recovery and an explicit current-baseline handoff are still required
-before the preserved workload suite may resume.
+`scaleDebugModernCniPromBuildId` selects a completed monitoring recovery receipt
+for the separate supported-family CNI job. This phase uses two explicitly
+qualified `cniv5` System workers rather than allocating more deprecated Dv3
+capacity. The existing source-UID, Pending-Pod, healthy-source cap, actual
+CPU/memory/IP-growth, PDB, and 99-Ready migration barriers remain mandatory.
+Only the fully drained original CNI source may be retired; the other original
+default worker and its healthy mock identities are preserved.
+
+The final mesh-96 layout is `default` System count 1, `promv5` User count 1, and
+`cniv5` System count 2. This changes the campaign pool-object baseline from 201
+to 202 and introduces a documented hardware baseline change. Workload mode
+requires `scaleDebugModernBaselineBuildId` pointing to the completed modern CNI
+receipt. The historical verification artifact is still checked against its
+original 201 pools; current live validation requires the exact receipt-bound
+202-pool layout, all other clusters' original pool names, and full health.
+Changing an expected count alone never authorizes an unproved layout.
 
 ### Planned single-worker CNI maintenance
 

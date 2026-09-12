@@ -125,7 +125,7 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
         if item.get("stage") == "azure_eastus2euap_n100_debug_resume_37deca"
     )
     condition = (
-        "${{ if and(not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugCniWorkerMaintenanceOnly, "
+        "${{ if and(eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugCniWorkerMaintenanceOnly, "
         "not(parameters.scaleDebugPreparedRetirementObserveOnly), "
         "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), "
         "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "

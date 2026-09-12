@@ -22,6 +22,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import preserved_mock_capture as capture  # pylint: disable=wrong-import-position
+import modern_pool_baseline as modern_baseline  # pylint: disable=wrong-import-position
 
 
 class VerificationError(Exception):
@@ -325,9 +326,18 @@ def validate_platform_state(
     fleet_name: str,
     profile_name: str,
     runner: Runner,
+    modern_pool_layout: Optional[dict] = None,
 ) -> dict:
     """Require exact healthy AKS, pool, and Fleet membership state."""
 
+    if modern_pool_layout is not None:
+        try:
+            modern_pool_layout = modern_baseline.validate_layout(
+                modern_pool_layout, run_id=run_id, subscription_id=subscription_id,
+                expected_pool_count=expected_pool_count,
+            )
+        except modern_baseline.BaselineError as error:
+            raise VerificationError(str(error)) from error
     aks = capture.parse_json(
         runner(
             [
@@ -374,17 +384,16 @@ def validate_platform_state(
             if pool_key in pool_keys:
                 raise VerificationError(f"{role}: duplicate AKS pool {pool_name}")
             pool_keys.add(pool_key)
+            try:
+                modern_baseline.validate_live_pool(str(role), pool, modern_pool_layout)
+            except modern_baseline.BaselineError as error:
+                raise VerificationError(str(error)) from error
             pools.append({"role": role, "name": pool_name})
     if len(pools) != expected_pool_count:
         raise VerificationError(
             f"expected {expected_pool_count} AKS pools, got {len(pools)}"
         )
-    expected_pool_keys = {
-        (cluster.role, pool_name)
-        for cluster in clusters
-        for pool_name in ("default", "prompool")
-    }
-    expected_pool_keys.add(("mesh-1", "churnpool"))
+    expected_pool_keys = modern_baseline.expected_keys(clusters, modern_pool_layout)
     if pool_keys != expected_pool_keys:
         missing = sorted(expected_pool_keys - pool_keys)[:10]
         extra = sorted(pool_keys - expected_pool_keys)[:10]
@@ -441,13 +450,18 @@ def validate_platform_state(
     if set(member_by_role) != expected_roles:
         raise VerificationError("Fleet roles are not exactly mesh-1..mesh-N")
 
-    return {
+    result = {
         "aks_count": len(aks),
         "pool_count": len(pools),
         "fleet_member_count": len(members),
         "fleet_connected_count": len(members),
         "resource_ids": resource_ids,
     }
+    if modern_pool_layout is not None:
+        result["modern_pool_layout"] = modern_pool_layout
+        result["original_pool_count"] = modern_baseline.ORIGINAL_POOL_COUNT
+        result["intentional_hardware_baseline_change"] = True
+    return result
 
 
 def capture_live(

@@ -35,6 +35,9 @@ parameters:
 - name: mock_handoff_expected_pool_count
   type: number
   default: 201
+- name: mock_handoff_modern_baseline_proof
+  type: string
+  default: ""
 
 steps:
 - template: /steps/topology/${{ parameters.topology }}/execute-${{ parameters.engine }}.yml@self
@@ -51,3 +54,4 @@ steps:
       mock_handoff_expected_cluster_count: ${{ parameters.mock_handoff_expected_cluster_count }}
       mock_handoff_expected_mock_count: ${{ parameters.mock_handoff_expected_mock_count }}
       mock_handoff_expected_pool_count: ${{ parameters.mock_handoff_expected_pool_count }}
+      mock_handoff_modern_baseline_proof: ${{ parameters.mock_handoff_modern_baseline_proof }}
