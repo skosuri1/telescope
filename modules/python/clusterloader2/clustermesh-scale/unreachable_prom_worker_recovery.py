@@ -143,7 +143,14 @@ def digest(value) -> str:
 
 def timestamp(value, description: str) -> datetime:
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        text = str(value).replace("Z", "+00:00")
+        # Azure's 100ns fractions need normalization for the pipeline's Python 3.10.
+        text = re.sub(
+            r"(\d{2}:\d{2}:\d{2}\.)(\d+)(?=[+-]\d{2}:\d{2}$)",
+            lambda match: match[1] + match[2][:6].ljust(6, "0"),
+            text,
+        )
+        parsed = datetime.fromisoformat(text)
         require(parsed.tzinfo is not None, f"{description}: timezone is missing")
         return parsed
     except (ValueError, TypeError) as error:

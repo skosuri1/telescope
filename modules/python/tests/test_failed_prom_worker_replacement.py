@@ -967,3 +967,19 @@ def test_derived_host_regression_cannot_complete_replacement(environment, monkey
         run(environment, execute=True)
     assert waits == 2 and not failed_receipt()["replacement"]["replacement_completed"]
     assert fake.native_actions == ["delete", "scale"] and not fake.deleted
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_real_azure_failure_precision_on_pipeline_python310(environment, monkeypatch, execute):
+    _, _, fake = environment
+    base.use_python310_datetime(monkeypatch)
+    observed = datetime.now(timezone.utc) - timedelta(minutes=20)
+    vm_time = observed.strftime("%Y-%m-%dT%H:%M:%S.%f") + "3+00:00"
+    vmss_time = observed.strftime("%Y-%m-%dT%H:%M:%S.%f") + "6+00:00"
+    fake.views[(recovery.PROM_VMSS, "0")]["statuses"][0]["time"] = vm_time
+    fake.scale_view["statuses"][0]["time"] = vmss_time
+    summary = run(environment, execute=execute)
+    assert summary["terminal_failure_observations"]["VM"]["time"] == vm_time
+    assert summary["terminal_failure_observations"]["VMSS"]["time"] == vmss_time
+    assert summary["repaired"] is execute
+    assert fake.native_actions == (["delete", "scale"] if execute else [])

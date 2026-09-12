@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import uuid
@@ -38,6 +39,31 @@ def uid(name):
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def use_python310_datetime(monkeypatch):
+    parsed_arguments = []
+
+    class Python310Datetime(datetime):
+        @classmethod
+        def fromisoformat(cls, date_string):
+            parsed_arguments.append(date_string)
+            fraction = re.search(r"\d{2}:\d{2}:\d{2}\.(\d+)", date_string)
+            if fraction and len(fraction[1]) not in (3, 6):
+                raise ValueError("Python 3.10 requires three or six fractional digits")
+            return super().fromisoformat(date_string)
+
+    monkeypatch.setattr(recovery, "datetime", Python310Datetime)
+    return parsed_arguments
+
+
+@pytest.mark.parametrize("fraction", ["1", "12", "123", "1234", "12345", "123456", "6101413", "123456789"])
+def test_azure_timestamp_precision_is_compatible_with_pipeline_python310(monkeypatch, fraction):
+    arguments = use_python310_datetime(monkeypatch)
+    parsed = recovery.timestamp(f"2026-09-12T08:42:20.{fraction}Z", "Azure terminal failure")
+    normalized = fraction[:6].ljust(6, "0")
+    assert arguments == [f"2026-09-12T08:42:20.{normalized}+00:00"]
+    assert parsed.microsecond == int(normalized) and parsed.utcoffset() == timedelta(0)
 
 
 def metadata(name, namespace="", row_uid=None):

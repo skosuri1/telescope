@@ -133,6 +133,10 @@ class ReplacementRecovery(recovery.Recovery):
         require(provisioning(rows, key) == FAILURE_CODE,
                 "Only the new terminal OSProvisioningInternalError is a replacement candidate")
         row = next(row for row in rows if row["code"] == FAILURE_CODE)
+        self.summary.setdefault("terminal_failure_observations", {})[key] = {
+            "code": row["code"], "time": row.get("time"), "stage": self.stage,
+        }
+        self.save()
         observed = recovery.timestamp(row.get("time"), f"{key} terminal failure")
         requested = recovery.timestamp(self.accepted["restart"]["requested_at"], "accepted reimage")
         require(requested < observed and (datetime.now(timezone.utc) - observed).total_seconds() >= 300,
@@ -528,6 +532,11 @@ class ReplacementRecovery(recovery.Recovery):
         finally:
             receipt["returned_at"] = recovery.workers.utc_now()
             self.save()
+            print(json.dumps({
+                "role": recovery.ROLE, "native_replacement_action": action,
+                "attempted": receipt["attempted"], "accepted": receipt["accepted"],
+                "ambiguous": receipt["ambiguous"], "returned_at": receipt["returned_at"],
+            }), flush=True)
 
     def mark_original(self, snapshot):
         host = next(row for row in snapshot["nodes"]["items"] if row["metadata"]["name"] == recovery.PROM_NODE)
