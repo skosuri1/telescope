@@ -16,6 +16,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import failed_prom_capacity_resume as capacity
 import failed_prom_worker_replacement as replacement
@@ -235,7 +236,11 @@ class ModernPromRecovery(capacity.CapacityResumeRecovery):
         return selected, connected
 
     def fresh_zero(self):
-        decisions = super().fresh_zero()
+        try:
+            decisions = super().fresh_zero()
+        except recovery.EXPECTED_ERRORS as error:
+            self.capture_preflight_failure(str(error))
+            raise
         require(self.old_pool_references_absent(self.snapshot()),
                 "The empty original pool still has Kubernetes references")
         require(not super().guard_objects(), "A legacy capacity attempt appeared during modern zero qualification")
@@ -243,6 +248,56 @@ class ModernPromRecovery(capacity.CapacityResumeRecovery):
             self.source_pool = copy.deepcopy(self.live["pool"])
         self.summary["original_model_pins"] = copy.deepcopy(self.model_pin)
         return decisions
+
+    def capture_preflight_failure(self, primary_error):
+        if self.args.execute or self.authority_pin is None or not self.source_hashes:
+            return
+        audit = {
+            "read_only": True, "primary_error": primary_error,
+            "started_at": recovery.workers.utc_now(), "files": [], "errors": [],
+        }
+        self.modern["preflight_diagnostics"] = audit
+        self.save()
+        if recovery.AUTH_ERROR.search(primary_error):
+            audit["skipped_reason"] = "authorization-failure"
+            self.save()
+            return
+        directory = Path(self.args.summary_file).parent / "preflight-diagnostics"
+        directory.mkdir(mode=0o700, exist_ok=True)
+
+        def capture(name, read):
+            try:
+                payload = read()
+                recovery.mocks.write_json_atomic(str(directory / f"{name}.json"), payload)
+                audit["files"].append(f"preflight-diagnostics/{name}.json")
+            except recovery.EXPECTED_ERRORS as error:
+                audit["errors"].append({"capture": name, "error": str(error)})
+            self.save()
+
+        for instance in ("0", "1"):
+            capture(f"default-{instance}-instance-view", lambda selected=instance: self.az_json(
+                "vmss", "get-instance-view", "--resource-group", recovery.NODE_GROUP,
+                "--name", recovery.DEFAULT_VMSS, "--instance-id", selected, "--query", recovery.VIEW_QUERY,
+            ))
+        if not self.cluster_open:
+            try:
+                self.open_cluster()
+                self.cluster_open = True
+            except recovery.EXPECTED_ERRORS as error:
+                audit["errors"].append({"capture": "private-kubeconfig", "error": str(error)})
+                self.save()
+                return
+        for name, command in (
+            ("controllers", ("get", "deployments,replicasets,daemonsets,statefulsets", "-A", "-o", "json")),
+            ("pdbs", ("get", "pdb", "-A", "-o", "json")),
+            ("nodes", ("get", "nodes", "-o", "json")),
+            ("pods", ("get", "pods", "-A", "-o", "json")),
+            ("nnc", ("get", "nodenetworkconfigs", "-n", "kube-system", "-o", "json")),
+            ("events", ("get", "events", "-A", "-o", "json")),
+        ):
+            capture(name, lambda selected=command: self.kube(*selected))
+        audit["finished_at"] = recovery.workers.utc_now()
+        self.save()
 
     def plan_configuration(self):
         require(self.source_pool is not None, "A freshly proven original zero is required")

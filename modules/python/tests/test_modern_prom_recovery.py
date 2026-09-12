@@ -385,6 +385,42 @@ def test_plan_is_zero_write_and_honest_about_modern_delta(environment, ready):
     no_writes(fake)
 
 
+@pytest.mark.parametrize("fault", ["controller", "vm-view", "partial-diagnostics"])
+def test_failed_read_only_preflight_preserves_independent_diagnostics(environment, monkeypatch, fault):
+    args, _, fake = environment
+    if fault == "controller":
+        fake.get_controller("grafana")["spec"]["replicas"] = 2
+        message = "controller/PDB pins changed"
+    else:
+        message = "A healthy VM has uninitialized guest extension statuses"
+
+        def reject_models(_self, **_kwargs):
+            raise recovery.workers.ReconcileError(message)
+
+        monkeypatch.setattr(modern.ModernPromRecovery, "models", reject_models)
+    if fault == "partial-diagnostics":
+        read = fake.kubernetes
+
+        def reject_pods(command):
+            if "get" in command and "pods" in command:
+                raise recovery.workers.ReconcileError("Pod diagnostics unavailable")
+            return read(command)
+
+        monkeypatch.setattr(fake, "kubernetes", reject_pods)
+    with pytest.raises(recovery.workers.ReconcileError, match=message):
+        run(environment)
+    audit = base.receipt()["modern_prom_recovery"]["preflight_diagnostics"]
+    assert audit["read_only"] and message in audit["primary_error"]
+    directory = Path(args.summary_file).parent / "preflight-diagnostics"
+    assert json.loads((directory / "controllers.json").read_text())["items"] == fake.controllers
+    assert (directory / "default-0-instance-view.json").is_file()
+    assert (directory / "default-1-instance-view.json").is_file()
+    assert bool(audit["errors"]) is (fault == "partial-diagnostics")
+    if fault == "partial-diagnostics":
+        assert audit["errors"] == [{"capture": "pods", "error": "Pod diagnostics unavailable"}]
+    no_writes(fake)
+
+
 @pytest.mark.parametrize("instance,name", [("0", NEW_NODE), ("35", f"{NEW_VMSS}00000z")])
 def test_one_add_five_pinned_moves_then_one_empty_retirement(environment, instance, name):
     args, plan, fake = environment
