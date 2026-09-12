@@ -697,15 +697,104 @@ def test_pipeline_wires_retirement_before_arm_recovery():
     assert job["jobs"][0]["condition"] == (
         "and(succeeded(), "
         "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'), "
+        "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY'], 'true'), "
         "ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'), "
         "ne(variables['CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY'], 'true'))"
     )
     retirement_jobs = stage["jobs"][0][
-        "${{ if eq(parameters.scaleDebugPreparedRetirementOnly, true) }}"
+        "${{ if or(parameters.scaleDebugPreparedRetirementOnly, parameters.scaleDebugPreparedRetirementObserveOnly) }}"
     ]
     assert retirement_jobs[0]["template"] == (
         "/jobs/clustermesh-prepared-worker-retirement.yml"
     )
+    assert retirement_jobs[0]["parameters"]["observe_only"] == (
+        "${{ parameters.scaleDebugPreparedRetirementObserveOnly }}"
+    )
+    assert "${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}" in stage["jobs"][1]
+    assert "${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}" in stage["jobs"][2]
+
+
+@pytest.mark.parametrize("observe_only", ["true", "false", "invalid"])
+def test_pipeline_observation_never_passes_execute(tmp_path, observe_only):
+    repository = MODULE_DIR.parents[3]
+    template = yaml.safe_load(
+        (repository / "steps/topology/clustermesh-scale/reuse/retire-prepared-worker.yml")
+        .read_text(encoding="utf-8")
+    )
+    script = template["steps"][0]["script"]
+    script = script.replace("$(Build.ArtifactStagingDirectory)", str(tmp_path / "artifacts"))
+    script = script.replace("$(Pipeline.Workspace)/s", str(repository))
+    script = script.replace(
+        "${{ parameters.tfvars_path }}",
+        "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars",
+    )
+    script = script.replace("${{ parameters.expected_subscription_id }}", "test-subscription")
+    script = script.replace("${{ parameters.expected_region }}", "eastus2euap")
+    captured = tmp_path / "arguments.txt"
+    fake_python = tmp_path / "python3"
+    fake_python.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$CAPTURED_ARGUMENTS"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            **os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "CAPTURED_ARGUMENTS": str(captured), "OBSERVE_ONLY": observe_only,
+            "RETIREMENT_ROLE": "mesh-38", "RETIREMENT_NODE": SOURCE,
+            "RETIREMENT_UID": SOURCE_UID, "EXPECTED_CLUSTER_COUNT": "100",
+            "RUN_ID": "12345-aabbccdd", "CONFIRM_RESUME": "12345-aabbccdd",
+        },
+        capture_output=True, text=True, check=False, timeout=10,
+    )
+    if observe_only == "invalid":
+        assert result.returncode == 1 and not captured.exists()
+        assert "OBSERVE_ONLY must be true or false" in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    arguments = captured.read_text(encoding="utf-8").splitlines()
+    assert ("--execute" in arguments) is (observe_only == "false")
+    if observe_only == "true":
+        assert arguments[-2:] == ["--timeout-seconds", "600"]
+        assert "Read-only observation" in result.stdout
+
+
+@pytest.mark.parametrize("fault", ["none", "workload", "not-exclusive", "arm", "cni"])
+def test_observation_job_rejects_conflicting_modes_before_observation(fault):
+    repository = MODULE_DIR.parents[3]
+    job = yaml.safe_load(
+        (repository / "jobs/clustermesh-prepared-worker-retirement.yml")
+        .read_text(encoding="utf-8")
+    )["jobs"][0]
+    environment = {
+        **os.environ, "EXPECTED_CLUSTER_COUNT": "100", "ARM_REPAIR_ONLY": "false",
+        "CNI_MAINTENANCE_ONLY": "false", "RETIREMENT_ONLY": "true",
+        "OBSERVE_ONLY": "true", "RUN_WORKLOAD": "false",
+        "RETIREMENT_ROLE": "mesh-38", "RETIREMENT_NODE": SOURCE,
+        "RETIREMENT_UID": SOURCE_UID,
+    }
+    changes = {
+        "workload": ("RUN_WORKLOAD", "true"),
+        "not-exclusive": ("RETIREMENT_ONLY", "false"),
+        "arm": ("ARM_REPAIR_ONLY", "true"),
+        "cni": ("CNI_MAINTENANCE_ONLY", "true"),
+    }
+    if fault in changes:
+        key, value = changes[fault]
+        environment[key] = value
+    result = subprocess.run(
+        ["bash", "-c", job["steps"][0]["script"]], env=environment,
+        capture_output=True, text=True, check=False, timeout=10,
+    )
+    assert result.returncode == (0 if fault == "none" else 1), result.stderr
+    assert [step.get("template") for step in job["steps"] if "template" in step] == [
+        "/steps/setup-tests.yml",
+        "/steps/topology/clustermesh-scale/reuse/retire-prepared-worker.yml",
+    ]
+    assert job["steps"][-1]["parameters"]["observe_only"] == "${{ parameters.observe_only }}"
+    assert job["${{ if eq(parameters.observe_only, true) }}"]["timeoutInMinutes"] == 45
+    assert job["variables"]["${{ if eq(parameters.observe_only, true) }}"]["SKIP_RESOURCE_MANAGEMENT"] == "true"
 
 
 @pytest.mark.parametrize("job_name", [

@@ -124,7 +124,10 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
         item for item in pipeline["stages"]
         if item.get("stage") == "azure_eastus2euap_n100_debug_resume_37deca"
     )
-    condition = "${{ if eq(parameters.scaleDebugCniWorkerMaintenanceOnly, true) }}"
+    condition = (
+        "${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, "
+        "not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}"
+    )
     invocation = next(item[condition][0] for item in stage["jobs"] if condition in item)
     assert invocation["template"] == f"/{JOB}"
     for name, parameter in source_parameters.items():

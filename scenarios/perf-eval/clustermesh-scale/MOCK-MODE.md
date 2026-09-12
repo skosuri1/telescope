@@ -119,6 +119,16 @@ useful when local permissions prevent finishing an already drained replacement.
 It does not count as a workload run. Diagnostics are published as
 `n100-prepared-worker-retirement-<build>-<attempt>`.
 
+For read-only diagnostics, also set `scaleDebugPreparedRetirementObserveOnly=true`
+and `scaleDebugRunWorkload=false`. This runs the same helper without `--execute`,
+with a 600-second observer budget and no retirement, recovery, lease renewal,
+CL2, or resource cleanup. The job uses private temporary credentials through the
+normal service connection; failed, structurally owned Fleet members retain the
+bounded diagnostic capture described below. The normal workload job is disabled
+and other maintenance jobs are excluded in this mode. Conflicting mode flags
+fail before observation. A failed health observation still fails the diagnostic job;
+read-only mode does not turn unhealthy infrastructure into a successful proof.
+
 Prepared retirement preserves the initial Fleet member payload and names any
 unhealthy members. Structurally valid `PartialConnectivity` is observed read-only
 through the existing bounded Fleet observer, but every member must actually

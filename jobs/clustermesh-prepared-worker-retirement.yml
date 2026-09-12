@@ -15,19 +15,35 @@ parameters:
     type: string
   - name: retirement_uid
     type: string
+  - name: observe_only
+    type: boolean
+    default: false
+  - name: run_workload
+    type: boolean
+    default: false
 
 jobs:
   - job: prepared_worker_retirement
-    displayName: "Finish one prepared n100 worker retirement"
+    ${{ if eq(parameters.observe_only, true) }}:
+      displayName: "Read-only preserved n100 diagnostics"
+      timeoutInMinutes: 45
+      cancelTimeoutInMinutes: 5
+    ${{ else }}:
+      displayName: "Finish one prepared n100 worker retirement"
+      timeoutInMinutes: 120
+      cancelTimeoutInMinutes: 30
     variables:
       SCENARIO_NAME: clustermesh-scale
       CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
-      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "120"
-      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "30"
       SUITE_TOTAL_BUDGET_SECONDS: "0"
       AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
-    timeoutInMinutes: 120
-    cancelTimeoutInMinutes: 30
+      ${{ if eq(parameters.observe_only, true) }}:
+        CLUSTERMESH_JOB_TIMEOUT_MINUTES: "45"
+        CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "5"
+        SKIP_RESOURCE_MANAGEMENT: "true"
+      ${{ else }}:
+        CLUSTERMESH_JOB_TIMEOUT_MINUTES: "120"
+        CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "30"
     steps:
       - script: |
           set -euo pipefail
@@ -40,11 +56,21 @@ jobs:
             echo "Retirement-only mode requires n100 and an explicit role/node/UID plan." >&2
             exit 1
           fi
+          if [ "${OBSERVE_ONLY,,}" = "true" ] && {
+            [ "${RETIREMENT_ONLY,,}" != "true" ] ||
+            [ "${RUN_WORKLOAD,,}" != "false" ];
+          }; then
+            echo "Read-only observation requires retirement-only mode and workloads disabled." >&2
+            exit 1
+          fi
         displayName: "Require an explicit prepared worker plan"
         env:
           EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
           ARM_REPAIR_ONLY: $(CLUSTERMESH_ARM_REPAIR_ONLY)
           CNI_MAINTENANCE_ONLY: $(CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY)
+          RETIREMENT_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_ONLY)
+          OBSERVE_ONLY: "${{ parameters.observe_only }}"
+          RUN_WORKLOAD: "${{ parameters.run_workload }}"
           RETIREMENT_ROLE: ${{ parameters.retirement_role }}
           RETIREMENT_NODE: ${{ parameters.retirement_node }}
           RETIREMENT_UID: ${{ parameters.retirement_uid }}
@@ -67,3 +93,4 @@ jobs:
           retirement_role: ${{ parameters.retirement_role }}
           retirement_node: ${{ parameters.retirement_node }}
           retirement_uid: ${{ parameters.retirement_uid }}
+          observe_only: ${{ parameters.observe_only }}

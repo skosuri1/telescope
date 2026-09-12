@@ -15,6 +15,9 @@ parameters:
     type: string
   - name: retirement_uid
     type: string
+  - name: observe_only
+    type: boolean
+    default: false
 
 steps:
   - script: |
@@ -39,6 +42,20 @@ steps:
         echo "Prepared retirement requires the exact preserved resume confirmation." >&2
         exit 1
       fi
+      execution_args=()
+      case "${OBSERVE_ONLY,,}" in
+        true)
+          echo "Read-only observation: no retirement, recovery, lease changes, or workloads."
+          execution_args=(--timeout-seconds 600)
+          ;;
+        false)
+          execution_args=(--execute)
+          ;;
+        *)
+          echo "OBSERVE_ONLY must be true or false." >&2
+          exit 1
+          ;;
+      esac
       summary_dir="$(Build.ArtifactStagingDirectory)/n100-prepared-worker-retirement"
       mkdir -p "$summary_dir"
       echo "##vso[task.setvariable variable=PREPARED_WORKER_RETIREMENT_DIAGNOSTICS_READY]true"
@@ -54,8 +71,11 @@ steps:
         --node-name "$RETIREMENT_NODE" \
         --node-uid "$RETIREMENT_UID" \
         --summary-file "$summary_dir/retirement.json" \
-        --execute
-    displayName: "Finish explicitly prepared worker retirement"
+        "${execution_args[@]}"
+    ${{ if eq(parameters.observe_only, true) }}:
+      displayName: "Observe prepared worker and failed Fleet members (read-only)"
+    ${{ else }}:
+      displayName: "Finish explicitly prepared worker retirement"
     env:
       RUN_ID: ${{ parameters.target_run_id }}
       EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
@@ -63,6 +83,7 @@ steps:
       RETIREMENT_ROLE: ${{ parameters.retirement_role }}
       RETIREMENT_NODE: ${{ parameters.retirement_node }}
       RETIREMENT_UID: ${{ parameters.retirement_uid }}
+      OBSERVE_ONLY: "${{ parameters.observe_only }}"
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish prepared worker retirement diagnostics"

@@ -70,6 +70,9 @@ parameters:
   - name: scaleDebugPreparedRetirementOnly
     type: boolean
     default: false
+  - name: scaleDebugPreparedRetirementObserveOnly
+    type: boolean
+    default: false
   - name: scaleDebugArmRepairOnly
     type: boolean
     default: false
@@ -2973,6 +2976,7 @@ stages:
     displayName: "DEBUG scale resume preserved AKS clusters"
     variables:
       CLUSTERMESH_PREPARED_RETIREMENT_ONLY: ${{ parameters.scaleDebugPreparedRetirementOnly }}
+      CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY: ${{ parameters.scaleDebugPreparedRetirementObserveOnly }}
       CLUSTERMESH_ARM_REPAIR_ONLY: ${{ parameters.scaleDebugArmRepairOnly }}
       CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY: ${{ parameters.scaleDebugCniWorkerMaintenanceOnly }}
       AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
@@ -3079,7 +3083,7 @@ stages:
       CL2_PROBE_WINDOW_DURATION: "60m"
       CL2_PROBE_PREWAIT_S: "600"
     jobs:
-      - ${{ if eq(parameters.scaleDebugPreparedRetirementOnly, true) }}:
+      - ${{ if or(parameters.scaleDebugPreparedRetirementOnly, parameters.scaleDebugPreparedRetirementObserveOnly) }}:
           - template: /jobs/clustermesh-prepared-worker-retirement.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3090,7 +3094,9 @@ stages:
               retirement_role: ${{ parameters.scaleDebugPreparedRetirementRole }}
               retirement_node: ${{ parameters.scaleDebugPreparedRetirementNode }}
               retirement_uid: ${{ parameters.scaleDebugPreparedRetirementUid }}
-      - ${{ if eq(parameters.scaleDebugArmRepairOnly, true) }}:
+              observe_only: ${{ parameters.scaleDebugPreparedRetirementObserveOnly }}
+              run_workload: ${{ parameters.scaleDebugRunWorkload }}
+      - ${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}:
           - template: /jobs/clustermesh-arm-repair.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3099,7 +3105,7 @@ stages:
               expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
               tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
               overlay_mode: ${{ parameters.debugMode }}
-      - ${{ if eq(parameters.scaleDebugCniWorkerMaintenanceOnly, true) }}:
+      - ${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}:
           - template: /jobs/clustermesh-cni-worker-maintenance.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
