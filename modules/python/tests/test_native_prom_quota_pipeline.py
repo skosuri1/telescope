@@ -16,9 +16,12 @@ STEP = ROOT / "steps/topology/clustermesh-scale/reuse/observe-native-prom-quota.
 SUBSCRIPTION = "37deca37-c375-4a14-b90a-043849bd2bf1"
 
 
-@pytest.mark.parametrize("fault", ["none", "scope", "checkpoint", "absent", "forbidden", "timeout", "foreign-cluster"])
-@pytest.mark.parametrize("family,total", [(32, 100), (8, 100), (0, 100), (100, 0)])
-def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fault, family, total):
+@pytest.mark.parametrize("fault", [
+    "none", "scope", "checkpoint", "absent", "forbidden", "timeout", "foreign-cluster", "bad-counter",
+])
+@pytest.mark.parametrize("family,total", [(32, 100), (8, 100), (0, 100), (100, 0), (-16, 100)])
+@pytest.mark.parametrize("counter_type", ["number", "string"])
+def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fault, family, total, counter_type):
     script = yaml.safe_load(STEP.read_text(encoding="utf-8"))["steps"][0]["script"]
     native = tmp_path / "native"
     native.mkdir()
@@ -69,6 +72,11 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                         ("cores", int(os.environ["TOTAL"])),
                     ]
                 ]
+                if os.environ["COUNTER_TYPE"] == "string":
+                    for row in value:
+                        row["currentValue"], row["limit"] = str(row["currentValue"]), str(row["limit"])
+                if fault == "bad-counter":
+                    value[0]["currentValue"] = "100.5"
             elif args[:2] == ["group", "show"]:
                 name = arg("--name")
                 if name == "79825-24946a3a" and fault in ("absent", "forbidden", "timeout"):
@@ -120,6 +128,7 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
         "EXPECTED_CLUSTER_COUNT": "100", "NATIVE_BUILD_ID": "79894",
         "NATIVE_INPUT_DIRECTORY": str(native), "ARTIFACT_STAGING_DIRECTORY": str(tmp_path / "artifacts"),
         "CALLS": str(calls_file), "FAULT": fault, "FAMILY": str(family), "TOTAL": str(total),
+        "COUNTER_TYPE": counter_type,
     }
     if fault == "scope":
         environment["CONFIRM_RESUME"] = "different"

@@ -45,8 +45,14 @@ steps:
         --location "$EXPECTED_REGION" --output json --only-show-errors \
         --query '[].{name:name.value,currentValue:currentValue,limit:limit,unit:unit}' \
         > "$directory/regional-usage.json"
-      jq '[.[] | select((.name | ascii_downcase) == "standarddv3family"
+      jq 'def counter:
+        if type == "number" and . >= 0 and floor == . then .
+        elif type == "string" and test("^[0-9]+$") then tonumber
+        else error("Quota counters must be nonnegative integers or decimal strings")
+        end;
+        [.[] | select((.name | ascii_downcase) == "standarddv3family"
         or (.name | ascii_downcase) == "cores") |
+        .limit |= counter | .currentValue |= counter |
         . + {remaining: (.limit - .currentValue)}]' \
         "$directory/regional-usage.json" > "$directory/quota.json"
       jq -e 'length == 2 and all(.[];
