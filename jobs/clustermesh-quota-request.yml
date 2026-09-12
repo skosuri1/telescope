@@ -1,0 +1,128 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: overlay_mode
+    type: string
+  - name: run_workload
+    type: boolean
+  - name: native_build_id
+    type: number
+  - name: quota_limit
+    type: number
+
+jobs:
+  - job: bounded_quota_request
+    displayName: "Request bounded Dv3 quota through normal Azure approval"
+    variables:
+      SCENARIO_NAME: clustermesh-scale
+      CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "45"
+      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "10"
+      SUITE_TOTAL_BUDGET_SECONDS: "0"
+      AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
+    timeoutInMinutes: 45
+    cancelTimeoutInMinutes: 10
+    steps:
+      - script: |
+          set -euo pipefail
+          if [ "$RUN_ID" != "78751-f36f3d5a" ] ||
+            [ "$CONFIRM_RESUME" != "$RUN_ID" ] ||
+            [ "$SUBSCRIPTION" != "37deca37-c375-4a14-b90a-043849bd2bf1" ] ||
+            [ "$REGION" != "eastus2euap" ] ||
+            [ "$CLUSTER_COUNT" != "100" ] ||
+            [ "$OVERLAY_MODE" != "resume-existing" ] ||
+            [ "${RUN_WORKLOAD,,}" != "false" ] ||
+            [ "$QUOTA_LIMIT" != "5500" ] ||
+            [ "$NATIVE_BUILD_ID" != "79894" ] ||
+            [ "${RECOVERY_ONLY,,}" != "false" ] ||
+            [ "${QUOTA_OBSERVE_ONLY,,}" != "false" ] ||
+            [ "${ARM_ONLY,,}" != "false" ] ||
+            [ "${RETIREMENT_ONLY,,}" != "false" ] ||
+            [ "${RETIREMENT_OBSERVE_ONLY,,}" != "false" ] ||
+            [ "${CNI_ONLY,,}" != "false" ]; then
+            echo "Quota request requires the exact fixed limit/scope/checkpoint and no workload or repair mode." >&2
+            exit 1
+          fi
+        displayName: "Require one bounded quota request and no capacity mutations"
+        env:
+          RUN_ID: ${{ parameters.target_run_id }}
+          CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
+          SUBSCRIPTION: ${{ parameters.expected_subscription_id }}
+          REGION: ${{ parameters.expected_region }}
+          CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+          OVERLAY_MODE: ${{ parameters.overlay_mode }}
+          RUN_WORKLOAD: "${{ parameters.run_workload }}"
+          QUOTA_LIMIT: "${{ parameters.quota_limit }}"
+          NATIVE_BUILD_ID: "${{ parameters.native_build_id }}"
+          RECOVERY_ONLY: $(CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY)
+          QUOTA_OBSERVE_ONLY: $(CLUSTERMESH_UNREACHABLE_WORKER_QUOTA_OBSERVE_ONLY)
+          ARM_ONLY: $(CLUSTERMESH_ARM_REPAIR_ONLY)
+          RETIREMENT_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_ONLY)
+          RETIREMENT_OBSERVE_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY)
+          CNI_ONLY: $(CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY)
+
+      - template: /steps/setup-tests.yml
+        parameters:
+          cloud: azure
+          region: ${{ parameters.expected_region }}
+          run_id: ${{ parameters.target_run_id }}
+          credential_type: service_connection
+          ssh_key_enabled: false
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download the quota-rejected native restoration receipt"
+        inputs:
+          buildType: specific
+          project: $(System.TeamProjectId)
+          definition: $(System.DefinitionId)
+          specificBuildWithTriggering: false
+          buildVersionToDownload: specific
+          pipelineId: ${{ parameters.native_build_id }}
+          artifactName: n100-unreachable-worker-recovery-${{ parameters.native_build_id }}-1
+          targetPath: $(Pipeline.Workspace)/native-quota-source-${{ parameters.native_build_id }}
+
+      - script: |
+          set -euo pipefail
+          umask 077
+          directory="$(Build.ArtifactStagingDirectory)/n100-quota-request"
+          mkdir -p "$directory"
+          echo "##vso[task.setvariable variable=QUOTA_REQUEST_DIAGNOSTICS_READY]true"
+          cp "$(Pipeline.Workspace)/native-quota-source-$NATIVE_BUILD_ID/recovery.json" \
+            "$directory/native-checkpoint.json"
+          checkpoint_sha=$(sha256sum "$directory/native-checkpoint.json" | awk '{print $1}')
+          helper="$(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/request_mesh96_quota.py"
+          args=(
+            --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
+            --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
+            --native-checkpoint "$directory/native-checkpoint.json" --timeout-seconds 900
+          )
+          python3 -u "$helper" "${args[@]}" --summary-file "$directory/plan.json"
+          jq -e '.execute == false and .mutation_started == false
+            and (.plan_valid == true or .success == true)' "$directory/plan.json" >/dev/null
+          if [ "$(sha256sum "$directory/native-checkpoint.json" | awk '{print $1}')" != "$checkpoint_sha" ]; then
+            echo "Quota-request source checkpoint changed during read-only planning." >&2
+            exit 1
+          fi
+          python3 -u "$helper" "${args[@]}" --summary-file "$directory/request.json" --execute
+        displayName: "Plan then submit at most one normal quota increase request"
+        retryCountOnTaskFailure: 0
+        env:
+          RUN_ID: ${{ parameters.target_run_id }}
+          CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
+          SUBSCRIPTION: ${{ parameters.expected_subscription_id }}
+          REGION: ${{ parameters.expected_region }}
+          NATIVE_BUILD_ID: "${{ parameters.native_build_id }}"
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish quota request and approval evidence"
+        condition: >-
+          and(always(), eq(variables['QUOTA_REQUEST_DIAGNOSTICS_READY'], 'true'))
+        inputs:
+          targetPath: "$(Build.ArtifactStagingDirectory)/n100-quota-request"
+          artifact: "n100-quota-request-$(Build.BuildId)-$(System.JobAttempt)"

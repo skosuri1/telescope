@@ -239,6 +239,21 @@ is retained as a non-workload audit record, including on failure, and later
 retries cannot simply overwrite it. New-host and framework recovery still need
 the full scheduling, actual-IP, memory, applicable-DaemonSet, and peer/Fleet proof.
 
+`scaleDebugDv3QuotaRequestLimit=5500` selects a separate normal Azure quota-request
+job; `0` disables it, and no other limit is accepted. Supply native checkpoint
+build `79894`, keep `scaleDebugRunWorkload=false`, and disable every recovery or
+observation mode. This job cannot scale workers or run measurements. It requires
+the existing `Microsoft.Quota` registration, normal permissions, exact scope,
+fresh quota/usage, and the native removal receipt before proposing one bounded
+Dv3-family increase. Existing requests are observed rather than duplicated;
+provider registration, role grants, quota overrides, and higher limits are not
+attempted. An accepted request is not approval or usable headroom.
+
+The `n100-quota-request-<build>-<attempt>` artifact includes the adjacent
+`request_mesh96_quota.attempt.json` journal. Preserve that journal with its
+checkpoint when inspecting or continuing a request on another agent. An
+ambiguous request must not be resubmitted using a new empty artifact directory.
+
 ### Planned single-worker CNI maintenance
 
 `cni_worker_maintenance.py` provides the local operator path for one explicitly

@@ -88,7 +88,7 @@ def test_only_selected_resume_stage_exposes_arm_only_job():
         "${{ parameters.scaleDebugArmRepairOnly }}"
     )
     condition = (
-        "${{ if and(parameters.scaleDebugArmRepairOnly, "
+        "${{ if and(eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), parameters.scaleDebugArmRepairOnly, "
         "not(parameters.scaleDebugPreparedRetirementObserveOnly), "
         "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), "
         "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "
