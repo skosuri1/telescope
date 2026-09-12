@@ -983,3 +983,47 @@ def test_real_azure_failure_precision_on_pipeline_python310(environment, monkeyp
     assert summary["terminal_failure_observations"]["VMSS"]["time"] == vmss_time
     assert summary["repaired"] is execute
     assert fake.native_actions == (["delete", "scale"] if execute else [])
+
+
+def test_unreported_summary_with_a_live_original_vm_is_not_an_empty_inventory(environment):
+    _, _, fake = environment
+    fake.scale_view["virtualMachines"] = None
+    with pytest.raises(recovery.workers.ReconcileError, match="status summary"):
+        run(environment, execute=True)
+    summary = failed_receipt()
+    assert summary["arm_metadata"]["reported_vm_status_counts_type"] == "NoneType"
+    assert summary["arm_metadata"]["vm_status_counts"] is None
+    assert_no_writes(fake)
+
+
+def test_no_vm_summary_after_exact_native_removal_uses_authoritative_zero(environment):
+    _, _, fake = environment
+
+    def remove():
+        fake.finish_removal()
+        fake.scale_view["virtualMachines"] = None
+
+    fake.on_native_delete = remove
+    summary = run(environment, execute=True)
+    assert summary["repaired"] and summary["replacement"]["native_removal"]["pool_count"] == 0
+    assert fake.native_actions == ["delete", "scale"]
+
+
+def test_no_vm_summary_while_owned_restoration_has_no_instances_is_not_ready(environment, monkeypatch):
+    _, _, fake = environment
+
+    def creating():
+        fake.pools[1].update(count=1, provisioningState="Scaling")
+        fake.vmsses[1].update(provisioningState="Updating")
+        fake.vmsses[1]["sku"]["capacity"] = 1
+        fake.scale_view = {"statuses": [{"code": "ProvisioningState/updating"}], "virtualMachines": None}
+
+    def finish(operator, _deadline, _description):
+        assert operator.stage == "restoring" and operator.derived is None and not fake.deleted
+        assert not base.receipt()["replacement"]["replacement_completed"]
+        fake.finish_restoration()
+
+    fake.on_scale = creating
+    monkeypatch.setattr(recovery.Recovery, "wait", finish)
+    assert run(environment, execute=True)["repaired"]
+    assert fake.native_actions == ["delete", "scale"]

@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import jmespath
 
 
 MODULE_DIR = Path(__file__).resolve().parents[1] / "clusterloader2" / "clustermesh-scale"
@@ -64,6 +65,18 @@ def test_azure_timestamp_precision_is_compatible_with_pipeline_python310(monkeyp
     normalized = fraction[:6].ljust(6, "0")
     assert arguments == [f"2026-09-12T08:42:20.{normalized}+00:00"]
     assert parsed.microsecond == int(normalized) and parsed.utcoffset() == timedelta(0)
+
+
+def test_scale_instance_view_query_uses_the_actual_arm_singular_property():
+    status = {"code": "ProvisioningState/failed", "count": 1}
+    raw = {
+        "statuses": [{"code": recovery.OS_FAILURE_CODE}],
+        "virtualMachine": {"statusesSummary": [status]},
+        "extensions": [{"name": "irrelevant-to-this-projection"}],
+    }
+    assert jmespath.search(recovery.SCALE_VIEW_QUERY, raw) == {
+        "statuses": raw["statuses"], "virtualMachines": [status],
+    }
 
 
 def metadata(name, namespace="", row_uid=None):
@@ -443,7 +456,10 @@ class FakeCloud:
         if route == ["vmss", "get-instance-view"]:
             if "--instance-id" not in command:
                 assert self.value(command, "--query") == recovery.SCALE_VIEW_QUERY
-                return self.scale_view
+                return jmespath.search(self.value(command, "--query"), {
+                    "statuses": self.scale_view.get("statuses"),
+                    "virtualMachine": {"statusesSummary": self.scale_view.get("virtualMachines")},
+                })
             assert self.value(command, "--query") == recovery.VIEW_QUERY
             return self.views[(self.value(command, "--name"), self.value(command, "--instance-id"))]
         if route == ["aks", "get-credentials"]:

@@ -368,6 +368,17 @@ class ReplacementRecovery(recovery.Recovery):
                             or (self.stage == "deleting" and bool(instances))),
                             "VMSS returned a new terminal failure or unsupported transition")
                 counts_view = scale.get("virtualMachines")
+                evidence["vm_status_counts"] = copy.deepcopy(counts_view)
+                evidence["reported_vm_status_counts_type"] = type(counts_view).__name__
+                self.save()
+                if counts_view is None and not instances and self.stage in ("deleting", "empty", "restoring"):
+                    action = "restore" if self.stage == "restoring" else "delete"
+                    require(self.record[action]["accepted"] is True,
+                            "An absent VM summary requires this accepted native operation")
+                    # No VM status exists for an empty, successfully enumerated inventory.
+                    # Pool/model convergence still decides zero or healthy; this never does.
+                    counts_view = []
+                    evidence["vm_summary_absent_for_empty_inventory"] = True
                 require(len(rows) == 1 and isinstance(counts_view, list) and all(
                     isinstance(row, dict) and recovery.integer(row.get("count")) and 0 <= row["count"] <= 1
                     and row.get("code") in (

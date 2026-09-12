@@ -123,7 +123,7 @@ VM_QUERY = (
     "computerName:osProfile.computerName,latestModelApplied:latestModelApplied,vmId:vmId}"
 )
 VIEW_QUERY = "{statuses:statuses,extensions:extensions[].{name:name,statuses:statuses}}"
-SCALE_VIEW_QUERY = "{statuses:statuses,virtualMachines:virtualMachines.statusesSummary}"
+SCALE_VIEW_QUERY = "{statuses:statuses,virtualMachines:virtualMachine.statusesSummary}"
 OPERATION_QUERY = (
     "{name:name,status:status,operationType:operationType,startTime:startTime,"
     "endTime:endTime,errorCode:error.code}"
@@ -830,6 +830,7 @@ class Recovery(maintenance.ClusterOperator):
             {key: row.get(key) for key in ("code", "count")}
             for row in scale_view.get("virtualMachines") or [] if isinstance(row, dict)
         ]
+        diagnostic["reported_vm_status_counts_type"] = type(scale_view.get("virtualMachines")).__name__
         self.save()
         instances = self.az_json(
             "vmss", "list-instances", "--resource-group", NODE_GROUP,
