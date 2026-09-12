@@ -382,7 +382,7 @@ class ReplacementRecovery(recovery.Recovery):
                 require(len(rows) == 1 and isinstance(counts_view, list) and all(
                     isinstance(row, dict) and recovery.integer(row.get("count")) and 0 <= row["count"] <= 1
                     and row.get("code") in (
-                        {"ProvisioningState/failed", "ProvisioningState/deleting"}
+                        {"ProvisioningState/failed", FAILURE_CODE, "ProvisioningState/deleting"}
                         if instances and self.stage in ("original", "deleting") else
                         {"ProvisioningState/succeeded", "ProvisioningState/creating", "ProvisioningState/updating"}
                     ) for row in counts_view

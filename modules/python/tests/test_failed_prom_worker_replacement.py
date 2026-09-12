@@ -233,7 +233,8 @@ def replacement_environment(tmp_path, monkeypatch):
         "extensions": [{"name": "vmssCSE", "statuses": None}],
     }
     fake.scale_view = {
-        "statuses": [{"code": replacement.FAILURE_CODE, "time": failed_at}], "virtualMachines": [],
+        "statuses": [{"code": replacement.FAILURE_CODE, "time": failed_at}],
+        "virtualMachines": [{"code": replacement.FAILURE_CODE, "count": 1}],
     }
     save_checkpoint(args, checkpoint)
     Path(args.plan_file).write_text(json.dumps(plan), encoding="utf-8")
@@ -1027,3 +1028,16 @@ def test_no_vm_summary_while_owned_restoration_has_no_instances_is_not_ready(env
     monkeypatch.setattr(recovery.Recovery, "wait", finish)
     assert run(environment, execute=True)["repaired"]
     assert fake.native_actions == ["delete", "scale"]
+
+
+@pytest.mark.parametrize("code,count", [
+    ("ProvisioningState/failed/UnrelatedFailure", 1),
+    (recovery.OS_FAILURE_CODE, 1),
+    (replacement.FAILURE_CODE, 2),
+])
+def test_vm_summary_subcode_must_match_the_pinned_failed_instance(environment, code, count):
+    _, _, fake = environment
+    fake.scale_view["virtualMachines"] = [{"code": code, "count": count}]
+    with pytest.raises(recovery.workers.ReconcileError, match="status summary"):
+        run(environment, execute=True)
+    assert_no_writes(fake)
