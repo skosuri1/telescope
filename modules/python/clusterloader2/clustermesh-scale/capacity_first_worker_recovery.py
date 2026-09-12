@@ -233,6 +233,23 @@ class CapacityFirst(maintenance.ClusterOperator):
         if command[0] == "kubectl":
             allowed = "get" in command and not any(word in command for word in ("patch", "create", "delete", "exec", "run"))
         require(allowed, "Unsupported command on the strictly read-only path")
+        if command[:3] == ["az", "vm", "list-skus"]:
+            invoke = super().run
+
+            def once(arguments, timeout):
+                try:
+                    return invoke(arguments, timeout, cleanup=cleanup)
+                except workers.ReconcileError as error:
+                    if base.AUTH_ERROR.search(str(error)):
+                        raise
+                    raise base.arm.ReconcileError(str(error)) from error
+
+            try:
+                return base.arm.run_read_with_retries(
+                    command, once, timeout_seconds=120, attempts=2, retry_seconds=2,
+                )
+            except base.arm.ReconcileError as error:
+                raise workers.ReconcileError(str(error)) from error
         return super().run(command, min(timeout_seconds, 45), cleanup=cleanup)
 
     def kube(self, *command):
@@ -296,7 +313,7 @@ class CapacityFirst(maintenance.ClusterOperator):
             require(limit - used >= 24, "Current DSv5/regional headroom must cover 16 now plus 8 future Prom cores")
             counters[name] = {"used": used, "limit": limit, "remaining": limit - used}
         rows = self.az_json("vm", "list-skus", "--location", base.REGION, "--resource-type", "virtualMachines",
-                            "--all", "--query", prom.SKU_QUERY)
+                            "--size", prom.VM_SIZE, "--all", "--query", prom.SKU_QUERY)
         require(isinstance(rows, list) and len(rows) == 1, "Exactly one actual DSv5 SKU is required")
         sku = rows[0]
         caps = {row["name"]: row.get("value") for row in sku.get("capabilities") or []}

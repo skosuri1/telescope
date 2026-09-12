@@ -37,6 +37,8 @@ IMAGE = "AKSUbuntu-2404containerd-202609.10.0"
 class CapacityCloud(Cloud):
     """Reuse the real-schema failed-worker fixture; forbid its restart route."""
 
+    max_call_timeout = 120
+
     def __init__(self, args):
         super().__init__(args)
         self.node_group["tags"] = {"deletion_due_time": self.group["tags"]["deletion_due_time"]}
@@ -185,6 +187,7 @@ class CapacityCloud(Cloud):
         if command[1:3] == ["vm", "list-usage"]:
             return self.usage
         if command[1:3] == ["vm", "list-skus"]:
+            assert self.value(command, "--size") == capacity.prom.VM_SIZE
             return self.skus
         if command[1:3] == ["vmss", "show"]:
             assert self.value(command, "--name") == VMSS
@@ -272,6 +275,34 @@ def test_plan_is_read_only_and_does_not_gate_on_broken_kwok_or_metrics(environme
     assert not summary["capacity_qualified"] and not summary["pool_created"] and not summary["workloads_ready"]
     assert summary["quota_proof"]["required_cores"] == 24
     assert not any("/apis/metrics" in " ".join(command) for command in cloud.commands)
+
+
+@pytest.mark.parametrize("failure", ["transient", "authorization"])
+def test_exact_sku_read_has_bounded_transient_retry_without_writes(environment, monkeypatch, failure):
+    _, cloud = environment
+    original = cloud.azure
+    calls = []
+
+    def flaky(command):
+        if command[1:3] == ["vm", "list-skus"]:
+            calls.append(command)
+            if len(calls) == 1:
+                message = ("command timed out after 120s: az vm list-skus"
+                           if failure == "transient" else "AuthorizationFailed: SKU read denied")
+                raise capacity.workers.ReconcileError(message)
+        return original(command)
+
+    cloud.azure = flaky
+    monkeypatch.setattr(capacity.base.arm.time, "sleep", lambda _seconds: None)
+    if failure == "transient":
+        assert run(environment)["plan_valid"]
+        assert len(calls) == 2
+    else:
+        with pytest.raises(capacity.workers.ReconcileError, match="AuthorizationFailed"):
+            run(environment)
+        assert len(calls) == 1
+    assert all(cloud.value(command, "--size") == capacity.prom.VM_SIZE for command in calls)
+    assert not cloud.writes and not cloud.add_calls
 
 
 def test_one_exact_add_preserves_every_old_identity_and_only_claims_registration(environment):

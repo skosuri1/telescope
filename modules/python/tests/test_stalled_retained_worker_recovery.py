@@ -72,6 +72,8 @@ def pod(name, namespace, node_name, owner, *, ready=True, terminating=False):
 class Cloud:
     """Stateful raw provider documents, projected with the actual CLI query."""
 
+    max_call_timeout = 45
+
     def __init__(self, args):
         self.args = args
         self.writes, self.commands, self.restart_calls = [], [], []
@@ -283,7 +285,7 @@ class Cloud:
                 row["status"] = status(True)
 
     def run(self, command, timeout_seconds):
-        assert 0 < timeout_seconds <= 45
+        assert 0 < timeout_seconds <= self.max_call_timeout
         self.commands.append(command)
         if self.hook:
             self.hook(command)
