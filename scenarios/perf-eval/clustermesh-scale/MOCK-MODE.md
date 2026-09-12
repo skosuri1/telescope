@@ -166,6 +166,10 @@ failed framework Pods. It is not a substitute for the separate bounded CNI
 worker-maintenance gates or the full workload handoff. Evidence is published as
 `n100-unreachable-worker-recovery-<build>-<attempt>`, including the original plan,
 read-only assessment, and execution summary; credentials remain private.
+If the owned prompool VMSS is Failed, planning captures its aggregate status and
+the pinned VM's status/extension codes before refusing mutation. Failed models
+are never accepted as restart-ready, and private model or extension settings
+are not included in this diagnostic capture.
 
 ### Planned single-worker CNI maintenance
 

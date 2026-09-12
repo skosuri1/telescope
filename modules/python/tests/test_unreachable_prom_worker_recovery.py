@@ -411,6 +411,13 @@ class FakeCloud:
             assert self.value(command, "--query") == recovery.VM_QUERY
             return self.instances[self.value(command, "--name")]
         if route == ["vmss", "get-instance-view"]:
+            if "--instance-id" not in command:
+                assert self.value(command, "--query") == recovery.SCALE_VIEW_QUERY
+                return {
+                    "statuses": [{"code": "ProvisioningState/failed",
+                                  "message": "must-not-be-published"}],
+                    "virtualMachines": [{"code": "ProvisioningState/failed", "count": 1}],
+                }
             assert self.value(command, "--query") == recovery.VIEW_QUERY
             return self.views[(self.value(command, "--name"), self.value(command, "--instance-id"))]
         if route == ["aks", "get-credentials"]:
@@ -757,6 +764,53 @@ def test_arm_model_and_operation_faults_fail_closed(environment, fault):
     assert "arm_metadata" in receipt()
     if fault == "stopped-vm":
         assert "PowerState/stopped" in receipt()["arm_metadata"]["instances"][recovery.PROM_NODE]["status_codes"]
+
+
+def test_failed_prom_parent_captures_vm_state_without_waiving_gate(environment):
+    _, _, fake = environment
+    fake.vmsses[1]["provisioningState"] = "Failed"
+    fake.instances[recovery.PROM_VMSS][0].update(
+        provisioningState="Failed", customData="must-not-be-published",
+    )
+    fake.views[(recovery.PROM_VMSS, "0")]["statuses"] = [
+        {"code": "ProvisioningState/failed/OSProvisioningTimedOut",
+         "displayStatus": "Provisioning failed", "message": "must-not-be-published"},
+        {"code": "PowerState/running"},
+    ]
+    with pytest.raises(recovery.workers.ReconcileError, match="parent pool/VMSS"):
+        run(environment, execute=True)
+    observed = receipt()["arm_metadata"]["failed_prom_instance_diagnostics"]
+    assert observed["read_only"]
+    assert observed["instances"][0]["provisioningState"] == "Failed"
+    assert observed["scale_set_statuses"][0]["code"] == "ProvisioningState/failed"
+    assert observed["vm_status_counts"] == [{"code": "ProvisioningState/failed", "count": 1}]
+    assert observed["statuses"][0]["code"] == "ProvisioningState/failed/OSProvisioningTimedOut"
+    assert "must-not-be-published" not in json.dumps(receipt())
+    assert not fake.writes and not fake.deleted and not receipt()["mutation_started"]
+    assert not any(command[1:3] == ["aks", "get-credentials"] for command in fake.commands)
+
+
+def test_failed_prom_parent_does_not_read_a_foreign_instance(environment):
+    _, _, fake = environment
+    fake.vmsses[1].update(provisioningState="Failed", id="/foreign/vmss")
+    with pytest.raises(recovery.workers.ReconcileError, match="ownership"):
+        run(environment, execute=True)
+    assert not fake.writes and not fake.deleted
+    assert not any(
+        command[1:3] == ["vmss", "list-instances"] and recovery.PROM_VMSS in command
+        for command in fake.commands
+    )
+
+
+def test_failed_prom_parent_records_missing_original_vm(environment):
+    _, _, fake = environment
+    fake.vmsses[1]["provisioningState"] = "Failed"
+    fake.instances[recovery.PROM_VMSS] = []
+    with pytest.raises(recovery.workers.ReconcileError, match="parent pool/VMSS"):
+        run(environment, execute=True)
+    observed = receipt()["arm_metadata"]["failed_prom_instance_diagnostics"]
+    assert observed["instances"] == [] and "absent" in observed["error"]
+    assert not fake.writes and not fake.deleted
 
 
 @pytest.mark.parametrize("fault", [

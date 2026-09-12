@@ -120,6 +120,7 @@ VM_QUERY = (
     "computerName:osProfile.computerName,latestModelApplied:latestModelApplied,vmId:vmId}"
 )
 VIEW_QUERY = "{statuses:statuses,extensions:extensions[].{name:name,statuses:statuses}}"
+SCALE_VIEW_QUERY = "{statuses:statuses,virtualMachines:virtualMachines.statusesSummary}"
 OPERATION_QUERY = (
     "{name:name,status:status,operationType:operationType,startTime:startTime,"
     "endTime:endTime,errorCode:error.code}"
@@ -575,6 +576,14 @@ class Recovery(maintenance.ClusterOperator):
                 "provisioning_state": vmss.get("provisioningState"), "sku": vmss.get("sku"),
             }
             self.save()
+            if pool_name == "prompool" and vmss.get("provisioningState") == "Failed":
+                require(
+                    prepared.resource_equal(vmss.get("id"), vmss_id)
+                    and str(vmss.get("location", "")).lower() == REGION
+                    and workers.vmss_pool_name(vmss) == pool_name,
+                    "Failed prompool VMSS ownership is not exact",
+                )
+                self.capture_failed_prom_instance(evidence, vmss_id)
             require(
                 integer(pool.get("count")) and pool["count"] == count
                 and pool.get("enableAutoScaling") is False
@@ -657,6 +666,70 @@ class Recovery(maintenance.ClusterOperator):
         self.summary["arm_metadata"] = evidence
         self.save()
         return stable
+
+    def capture_failed_prom_instance(self, evidence, vmss_id):
+        """Keep the failed-parent gate, but record its exact VM's nonsecret state."""
+
+        diagnostic = {"read_only": True, "instances": []}
+        evidence["failed_prom_instance_diagnostics"] = diagnostic
+        self.save()
+        scale_view = self.az_json(
+            "vmss", "get-instance-view", "--resource-group", NODE_GROUP,
+            "--name", PROM_VMSS, "--query", SCALE_VIEW_QUERY,
+        )
+        fields = ("code", "level", "displayStatus", "time")
+        diagnostic["scale_set_statuses"] = [
+            {key: row.get(key) for key in fields}
+            for row in scale_view.get("statuses") or [] if isinstance(row, dict)
+        ]
+        diagnostic["vm_status_counts"] = [
+            {key: row.get(key) for key in ("code", "count")}
+            for row in scale_view.get("virtualMachines") or [] if isinstance(row, dict)
+        ]
+        self.save()
+        instances = self.az_json(
+            "vmss", "list-instances", "--resource-group", NODE_GROUP,
+            "--name", PROM_VMSS, "--query", VM_QUERY,
+        )
+        require(isinstance(instances, list) and all(isinstance(row, dict) for row in instances),
+                "Failed prompool instance inventory is unreadable")
+        diagnostic["instances"] = [
+            {key: row.get(key) for key in (
+                "id", "instanceId", "computerName", "vmId", "provisioningState", "latestModelApplied",
+            )}
+            for row in instances
+        ]
+        self.save()
+        selected = [row for row in instances if str(row.get("instanceId")) == "0"]
+        if len(selected) != 1:
+            diagnostic["error"] = "The originally pinned instance 0 is absent or ambiguous"
+            self.save()
+            return
+        require(
+            prepared.resource_equal(selected[0].get("id"), f"{vmss_id}/virtualMachines/0"),
+            "Failed prompool instance resource identity is not exact",
+        )
+        view = self.az_json(
+            "vmss", "get-instance-view", "--resource-group", NODE_GROUP,
+            "--name", PROM_VMSS, "--instance-id", "0", "--query", VIEW_QUERY,
+        )
+        statuses = view.get("statuses")
+        require(isinstance(statuses, list) and all(isinstance(row, dict) for row in statuses),
+                "Failed prompool instance status is unreadable")
+        diagnostic["statuses"] = [
+            {key: row.get(key) for key in fields} for row in statuses
+        ]
+        extensions = view.get("extensions") or []
+        require(isinstance(extensions, list) and all(isinstance(row, dict) for row in extensions),
+                "Failed prompool extension statuses are unreadable")
+        diagnostic["extensions"] = [
+            {"name": row.get("name"), "statuses": [
+                {key: status.get(key) for key in fields}
+                for status in row.get("statuses") or [] if isinstance(status, dict)
+            ]}
+            for row in extensions
+        ]
+        self.save()
 
     def snapshot(self):
         require(self.run(["kubectl", "--request-timeout=45s", "get", "--raw=/readyz"]).strip() == "ok",
