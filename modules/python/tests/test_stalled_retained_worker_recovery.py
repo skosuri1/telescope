@@ -483,6 +483,124 @@ def test_managed_checksum_annotation_only_change_is_not_functional_drift(environ
     assert summary["plan_valid"] and not cloud.writes
 
 
+@pytest.mark.parametrize("fault", ["remove", "add", "different-effect", "other-toleration", "different-uid"])
+def test_only_exact_managed_security_readiness_toleration_can_vary(environment, fault):
+    args, cloud = environment
+    daemon = copy.deepcopy(cloud.controllers[1])
+    daemon["metadata"] = metadata("azuresecuritylinuxagent", "kube-system", recovery.SECURITY_DAEMONSET_UID)
+    original = [{"key": "kwok.x-k8s.io/node", "operator": "Equal", "value": "fake", "effect": "NoSchedule"}]
+    daemon["spec"]["template"]["spec"]["tolerations"] = copy.deepcopy(original)
+    if fault != "add":
+        daemon["spec"]["template"]["spec"]["tolerations"].append(copy.deepcopy(recovery.READINESS_TOLERATION))
+    cloud.controllers.append(daemon)
+    (Path(args.source_state_directory) / "current-controllers.json").write_text(json.dumps({"items": cloud.controllers}))
+    tolerations = daemon["spec"]["template"]["spec"]["tolerations"]
+    if fault == "add":
+        tolerations.append(copy.deepcopy(recovery.READINESS_TOLERATION))
+    elif fault == "remove":
+        tolerations.remove(recovery.READINESS_TOLERATION)
+    elif fault == "different-effect":
+        tolerations[-1]["effect"] = "NoExecute"
+    elif fault == "other-toleration":
+        tolerations.append({"key": "unapproved", "operator": "Exists"})
+    else:
+        daemon["metadata"]["uid"] = uid("different-security-controller")
+    if fault in ("remove", "add"):
+        assert run(environment)["plan_valid"]
+    else:
+        with pytest.raises(recovery.workers.ReconcileError):
+            run(environment, True)
+    assert not cloud.writes
+
+
+def pre_submit_reservation(environment):
+    args, cloud = environment
+    prior = copy.deepcopy(run(environment))
+    reserved = datetime.now(timezone.utc) - timedelta(minutes=1)
+    prior.update(
+        execute=True, mutation_started=True, status="failed-closed", success=False, host_recovered=False,
+        error="ReconcileError: Captured functional controller specs/UIDs changed",
+        started_at=(reserved - timedelta(seconds=30)).isoformat(),
+        finished_at=(reserved + timedelta(seconds=30)).isoformat(),
+        restart={
+            "attempted": True, "accepted": None, "ambiguous": True, "automatic_retry_allowed": False,
+            "command": recovery.Recovery.restart_command(), "previous_boot_id": recovery.BOOTS[recovery.TARGET],
+            "requested_at": reserved.isoformat(),
+        },
+        journal={
+            "name": recovery.JOURNAL, "namespace": "kube-system", "uid": recovery.PRE_SUBMIT_JOURNAL_UID,
+            "create_attempted": True, "accepted": True, "ambiguous": False, "retained": True,
+        },
+    )
+    path = Path("prior-reservation.json")
+    path.write_text(json.dumps(prior), encoding="utf-8")
+    args.summary_file, args.resume_checkpoint, args.resume_build_id = "continued.json", str(path), recovery.PRE_SUBMIT_BUILD
+    cloud.journal = {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": metadata(recovery.JOURNAL, "kube-system", recovery.PRE_SUBMIT_JOURNAL_UID),
+        "data": {
+            "owner": recovery.OWNER, "token": "a" * 32,
+            "target_node_uid": base.REAL_UIDS[recovery.TARGET], "target_vm_id": recovery.VM_IDS[recovery.TARGET],
+            "source_state_sha256": prior["source_state_sha256"],
+            "receipt": json.dumps(prior["restart"], sort_keys=True, separators=(",", ":")),
+        },
+    }
+    return prior
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_proven_pre_submit_reservation_continues_same_journal_without_recreating_it(environment, execute):
+    _, cloud = environment
+    prior = pre_submit_reservation(environment)
+    original_uid, original_token = cloud.journal["metadata"]["uid"], cloud.journal["data"]["token"]
+    summary = run(environment, execute)
+    assert summary["plan_valid"] and summary["continuation"]["source_build"] == 79945
+    assert cloud.journal["metadata"]["uid"] == original_uid and cloud.journal["data"]["token"] == original_token
+    assert not any("create" in command for command in cloud.writes)
+    if execute:
+        assert len(cloud.restart_calls) == 1 and summary["restart"]["submission_started"]
+        assert summary["host_recovered"] and not summary["workloads_ready"]
+        assert json.loads(cloud.journal["data"]["prior_unsubmitted_receipt"]) == prior["restart"]
+    else:
+        assert not cloud.writes and not cloud.restart_calls
+        assert "prior_unsubmitted_receipt" not in cloud.journal["data"]
+
+
+@pytest.mark.parametrize("fault", [
+    "accepted", "submission-marker", "unknown-error", "source-hashes", "target-identity", "wrong-build",
+    "journal-uid", "journal-receipt", "journal-source", "journal-token", "already-continued",
+])
+def test_unproved_or_changed_reservation_never_restarts(environment, fault):
+    args, cloud = environment
+    prior = pre_submit_reservation(environment)
+    if fault == "accepted":
+        prior["restart"]["accepted"] = True
+    elif fault == "submission-marker":
+        prior["restart"]["submission_started"] = True
+    elif fault == "unknown-error":
+        prior["error"] = "POST timed out"
+    elif fault == "source-hashes":
+        prior["source_hashes"] = {}
+    elif fault == "target-identity":
+        prior["original_identity"]["node_uid"] = uid("foreign-node")
+    elif fault == "wrong-build":
+        args.resume_build_id = 79946
+    elif fault == "journal-uid":
+        cloud.journal["metadata"]["uid"] = uid("replacement-journal")
+    elif fault == "journal-receipt":
+        cloud.journal["data"]["receipt"] = "{}"
+    elif fault == "journal-source":
+        cloud.journal["data"]["source_state_sha256"] = "f" * 64
+    elif fault == "journal-token":
+        cloud.journal["data"]["token"] = "invalid"
+    else:
+        cloud.journal["data"]["prior_build_id"] = "79945"
+    Path(args.resume_checkpoint).write_text(json.dumps(prior), encoding="utf-8")
+    with pytest.raises(recovery.workers.ReconcileError):
+        run(environment, True)
+    assert not cloud.writes and not cloud.restart_calls
+
+
 @pytest.mark.parametrize("fault", ["journal-existing", "journal-ambiguous", "conflict", "timeout"])
 def test_existing_or_ambiguous_operations_never_replay(environment, fault):
     _, cloud = environment

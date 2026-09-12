@@ -42,6 +42,11 @@ NAMESPACE = "kube-system"
 COMPLETED_CERT_POD = "hubble-generate-certs-9a7a0d0e-zq9m9"
 COMPLETED_CERT_UID = "a47d492a-bdc7-43bf-b0e5-ec330ccff287"
 EXPECTED_ERRORS = base.EXPECTED_ERRORS + (ValueError, TypeError, KeyError, IndexError)
+PRE_SUBMIT_BUILD = 79945
+PRE_SUBMIT_COMMIT = "dc520ca5f67cca6871de1c2b12043f8cd2d681cf"
+PRE_SUBMIT_JOURNAL_UID = "55117c2c-db51-41b2-b8ec-12fc9d357501"
+SECURITY_DAEMONSET_UID = "c7fcc5e0-f23c-4399-85fd-c4a3926e22b4"
+READINESS_TOLERATION = {"effect": "NoSchedule", "key": "node.cilium.io/agent-not-ready", "operator": "Exists"}
 REQUIRED_FILES = (
     "current-nodes.json", "current-pods.json", "current-controllers.json", "current-pdbs.json",
     "current-nnc.json", "default-instances.json", "preserved-group.json", "cluster.json",
@@ -114,6 +119,13 @@ def controllers_pin(payload):
             annotations = spec.get("template", {}).get("metadata", {}).get("annotations", {})
             for name in CHECKSUM_KEYS:
                 annotations.pop(name, None)
+            if metadata.get("name") == "azuresecuritylinuxagent" and uid(row) == SECURITY_DAEMONSET_UID:
+                pod_spec = spec.get("template", {}).get("spec", {})
+                tolerations = pod_spec.get("tolerations") or []
+                require(isinstance(tolerations, list) and tolerations.count(READINESS_TOLERATION) <= 1,
+                        "Managed security-agent readiness toleration is ambiguous")
+                if READINESS_TOLERATION in tolerations:
+                    pod_spec["tolerations"] = [item for item in tolerations if item != READINESS_TOLERATION]
         require(key not in result and uid(row), "Controller inventory is ambiguous")
         result[key] = {"uid": uid(row), "functional_spec_sha256": digest(spec)}
     return result
@@ -275,10 +287,56 @@ def load_source(args):
     return data, hashes
 
 
+def load_pre_submit_checkpoint(args, data, hashes):
+    path = getattr(args, "resume_checkpoint", None)
+    if not path:
+        return None, ""
+    checkpoint_path = Path(path)
+    require(checkpoint_path.is_file() and not checkpoint_path.is_symlink()
+            and checkpoint_path.stat().st_size <= 32 * 1024 * 1024, "Prior checkpoint must be a bounded regular file")
+    checksum = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
+    prior = read_json(checkpoint_path)
+    restart, journal = prior.get("restart") or {}, prior.get("journal") or {}
+    require(getattr(args, "resume_build_id", 0) == PRE_SUBMIT_BUILD
+            and prior.get("execute") is True and prior.get("mutation_started") is True
+            and prior.get("plan_valid") is True and prior.get("success") is False
+            and prior.get("host_recovered") is False and prior.get("workloads_ready") is False
+            and prior.get("status") == "failed-closed"
+            and prior.get("error") == "ReconcileError: Captured functional controller specs/UIDs changed"
+            and prior.get("plan_sha256") == PLAN_SHA and prior.get("source_hashes") == hashes
+            and prior.get("source_state_sha256") == digest(hashes)
+            and prior.get("original_identity") == {
+                "node_name": TARGET, "node_uid": base.REAL_UIDS[TARGET],
+                "vm_id": VM_IDS[TARGET], "boot_id": BOOTS[TARGET],
+            },
+            "Only build 79945's proven pre-POST controller guard failure may continue")
+    require(restart.get("attempted") is True and restart.get("accepted") is None
+            and restart.get("ambiguous") is True and "accepted_at" not in restart
+            and "submission_started" not in restart and not restart.get("host_proven")
+            and not restart.get("reboot_fenced") and restart.get("command") == Recovery.restart_command()
+            and restart.get("previous_boot_id") == BOOTS[TARGET]
+            and journal.get("uid") == PRE_SUBMIT_JOURNAL_UID and journal.get("name") == JOURNAL
+            and journal.get("namespace") == NAMESPACE and journal.get("create_attempted") is True
+            and journal.get("accepted") is True and journal.get("ambiguous") is False,
+            "An accepted, submitted, or differently owned restart must never be replayed")
+    require(base.timestamp(prior.get("started_at"), "prior execution")
+            <= base.timestamp(restart.get("requested_at"), "prior reservation")
+            <= base.timestamp(prior.get("finished_at"), "prior guard failure")
+            <= datetime.now(timezone.utc), "Prior reservation timestamps are invalid")
+    snapshot = prior.get("current_kubernetes_diagnostics") or {}
+    # The saved diagnostics redact environment values; the live guard still compares raw configuration.
+    require(controllers_pin(snapshot["controllers"]) == controllers_pin(safe_diagnostics(data["current-controllers.json"]))
+            and base.frozen_pdbs(snapshot) == base.frozen_pdbs({"pdbs": data["current-pdbs.json"]}),
+            "Prior drift is not confined to the specifically understood managed-controller variation")
+    require(hashlib.sha256(checkpoint_path.read_bytes()).hexdigest() == checksum,
+            "Prior checkpoint changed while validating its no-submission proof")
+    return prior, checksum
+
+
 class Recovery(maintenance.ClusterOperator):
     """No write path other than the exclusive journal and one explicit VM1 restart."""
 
-    def __init__(self, args, data, hashes, summary, runner):
+    def __init__(self, args, data, hashes, summary, runner, *, resume=None, resume_hash=""):
         deadline = time.monotonic() + args.timeout_seconds
         super().__init__(args, base.CLUSTER, runner, deadline - 60, deadline)
         self.data, self.hashes, self.summary = data, hashes, summary
@@ -312,12 +370,16 @@ class Recovery(maintenance.ClusterOperator):
         self.pre_restart_boot = ""
         self.restart_sent = False
         self.persisted_journal_data = None
+        self.resume, self.resume_hash = resume, resume_hash
 
     def save(self):
         mocks.write_json_atomic(self.args.summary_file, self.summary)
 
     def unchanged_inputs(self):
         require(file_hashes(self.args.source_state_directory) == self.hashes, "Immutable observation input hashes changed")
+        if self.resume:
+            require(hashlib.sha256(Path(self.args.resume_checkpoint).read_bytes()).hexdigest() == self.resume_hash,
+                    "Immutable prior reservation checkpoint changed")
 
     def run(self, command, timeout_seconds=45, *, cleanup=False):
         command = list(command)
@@ -665,11 +727,40 @@ class Recovery(maintenance.ClusterOperator):
         return current
 
     def journal_data(self):
-        return {
+        data = {
             "owner": OWNER, "token": self.token, "target_node_uid": base.REAL_UIDS[TARGET],
             "target_vm_id": VM_IDS[TARGET], "source_state_sha256": digest(self.hashes),
             "receipt": json.dumps(self.summary["restart"], sort_keys=True, separators=(",", ":")),
         }
+        if self.resume:
+            data.update(
+                prior_unsubmitted_receipt=json.dumps(self.resume["restart"], sort_keys=True, separators=(",", ":")),
+                prior_checkpoint_sha256=self.resume_hash, prior_build_id=str(PRE_SUBMIT_BUILD),
+            )
+        return data
+
+    def attach_pre_submit_reservation(self):
+        rows = self.journal_list()["items"]
+        require(len(rows) == 1, "The original pre-submit reservation must still exist")
+        current = rows[0]
+        data = current.get("data") or {}
+        expected = {
+            "owner": OWNER, "target_node_uid": base.REAL_UIDS[TARGET], "target_vm_id": VM_IDS[TARGET],
+            "source_state_sha256": digest(self.hashes),
+            "receipt": json.dumps(self.resume["restart"], sort_keys=True, separators=(",", ":")),
+        }
+        require(uid(current) == PRE_SUBMIT_JOURNAL_UID and set(data) == set(expected) | {"token"}
+                and all(data.get(key) == value for key, value in expected.items())
+                and isinstance(data.get("token"), str) and re.fullmatch(r"[0-9a-f]{32}", data["token"]),
+                "Original journal changed or has already been continued; no restart may be replayed")
+        self.token, self.journal_uid = data["token"], uid(current)
+        self.persisted_journal_data = copy.deepcopy(data)
+        self.owned_journal()
+        self.summary["journal"].update(
+            uid=self.journal_uid, accepted=True, ambiguous=False, create_attempted=False,
+            continued_existing_reservation=True,
+        )
+        self.save()
 
     def write(self, command):
         require(self.args.execute, "Read-only planning must never write")
@@ -683,6 +774,7 @@ class Recovery(maintenance.ClusterOperator):
                     "The exact restart requires a journalled first and only submission")
             self.owned_journal()
             self.restart_sent = True
+            self.summary["restart"]["submission_started"] = True
         self.summary["mutation_started"] = True
         self.save()
         return super().run(command, 45)
@@ -722,7 +814,10 @@ class Recovery(maintenance.ClusterOperator):
 
     def execute(self):
         healthy, snapshot, views = self.observe(before_restart=True)
-        require(self.journal_list().get("items") == [], "Existing journal prohibits blind accepted-action adoption")
+        if self.resume:
+            self.attach_pre_submit_reservation()
+        else:
+            require(self.journal_list().get("items") == [], "Existing journal prohibits blind accepted-action adoption")
         if healthy:
             self.summary.update(plan_valid=True, success=True, host_recovered=True, status="already-healthy-no-restart")
             self.save()
@@ -732,7 +827,10 @@ class Recovery(maintenance.ClusterOperator):
         self.save()
         if not self.args.execute:
             return
-        self.acquire()
+        if self.resume:
+            self.persist_journal()
+        else:
+            self.acquire()
         healthy, snapshot, views = self.observe(before_restart=True)
         if healthy:
             self.summary.update(success=True, host_recovered=True, status="recovered-before-restart-no-post")
@@ -780,6 +878,9 @@ def validate_args(args):
     require(maintenance.SHA256_RE.fullmatch(args.expected_tfvars_sha) is not None, "tfvars SHA256 is invalid")
     require(base.integer(args.timeout_seconds) and 300 <= args.timeout_seconds <= 1800, "Timeout must be 300..1800 seconds")
     require(args.context == base.CLUSTER and args.kubeconfig, "Private explicit mesh-96 credentials/context are required")
+    require((not getattr(args, "resume_checkpoint", None) and getattr(args, "resume_build_id", 0) == 0)
+            or (getattr(args, "resume_checkpoint", None) and getattr(args, "resume_build_id", 0) == PRE_SUBMIT_BUILD),
+            "Continuation requires only the exact known unsubmitted reservation from build 79945")
     root, output, credentials = (Path(value).resolve() for value in
                                  (args.source_state_directory, args.summary_file, args.kubeconfig))
     require(output != root and root not in output.parents and output != credentials
@@ -792,16 +893,24 @@ def execute_recovery(args, summary, runner=workers.run_command):
     summary.update(schema_version=1, execute=args.execute, mutation_started=False, plan_valid=False,
                    success=False, host_recovered=False, workloads_ready=False, full_suite_qualified=False,
                    status="validating", started_at=workers.utc_now(),
-                   restart={"attempted": False, "accepted": None, "ambiguous": False, "automatic_retry_allowed": False},
+                   restart={"attempted": False, "accepted": None, "ambiguous": False,
+                            "submission_started": False, "automatic_retry_allowed": False},
                    journal={"name": JOURNAL, "namespace": NAMESPACE, "retained": True})
     try:
         data, hashes = load_source(args)
+        resume, resume_hash = load_pre_submit_checkpoint(args, data, hashes)
         summary.update(source_hashes=hashes, source_state_sha256=digest(hashes), plan_sha256=PLAN_SHA,
                        original_identity={"node_name": TARGET, "node_uid": base.REAL_UIDS[TARGET],
                                           "vm_id": VM_IDS[TARGET], "boot_id": BOOTS[TARGET]},
                        migration_completed=None,
                        accepted_risk="Normal restart can discard paused memory and interrupt unfinished live migration")
-        Recovery(args, data, hashes, summary, runner).execute()
+        if resume:
+            summary["continuation"] = {
+                "source_build": PRE_SUBMIT_BUILD, "source_commit": PRE_SUBMIT_COMMIT,
+                "checkpoint_sha256": resume_hash, "prior_unsubmitted_restart": copy.deepcopy(resume["restart"]),
+                "proof": "exact pre-POST guard failure in pinned source; accepted flag is set before any post-POST observation",
+            }
+        Recovery(args, data, hashes, summary, runner, resume=resume, resume_hash=resume_hash).execute()
     except EXPECTED_ERRORS as error:
         summary.update(success=False, host_recovered=False, status="failed-closed", error=f"{type(error).__name__}: {error}")
         raise
@@ -820,6 +929,8 @@ def parse_args(argv=None):
     parser.add_argument("--context", default=base.CLUSTER)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--resume-checkpoint")
+    parser.add_argument("--resume-build-id", type=int, default=0)
     return parser.parse_args(argv)
 
 

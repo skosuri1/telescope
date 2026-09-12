@@ -56,7 +56,7 @@ jobs:
           ssh_key_enabled: false
 
       - task: DownloadPipelineArtifact@2
-        displayName: "Download the exact read-only worker-state evidence"
+        displayName: "Download the exact worker-state or pre-submit reservation evidence"
         inputs:
           buildType: specific
           project: $(System.TeamProjectId)
@@ -64,7 +64,10 @@ jobs:
           specificBuildWithTriggering: false
           buildVersionToDownload: specific
           pipelineId: ${{ parameters.source_state_build_id }}
-          artifactName: n100-unreachable-worker-recovery-${{ parameters.source_state_build_id }}-1
+          ${{ if eq(parameters.source_state_build_id, 79945) }}:
+            artifactName: n100-retained-worker-restart-${{ parameters.source_state_build_id }}-1
+          ${{ if ne(parameters.source_state_build_id, 79945) }}:
+            artifactName: n100-unreachable-worker-recovery-${{ parameters.source_state_build_id }}-1
           targetPath: $(Pipeline.Workspace)/retained-worker-source
 
       - script: |
@@ -78,6 +81,18 @@ jobs:
           if find "$source" -type l -print -quit | grep -q .; then
             echo "Worker-state evidence must contain regular files, not symlinks." >&2
             exit 1
+          fi
+          prior_checkpoint=""
+          prior_sha=""
+          if [ "$SOURCE_STATE_BUILD_ID" = "79945" ]; then
+            if [ ! -s "$source/recovery.json" ] || [ ! -d "$source/source-state" ]; then
+              echo "The exact failed reservation and its immutable original observation are required." >&2
+              exit 1
+            fi
+            cp "$source/recovery.json" "$directory/prior-reservation.json"
+            prior_checkpoint="$directory/prior-reservation.json"
+            prior_sha=$(sha256sum "$prior_checkpoint" | awk '{print $1}')
+            source="$source/source-state"
           fi
           snapshot_hashes() {
             (cd "$source" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
@@ -100,12 +115,20 @@ jobs:
             --expected-tfvars-sha "$tfvars_sha" --source-state-directory "$source"
             --kubeconfig "$private/cluster.config" --context clustermesh-96 --timeout-seconds 1800
           )
+          if [ -n "$prior_checkpoint" ]; then
+            args+=(--resume-checkpoint "$prior_checkpoint" --resume-build-id "$SOURCE_STATE_BUILD_ID")
+          fi
           python3 -u "$helper" "${args[@]}" --summary-file "$directory/plan.json"
           jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
             "$directory/plan.json" >/dev/null
           snapshot_hashes > "$directory/source-files-after-plan.sha256"
           if ! cmp -s "$directory/source-files.sha256" "$directory/source-files-after-plan.sha256"; then
             echo "Source evidence changed during read-only planning; no restart will be submitted." >&2
+            exit 1
+          fi
+          if [ -n "$prior_checkpoint" ] &&
+            [ "$(sha256sum "$prior_checkpoint" | awk '{print $1}')" != "$prior_sha" ]; then
+            echo "The prior reservation checkpoint changed during read-only planning." >&2
             exit 1
           fi
           if [ "$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')" != "$tfvars_sha" ]; then
@@ -121,6 +144,7 @@ jobs:
           SUBSCRIPTION: ${{ parameters.expected_subscription_id }}
           REGION: ${{ parameters.expected_region }}
           TFVARS_PATH: ${{ parameters.tfvars_path }}
+          SOURCE_STATE_BUILD_ID: "${{ parameters.source_state_build_id }}"
           SOURCE_DIRECTORY: $(Pipeline.Workspace)/retained-worker-source
           ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
           REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s

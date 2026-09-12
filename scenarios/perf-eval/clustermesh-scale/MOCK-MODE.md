@@ -276,6 +276,10 @@ outside published artifacts, and accepted or ambiguous requests are never blindl
 replayed. This mode preserves the healthy worker and original KWOK Node identities;
 controller-recreated mock Pods already terminating on the failed worker receive
 an explicit new identity record. Host recovery alone is not workload qualification.
+The specific source build `79945` selects continuation of its proven pre-submit
+reservation failure, retaining the original journal UID, token, source hashes,
+and prior receipt. It does not authorize replay of a submitted or uncertain
+Azure request. All fresh safety gates run again before the sole restart request.
 
 `scaleDebugModernPromRecovery=true` selects the separate monitoring recovery
 path with the original accepted-action and native-removal checkpoints. It does

@@ -71,7 +71,7 @@ def test_restart_mode_cannot_fall_through_to_other_jobs():
 @pytest.mark.parametrize("fault,expected_calls,expected_exit", [
     ("none", 2, 0), ("invalid-plan", 1, 1), ("mutate-source", 1, 1),
     ("extra-source", 1, 1), ("mutate-tfvars", 1, 1), ("execution-error", 2, 1),
-    ("source-symlink", 0, 1),
+    ("source-symlink", 0, 1), ("resume", 2, 0), ("mutate-checkpoint", 1, 1),
 ])
 def test_plan_execute_hashes_and_private_credentials(tmp_path, fault, expected_calls, expected_exit):
     definition = job()
@@ -80,6 +80,12 @@ def test_plan_execute_hashes_and_private_credentials(tmp_path, fault, expected_c
     for path in (source, checkout, private, binaries):
         path.mkdir()
     (source / "current-nodes.json").write_text('{"items": []}', encoding="utf-8")
+    resuming = fault in ("resume", "mutate-checkpoint")
+    if resuming:
+        nested = source / "source-state"
+        nested.mkdir()
+        (source / "current-nodes.json").rename(nested / "current-nodes.json")
+        (source / "recovery.json").write_text('{"known_reservation": true}', encoding="utf-8")
     if fault == "source-symlink":
         (source / "untrusted.json").symlink_to(tmp_path / "outside.json")
     tfvars = checkout / TFVARS
@@ -113,6 +119,10 @@ def test_plan_execute_hashes_and_private_credentials(tmp_path, fault, expected_c
             (source / "extra.json").write_text("{}")
         if not execute and fault == "mutate-tfvars":
             (Path(os.environ["REPOSITORY_DIRECTORY"]) / os.environ["TFVARS_PATH"]).write_text("changed")
+        if fault in ("resume", "mutate-checkpoint"):
+            assert value("--resume-build-id") == "79945"
+            if not execute and fault == "mutate-checkpoint":
+                Path(value("--resume-checkpoint")).write_text("changed")
         Path(value("--summary-file")).write_text(json.dumps({
             "execute": execute, "mutation_started": execute, "plan_valid": fault != "invalid-plan",
             "workloads_ready": False,
@@ -143,6 +153,7 @@ def test_plan_execute_hashes_and_private_credentials(tmp_path, fault, expected_c
         "RUN_ID": SCOPE["target_run_id"], "CONFIRM_RESUME": SCOPE["confirm_resume"],
         "SUBSCRIPTION": SCOPE["expected_subscription_id"], "REGION": "eastus2euap",
         "TFVARS_PATH": TFVARS, "SOURCE_DIRECTORY": str(source), "ARTIFACT_DIRECTORY": str(artifacts),
+        "SOURCE_STATE_BUILD_ID": "79945" if resuming else "79941",
         "REPOSITORY_DIRECTORY": str(checkout), "AGENT_TEMP_DIRECTORY": str(private),
         "CALLS": str(calls_file), "FAULT": fault,
     }
@@ -167,8 +178,11 @@ def test_restart_job_has_one_exact_source_and_bounded_publication():
     assert definition["timeoutInMinutes"] == 60 and definition["cancelTimeoutInMinutes"] == 30
     downloads = [row for row in definition["steps"] if row.get("task") == "DownloadPipelineArtifact@2"]
     assert len(downloads) == 1
-    assert downloads[0]["inputs"]["artifactName"] == (
+    assert downloads[0]["inputs"]["${{ if ne(parameters.source_state_build_id, 79945) }}"]["artifactName"] == (
         "n100-unreachable-worker-recovery-${{ parameters.source_state_build_id }}-1"
+    )
+    assert downloads[0]["inputs"]["${{ if eq(parameters.source_state_build_id, 79945) }}"]["artifactName"] == (
+        "n100-retained-worker-restart-${{ parameters.source_state_build_id }}-1"
     )
     artifact = definition["steps"][-1]
     assert artifact["task"] == "PublishPipelineArtifact@1" and "always()" in artifact["condition"]
