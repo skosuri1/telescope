@@ -24,6 +24,12 @@ parameters:
   - name: replace_failed_host_build_id
     type: number
     default: 0
+  - name: resume_replacement_build_id
+    type: number
+    default: 0
+  - name: quota_observe_only
+    type: boolean
+    default: false
 
 jobs:
   - job: unreachable_worker_recovery
@@ -62,6 +68,13 @@ jobs:
             echo "Failed-host replacement requires its accepted-action build and excludes observation or reimage." >&2
             exit 1
           fi
+          if ! [[ "$RESUME_REPLACEMENT_BUILD_ID" =~ ^(0|[1-9][0-9]*)$ ]] ||
+            { [ "$RESUME_REPLACEMENT_BUILD_ID" != "0" ] &&
+              { [ "$REPLACE_FAILED_HOST_BUILD_ID" = "0" ] || [ "${QUOTA_OBSERVE_ONLY,,}" != "true" ]; }; } ||
+            { [ "${QUOTA_OBSERVE_ONLY,,}" = "true" ] && [ "$RESUME_REPLACEMENT_BUILD_ID" = "0" ]; }; then
+            echo "Native-action checkpoints currently require exclusive read-only quota observation and original lineage." >&2
+            exit 1
+          fi
           if { [ -z "$RECOVERY_PLAN_JSON" ] && [ "$REPLACE_FAILED_HOST_BUILD_ID" = "0" ]; } ||
             [ "${#RECOVERY_PLAN_JSON}" -gt 32768 ]; then
             echo "An explicit bounded identity plan or the failed-host source artifact is required." >&2
@@ -88,6 +101,8 @@ jobs:
           RECOVERY_PLAN_JSON: ${{ parameters.plan_json }}
           OBSERVE_BUILD_ID: "${{ parameters.observe_build_id }}"
           REPLACE_FAILED_HOST_BUILD_ID: "${{ parameters.replace_failed_host_build_id }}"
+          RESUME_REPLACEMENT_BUILD_ID: "${{ parameters.resume_replacement_build_id }}"
+          QUOTA_OBSERVE_ONLY: "${{ parameters.quota_observe_only }}"
           REIMAGE_FAILED_OS: "${{ parameters.reimage_failed_os }}"
 
       - template: /steps/setup-tests.yml
@@ -124,14 +139,37 @@ jobs:
               artifactName: n100-unreachable-worker-recovery-${{ parameters.replace_failed_host_build_id }}-1
               targetPath: $(Pipeline.Workspace)/accepted-failed-host-${{ parameters.replace_failed_host_build_id }}
 
-      - template: /steps/topology/clustermesh-scale/reuse/recover-unreachable-worker.yml
-        parameters:
-          target_run_id: ${{ parameters.target_run_id }}
-          expected_subscription_id: ${{ parameters.expected_subscription_id }}
-          expected_region: ${{ parameters.expected_region }}
-          expected_cluster_count: ${{ parameters.expected_cluster_count }}
-          tfvars_path: ${{ parameters.tfvars_path }}
-          plan_json: ${{ parameters.plan_json }}
-          reimage_failed_os: ${{ parameters.reimage_failed_os }}
-          observe_build_id: ${{ parameters.observe_build_id }}
-          replace_failed_host_build_id: ${{ parameters.replace_failed_host_build_id }}
+      - ${{ if gt(parameters.resume_replacement_build_id, 0) }}:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download the native replacement outcome"
+            inputs:
+              buildType: specific
+              project: $(System.TeamProjectId)
+              definition: $(System.DefinitionId)
+              specificBuildWithTriggering: false
+              buildVersionToDownload: specific
+              pipelineId: ${{ parameters.resume_replacement_build_id }}
+              artifactName: n100-unreachable-worker-recovery-${{ parameters.resume_replacement_build_id }}-1
+              targetPath: $(Pipeline.Workspace)/native-host-action-${{ parameters.resume_replacement_build_id }}
+
+      - ${{ if parameters.quota_observe_only }}:
+          - template: /steps/topology/clustermesh-scale/reuse/observe-native-prom-quota.yml
+            parameters:
+              target_run_id: ${{ parameters.target_run_id }}
+              expected_subscription_id: ${{ parameters.expected_subscription_id }}
+              expected_region: ${{ parameters.expected_region }}
+              expected_cluster_count: ${{ parameters.expected_cluster_count }}
+              native_build_id: ${{ parameters.resume_replacement_build_id }}
+
+      - ${{ if not(parameters.quota_observe_only) }}:
+          - template: /steps/topology/clustermesh-scale/reuse/recover-unreachable-worker.yml
+            parameters:
+              target_run_id: ${{ parameters.target_run_id }}
+              expected_subscription_id: ${{ parameters.expected_subscription_id }}
+              expected_region: ${{ parameters.expected_region }}
+              expected_cluster_count: ${{ parameters.expected_cluster_count }}
+              tfvars_path: ${{ parameters.tfvars_path }}
+              plan_json: ${{ parameters.plan_json }}
+              reimage_failed_os: ${{ parameters.reimage_failed_os }}
+              observe_build_id: ${{ parameters.observe_build_id }}
+              replace_failed_host_build_id: ${{ parameters.replace_failed_host_build_id }}

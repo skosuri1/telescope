@@ -88,6 +88,12 @@ parameters:
   - name: scaleDebugUnreachableWorkerReplaceFailedHostBuildId
     type: number
     default: 0
+  - name: scaleDebugUnreachableWorkerResumeReplacementBuildId
+    type: number
+    default: 0
+  - name: scaleDebugUnreachableWorkerQuotaObserveOnly
+    type: boolean
+    default: false
   - name: scaleDebugArmRepairOnly
     type: boolean
     default: false
@@ -2994,6 +3000,8 @@ stages:
       CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY: ${{ parameters.scaleDebugPreparedRetirementObserveOnly }}
       CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY: ${{ parameters.scaleDebugUnreachableWorkerRecoveryOnly }}
       CLUSTERMESH_UNREACHABLE_WORKER_REPLACE_FAILED_HOST_BUILD_ID: ${{ parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId }}
+      CLUSTERMESH_UNREACHABLE_WORKER_RESUME_REPLACEMENT_BUILD_ID: ${{ parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId }}
+      CLUSTERMESH_UNREACHABLE_WORKER_QUOTA_OBSERVE_ONLY: ${{ parameters.scaleDebugUnreachableWorkerQuotaObserveOnly }}
       CLUSTERMESH_ARM_REPAIR_ONLY: ${{ parameters.scaleDebugArmRepairOnly }}
       CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY: ${{ parameters.scaleDebugCniWorkerMaintenanceOnly }}
       AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
@@ -3100,7 +3108,7 @@ stages:
       CL2_PROBE_WINDOW_DURATION: "60m"
       CL2_PROBE_PREWAIT_S: "600"
     jobs:
-      - ${{ if and(eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)))) }}:
+      - ${{ if and(eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)))) }}:
           - template: /jobs/clustermesh-prepared-worker-retirement.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3113,7 +3121,7 @@ stages:
               retirement_uid: ${{ parameters.scaleDebugPreparedRetirementUid }}
               observe_only: ${{ parameters.scaleDebugPreparedRetirementObserveOnly }}
               run_workload: ${{ parameters.scaleDebugRunWorkload }}
-      - ${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)) }}:
+      - ${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}:
           - template: /jobs/clustermesh-arm-repair.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3122,7 +3130,7 @@ stages:
               expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
               tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
               overlay_mode: ${{ parameters.debugMode }}
-      - ${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)) }}:
+      - ${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}:
           - template: /jobs/clustermesh-cni-worker-maintenance.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3142,7 +3150,7 @@ stages:
               recover_empty_fresh_node: ${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshNode }}
               recover_empty_fresh_uid: ${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshUid }}
               replace_empty_fresh: ${{ parameters.scaleDebugCniWorkerReplaceEmptyFresh }}
-      - ${{ if or(ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), and(parameters.scaleDebugUnreachableWorkerRecoveryOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly))) }}:
+      - ${{ if or(ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), ne(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), parameters.scaleDebugUnreachableWorkerQuotaObserveOnly, and(parameters.scaleDebugUnreachableWorkerRecoveryOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly))) }}:
           - template: /jobs/clustermesh-unreachable-worker-recovery.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3156,6 +3164,8 @@ stages:
               reimage_failed_os: ${{ parameters.scaleDebugUnreachableWorkerReimageFailedOs }}
               observe_build_id: ${{ parameters.scaleDebugUnreachableWorkerObserveBuildId }}
               replace_failed_host_build_id: ${{ parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId }}
+              resume_replacement_build_id: ${{ parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId }}
+              quota_observe_only: ${{ parameters.scaleDebugUnreachableWorkerQuotaObserveOnly }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}

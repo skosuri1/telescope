@@ -216,6 +216,16 @@ rewritten. Framework moves still require actual capacity/IP and strict peer/Flee
 proof. Failed or ambiguous operations retain their receipts for diagnosis,
 without automatic rollback or resubmission.
 
+If capacity restoration is rejected for quota after native removal, set
+`scaleDebugUnreachableWorkerQuotaObserveOnly=true` and
+`scaleDebugUnreachableWorkerResumeReplacementBuildId` to the native-operation
+build, retaining the original accepted-action build parameter. This selects
+a separate **read-only** step instead of the recovery executable. It captures
+current regional/family quota, the monitoring pool and VM inventory, the latest
+AKS operation, and the previously audited accidental n2 resource group in the
+same subscription. It never retries restoration, raises quota, or deletes
+resources. Its completed observation is not host recovery or workload readiness.
+
 ### Planned single-worker CNI maintenance
 
 `cni_worker_maintenance.py` provides the local operator path for one explicitly

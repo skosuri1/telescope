@@ -1,0 +1,133 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: native_build_id
+    type: number
+
+steps:
+  - script: |
+      set -euo pipefail
+      umask 077
+      if [ "$RUN_ID" != "78751-f36f3d5a" ] ||
+        [ "$CONFIRM_RESUME" != "$RUN_ID" ] ||
+        [ "$EXPECTED_SUBSCRIPTION_ID" != "37deca37-c375-4a14-b90a-043849bd2bf1" ] ||
+        [ "$EXPECTED_REGION" != "eastus2euap" ] ||
+        [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
+        ! [[ "$NATIVE_BUILD_ID" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Quota observation requires the exact preserved scope and native-action checkpoint." >&2
+        exit 1
+      fi
+      source="$NATIVE_INPUT_DIRECTORY/recovery.json"
+      jq -e '
+        .execute == true and .mutation_started == true
+        and .original_identity.node_uid == "9d8a9811-0e9a-4ff5-9a94-db89c42d223b"
+        and .original_identity.vm_id == "d731b838-501d-438d-a087-fd4545f1d607"
+        and .replacement.delete.accepted == true
+        and .replacement.delete.ambiguous == false
+        and .replacement.native_removal.pool_count == 0
+        and .replacement.native_removal.vmss_capacity == 0
+        and .replacement.native_removal.old_node_pods_nnc_absent == true
+        and .replacement.restore.attempted == true
+        and (.error | contains("ErrCode_InsufficientVCPUQuota"))' "$source" >/dev/null
+      directory="$ARTIFACT_STAGING_DIRECTORY/n100-unreachable-worker-recovery"
+      mkdir -p "$directory"
+      echo "##vso[task.setvariable variable=UNREACHABLE_WORKER_DIAGNOSTICS_READY]true"
+      cp "$source" "$directory/prior-native-action.json"
+      az account show --query '{id:id}' --output json --only-show-errors > "$directory/account.json"
+      jq -e --arg id "$EXPECTED_SUBSCRIPTION_ID" '.id == $id' "$directory/account.json" >/dev/null
+      az vm list-usage --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --location "$EXPECTED_REGION" --output json --only-show-errors \
+        --query '[].{name:name.value,currentValue:currentValue,limit:limit,unit:unit}' \
+        > "$directory/regional-usage.json"
+      jq '[.[] | select((.name | ascii_downcase) == "standarddv3family"
+        or (.name | ascii_downcase) == "cores") |
+        . + {remaining: (.limit - .currentValue)}]' \
+        "$directory/regional-usage.json" > "$directory/quota.json"
+      jq -e 'length == 2 and all(.[];
+        (.limit | type == "number") and (.currentValue | type == "number")
+        and .limit >= 0 and .currentValue >= 0)' "$directory/quota.json" >/dev/null
+      az group show --subscription "$EXPECTED_SUBSCRIPTION_ID" --name "$RUN_ID" \
+        --query '{id:id,name:name,location:location,tags:tags,provisioningState:properties.provisioningState}' \
+        --output json --only-show-errors > "$directory/preserved-group.json"
+      az aks show --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-group "$RUN_ID" --name clustermesh-96 \
+        --query '{id:id,name:name,location:location,nodeResourceGroup:nodeResourceGroup,tags:tags,provisioningState:provisioningState,powerState:powerState}' \
+        --output json --only-show-errors > "$directory/cluster.json"
+      az aks operation show-latest --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-group "$RUN_ID" --name clustermesh-96 \
+        --query '{name:name,status:status,operationType:operationType,startTime:startTime,endTime:endTime,errorCode:error.code}' \
+        --output json --only-show-errors > "$directory/operation.json"
+      az aks nodepool list --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-group "$RUN_ID" --cluster-name clustermesh-96 \
+        --query '[].{id:id,name:name,count:count,mode:mode,vmSize:vmSize,nodeImageVersion:nodeImageVersion,provisioningState:provisioningState,powerState:powerState,enableAutoScaling:enableAutoScaling}' \
+        --output json --only-show-errors > "$directory/pools.json"
+      node_group="mc_78751-f36f3d5a_clustermesh-96_eastus2euap"
+      az vmss list --subscription "$EXPECTED_SUBSCRIPTION_ID" --resource-group "$node_group" \
+        --query '[].{id:id,name:name,capacity:sku.capacity,sku:sku.name,provisioningState:provisioningState}' \
+        --output json --only-show-errors > "$directory/vmsses.json"
+      az vmss list-instances --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-group "$node_group" --name aks-prompool-38822163-vmss \
+        --query '[].{id:id,instanceId:instanceId,vmId:vmId,computerName:osProfile.computerName,provisioningState:provisioningState}' \
+        --output json --only-show-errors > "$directory/prom-instances.json"
+      accidental_group="79825-24946a3a"
+      if az group show --subscription "$EXPECTED_SUBSCRIPTION_ID" --name "$accidental_group" \
+        --query '{id:id,name:name,location:location,tags:tags,provisioningState:properties.provisioningState}' \
+        --output json --only-show-errors > "$directory/accidental-group.json" \
+        2> "$directory/accidental-group-read.log"; then
+        az aks list --subscription "$EXPECTED_SUBSCRIPTION_ID" --resource-group "$accidental_group" \
+          --query '[].{id:id,name:name,location:location,nodeResourceGroup:nodeResourceGroup,tags:tags,provisioningState:provisioningState,powerState:powerState}' \
+          --output json --only-show-errors > "$directory/accidental-clusters.json"
+        while IFS=$'\t' read -r name managed_group; do
+          if ! [[ "$name" =~ ^clustermesh-[12]$ ]] ||
+            [ "${managed_group,,}" != "mc_${accidental_group}_${name}_eastus2euap" ]; then
+            echo "Unexpected accidental-run cluster identity; no wider discovery is permitted." >&2
+            exit 1
+          fi
+          az group show --subscription "$EXPECTED_SUBSCRIPTION_ID" --name "$managed_group" \
+            --query '{id:id,name:name,managedBy:managedBy,location:location,provisioningState:properties.provisioningState}' \
+            --output json --only-show-errors > "$directory/accidental-$name-node-group.json"
+          az vmss list --subscription "$EXPECTED_SUBSCRIPTION_ID" --resource-group "$managed_group" \
+            --query '[].{id:id,name:name,capacity:sku.capacity,sku:sku.name,provisioningState:provisioningState}' \
+            --output json --only-show-errors > "$directory/accidental-$name-vmsses.json"
+        done < <(jq -r '.[] | [.name, .nodeResourceGroup] | @tsv' "$directory/accidental-clusters.json")
+      elif grep -q '(ResourceGroupNotFound)' "$directory/accidental-group-read.log"; then
+        jq -n --arg group "$accidental_group" \
+          '{name:$group,absent:true,proof:"ResourceGroupNotFound"}' > "$directory/accidental-group.json"
+      else
+        echo "Accidental-group read failed; absence is not proved. No resource writes were attempted." >&2
+        exit 1
+      fi
+      jq -n --argjson build "$NATIVE_BUILD_ID" --slurpfile quota "$directory/quota.json" \
+        --slurpfile pools "$directory/pools.json" --slurpfile instances "$directory/prom-instances.json" \
+        '{observation_only:true,mutation_started:false,workloads_ready:false,
+          source_native_build:$build,observation_complete:true,quota:$quota[0],
+          headroom_for_restore:(all($quota[0][]; .remaining >= 8)),
+          headroom_for_restore_and_cni:(all($quota[0][]; .remaining >= 24)),
+          pools:$pools[0],prom_instances:$instances[0]}' > "$directory/quota-observation.json"
+      echo "Completed read-only native-outcome and quota observation; no repair or cleanup was submitted."
+    displayName: "Observe native outcome and quota without resource changes"
+    retryCountOnTaskFailure: 0
+    env:
+      RUN_ID: ${{ parameters.target_run_id }}
+      CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
+      EXPECTED_SUBSCRIPTION_ID: ${{ parameters.expected_subscription_id }}
+      EXPECTED_REGION: ${{ parameters.expected_region }}
+      EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      NATIVE_BUILD_ID: "${{ parameters.native_build_id }}"
+      NATIVE_INPUT_DIRECTORY: $(Pipeline.Workspace)/native-host-action-${{ parameters.native_build_id }}
+      ARTIFACT_STAGING_DIRECTORY: $(Build.ArtifactStagingDirectory)
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish read-only quota and native-outcome evidence"
+    condition: >-
+      and(always(),
+      eq(variables['UNREACHABLE_WORKER_DIAGNOSTICS_READY'], 'true'))
+    inputs:
+      targetPath: "$(Build.ArtifactStagingDirectory)/n100-unreachable-worker-recovery"
+      artifact: "n100-unreachable-worker-recovery-$(Build.BuildId)-$(System.JobAttempt)"

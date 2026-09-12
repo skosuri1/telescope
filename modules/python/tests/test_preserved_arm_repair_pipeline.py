@@ -91,7 +91,9 @@ def test_only_selected_resume_stage_exposes_arm_only_job():
         "${{ if and(parameters.scaleDebugArmRepairOnly, "
         "not(parameters.scaleDebugPreparedRetirementObserveOnly), "
         "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), "
-        "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)) }}"
+        "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "
+        "eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), "
+        "not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}"
     )
     entry = next(item for item in stage["jobs"] if condition in item)
     maintenance = entry[condition][0]

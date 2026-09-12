@@ -128,7 +128,9 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
         "${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, "
         "not(parameters.scaleDebugPreparedRetirementObserveOnly), "
         "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), "
-        "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)) }}"
+        "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "
+        "eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), "
+        "not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}"
     )
     invocation = next(item[condition][0] for item in stage["jobs"] if condition in item)
     assert invocation["template"] == f"/{JOB}"

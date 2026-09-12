@@ -34,6 +34,8 @@ ENVIRONMENT = {
     "CONFIRM_RESUME": "78751-f36f3d5a",
     "OBSERVE_BUILD_ID": "0",
     "REPLACE_FAILED_HOST_BUILD_ID": "0",
+    "RESUME_REPLACEMENT_BUILD_ID": "0",
+    "QUOTA_OBSERVE_ONLY": "False",
     "REIMAGE_FAILED_OS": "False",
 }
 
@@ -67,6 +69,10 @@ def template(path):
     {"REPLACE_FAILED_HOST_BUILD_ID": "79880", "OBSERVE_BUILD_ID": "79880", "REIMAGE_FAILED_OS": "True"},
     {"REPLACE_FAILED_HOST_BUILD_ID": "79880", "RECOVERY_ONLY": "False"},
     {"REPLACE_FAILED_HOST_BUILD_ID": "79880", "RUN_WORKLOAD": "True"},
+    {"RESUME_REPLACEMENT_BUILD_ID": "-1"},
+    {"QUOTA_OBSERVE_ONLY": "True"},
+    {"RESUME_REPLACEMENT_BUILD_ID": "79894", "QUOTA_OBSERVE_ONLY": "True"},
+    {"RESUME_REPLACEMENT_BUILD_ID": "79894", "REPLACE_FAILED_HOST_BUILD_ID": "79880"},
 ])
 def test_recovery_job_requires_complete_exclusive_mode(changes):
     result = subprocess.run(
@@ -82,6 +88,8 @@ def test_recovery_job_requires_complete_exclusive_mode(changes):
     {"REPLACE_FAILED_HOST_BUILD_ID": "79880"},
     {"REPLACE_FAILED_HOST_BUILD_ID": "79880", "RECOVERY_PLAN_JSON": ""},
     {"OBSERVE_BUILD_ID": "79880", "REIMAGE_FAILED_OS": "True"},
+    {"RESUME_REPLACEMENT_BUILD_ID": "79894", "REPLACE_FAILED_HOST_BUILD_ID": "79880",
+     "QUOTA_OBSERVE_ONLY": "True", "RECOVERY_PLAN_JSON": ""},
 ])
 def test_recovery_job_accepts_distinct_checkpoint_modes(changes):
     result = subprocess.run(
@@ -104,6 +112,8 @@ def test_recovery_mode_excludes_other_mutation_paths():
     )
     key = (
         "${{ if or(ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "
+        "ne(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), "
+        "parameters.scaleDebugUnreachableWorkerQuotaObserveOnly, "
         "and(parameters.scaleDebugUnreachableWorkerRecoveryOnly, "
         "not(parameters.scaleDebugPreparedRetirementObserveOnly))) }}"
     )
@@ -119,17 +129,27 @@ def test_recovery_mode_excludes_other_mutation_paths():
         assert "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)" in next(iter(key))
     for key in stage["jobs"][:3]:
         assert "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)" in next(iter(key))
+        assert "eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0)" in next(iter(key))
+        assert "not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)" in next(iter(key))
     normal = template("jobs/clustermesh-debug-resume.yml")["jobs"][0]
     assert "ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY'], 'true')" in normal["condition"]
     assert "eq(variables['CLUSTERMESH_UNREACHABLE_WORKER_REPLACE_FAILED_HOST_BUILD_ID'], '0')" in normal["condition"]
+    assert "eq(variables['CLUSTERMESH_UNREACHABLE_WORKER_RESUME_REPLACEMENT_BUILD_ID'], '0')" in normal["condition"]
+    assert "ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_QUOTA_OBSERVE_ONLY'], 'true')" in normal["condition"]
     assert stage["variables"]["CLUSTERMESH_UNREACHABLE_WORKER_REPLACE_FAILED_HOST_BUILD_ID"] == (
         "${{ parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId }}"
     )
     job = template(JOB)["jobs"][0]
     assert job["variables"]["SCENARIO_NAME"] == "clustermesh-scale"
     assert [row.get("template") for row in job["steps"] if "template" in row] == [
-        "/steps/setup-tests.yml", f"/{STEP}",
+        "/steps/setup-tests.yml",
     ]
+    normal_key = "${{ if not(parameters.quota_observe_only) }}"
+    observe_key = "${{ if parameters.quota_observe_only }}"
+    assert next(row[normal_key][0] for row in job["steps"] if normal_key in row)["template"] == f"/{STEP}"
+    observation = next(row[observe_key][0] for row in job["steps"] if observe_key in row)
+    assert observation["template"] == "/steps/topology/clustermesh-scale/reuse/observe-native-prom-quota.yml"
+    assert observation["parameters"]["native_build_id"] == "${{ parameters.resume_replacement_build_id }}"
     assert job["steps"][1]["parameters"]["credential_type"] == "service_connection"
     assert job["steps"][1]["parameters"]["ssh_key_enabled"] is False
     assert template(STEP)["steps"][0]["retryCountOnTaskFailure"] == 0
