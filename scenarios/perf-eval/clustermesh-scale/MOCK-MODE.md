@@ -184,6 +184,15 @@ fully Succeeded/Running models, a new boot, Ready Pods, and strict peer/Fleet
 postproof. A new provisioning failure or ambiguous request retains the marker
 and fails without another reimage.
 
+If an accepted reimage outlives its observer, set
+`scaleDebugUnreachableWorkerObserveBuildId` to the build that recorded acceptance,
+with the same original plan and OS-reimage option. This downloads that run's
+receipt and runs `--observe-accepted-action` without `--execute`. The observer
+requires matching acceptance, VM ID, plan hash, Node UID, and live marker, and
+waits only for the already submitted action. It never recreates markers,
+reimages again, moves Pods, or clears the marker. A Ready host observation is
+not a full framework/CNI recovery or workload-ready result.
+
 ### Planned single-worker CNI maintenance
 
 `cni_worker_maintenance.py` provides the local operator path for one explicitly

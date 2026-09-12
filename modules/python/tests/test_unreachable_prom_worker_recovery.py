@@ -946,6 +946,94 @@ def test_reimage_postproof_requires_actual_succeeded_extension_status(environmen
     assert not fake.deleted
 
 
+def accepted_observation(environment, *, healthy):
+    args, plan, fake = environment
+    args.reimage_failed_os = True
+    args.execute = False
+    previous_boot = recovery.node_boot(fake.nodes[recovery.PROM_NODE])
+    marker_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    requested_time = (datetime.now(timezone.utc) - timedelta(minutes=55)).isoformat()
+    marker = {
+        "schema_version": 1, "owner": recovery.OWNER, "action": "single-instance-reimage",
+        "node_uid": recovery.REAL_UIDS[recovery.PROM_NODE], "provider_id": recovery.PROVIDER,
+        "plan_sha256": recovery.digest(plan), "previous_boot_id": previous_boot,
+        "token": uid("accepted-marker"), "recorded_at": marker_time,
+    }
+    checkpoint = {
+        "execute": True, "mutation_started": True, "plan_sha256": recovery.digest(plan),
+        "restart": {
+            "action": "reimage", "attempted": True, "accepted": True, "ambiguous": False,
+            "marker": marker, "requested_at": requested_time, "previous_boot_id": previous_boot,
+        },
+        "arm_metadata": {"instances": {recovery.PROM_NODE: {
+            "vm_id": recovery.FAILED_PROM_VM_ID, "instance_id": "0",
+        }}},
+    }
+    fake.nodes[recovery.PROM_NODE]["metadata"]["annotations"][recovery.MARKER_KEY] = (
+        json.dumps(marker, sort_keys=True, separators=(",", ":"))
+    )
+    fake.instances[recovery.PROM_VMSS][0]["vmId"] = recovery.FAILED_PROM_VM_ID
+    args.observe_accepted_action = str(Path(args.plan_file).parent / "accepted.json")
+    Path(args.observe_accepted_action).write_text(json.dumps(checkpoint), encoding="utf-8")
+    if healthy:
+        fake.recover_host()
+    else:
+        fake.vmsses[1]["provisioningState"] = "Updating"
+        fake.instances[recovery.PROM_VMSS][0]["provisioningState"] = "Updating"
+        fake.views[(recovery.PROM_VMSS, "0")]["statuses"] = [
+            {"code": "ProvisioningState/updating"}, {"code": "PowerState/running"},
+        ]
+    return checkpoint
+
+
+def test_accepted_action_observer_certifies_host_without_any_write(environment):
+    accepted_observation(environment, healthy=True)
+    _, _, fake = environment
+    summary = run(environment, execute=False)
+    assert summary["observation_only"] and summary["observed_host_ready"]
+    assert not summary["repaired"] and not summary["mutation_started"]
+    assert not summary["restart"]["attempted"]
+    assert not fake.writes and not fake.deleted
+    assert recovery.MARKER_KEY in fake.nodes[recovery.PROM_NODE]["metadata"]["annotations"]
+
+
+def test_accepted_action_observer_waits_without_resubmitting(environment, monkeypatch):
+    accepted_observation(environment, healthy=False)
+    _, _, fake = environment
+    abort_wait(monkeypatch)
+    with pytest.raises(recovery.workers.ReconcileError, match="accepted-reimage observation"):
+        run(environment, execute=False)
+    assert not fake.writes and not fake.deleted
+    assert not receipt()["mutation_started"] and not receipt()["restart"]["attempted"]
+    assert receipt()["observed_action"]["models_stable"] is False
+
+
+@pytest.mark.parametrize("fault", ["unaccepted", "different-plan", "different-vm", "different-marker"])
+def test_accepted_action_observer_rejects_unproven_checkpoint(environment, fault):
+    checkpoint = accepted_observation(environment, healthy=True)
+    args, _, fake = environment
+    if fault == "unaccepted":
+        checkpoint["restart"]["accepted"] = False
+    elif fault == "different-plan":
+        checkpoint["plan_sha256"] = "x" * 64
+    elif fault == "different-vm":
+        checkpoint["arm_metadata"]["instances"][recovery.PROM_NODE]["vm_id"] = uid("foreign")
+    else:
+        fake.nodes[recovery.PROM_NODE]["metadata"]["annotations"][recovery.MARKER_KEY] = "{}"
+    Path(args.observe_accepted_action).write_text(json.dumps(checkpoint), encoding="utf-8")
+    with pytest.raises(recovery.workers.ReconcileError):
+        run(environment, execute=False)
+    assert not fake.writes and not fake.deleted
+
+
+def test_accepted_action_observer_forbids_execute(environment):
+    accepted_observation(environment, healthy=True)
+    _, _, fake = environment
+    with pytest.raises(recovery.workers.ReconcileError, match="cannot be combined"):
+        run(environment, execute=True)
+    assert not fake.commands and not fake.writes
+
+
 @pytest.mark.parametrize("fault", [
     "node-uid", "node-provider", "default-unready", "kwok-uid", "kwok-unready",
     "mock-uid", "healthy-on-source", "mock-on-host", "pvc-host", "unknown-controller",

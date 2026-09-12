@@ -18,6 +18,9 @@ parameters:
   - name: reimage_failed_os
     type: boolean
     default: false
+  - name: observe_build_id
+    type: number
+    default: 0
 
 jobs:
   - job: unreachable_worker_recovery
@@ -56,6 +59,11 @@ jobs:
              and (.node_name | type == "string")
              and (.node_uid | type == "string")' \
             <<< "$RECOVERY_PLAN_JSON" >/dev/null
+          if ! [[ "$OBSERVE_BUILD_ID" =~ ^(0|[1-9][0-9]*)$ ]] ||
+            { [ "$OBSERVE_BUILD_ID" != "0" ] && [ "${REIMAGE_FAILED_OS,,}" != "true" ]; }; then
+            echo "Accepted-action observation requires a positive source build ID and the OS-reimage mode." >&2
+            exit 1
+          fi
         displayName: "Require one exclusive unreachable-worker recovery plan"
         env:
           EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
@@ -67,6 +75,8 @@ jobs:
           OBSERVE_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY)
           CNI_MAINTENANCE_ONLY: $(CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY)
           RECOVERY_PLAN_JSON: ${{ parameters.plan_json }}
+          OBSERVE_BUILD_ID: "${{ parameters.observe_build_id }}"
+          REIMAGE_FAILED_OS: "${{ parameters.reimage_failed_os }}"
 
       - template: /steps/setup-tests.yml
         parameters:
@@ -75,6 +85,19 @@ jobs:
           run_id: ${{ parameters.target_run_id }}
           credential_type: service_connection
           ssh_key_enabled: false
+
+      - ${{ if gt(parameters.observe_build_id, 0) }}:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download the accepted host-action receipt"
+            inputs:
+              buildType: specific
+              project: $(System.TeamProjectId)
+              definition: $(System.DefinitionId)
+              specificBuildWithTriggering: false
+              buildVersionToDownload: specific
+              pipelineId: ${{ parameters.observe_build_id }}
+              artifactName: n100-unreachable-worker-recovery-${{ parameters.observe_build_id }}-1
+              targetPath: $(Pipeline.Workspace)/accepted-host-action-${{ parameters.observe_build_id }}
 
       - template: /steps/topology/clustermesh-scale/reuse/recover-unreachable-worker.yml
         parameters:
@@ -85,3 +108,4 @@ jobs:
           tfvars_path: ${{ parameters.tfvars_path }}
           plan_json: ${{ parameters.plan_json }}
           reimage_failed_os: ${{ parameters.reimage_failed_os }}
+          observe_build_id: ${{ parameters.observe_build_id }}

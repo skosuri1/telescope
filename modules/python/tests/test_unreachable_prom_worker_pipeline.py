@@ -32,6 +32,8 @@ ENVIRONMENT = {
     "RECOVERY_PLAN_JSON": json.dumps(PLAN),
     "RUN_ID": "78751-f36f3d5a",
     "CONFIRM_RESUME": "78751-f36f3d5a",
+    "OBSERVE_BUILD_ID": "0",
+    "REIMAGE_FAILED_OS": "False",
 }
 
 
@@ -56,6 +58,8 @@ def template(path):
     {"RECOVERY_PLAN_JSON": "[]"},
     {"RECOVERY_PLAN_JSON": json.dumps({**PLAN, "schema_version": 2})},
     {"RECOVERY_PLAN_JSON": "x" * 32769},
+    {"OBSERVE_BUILD_ID": "-1"},
+    {"OBSERVE_BUILD_ID": "79880"},
 ])
 def test_recovery_job_requires_complete_exclusive_mode(changes):
     result = subprocess.run(
@@ -108,6 +112,8 @@ def test_recovery_mode_excludes_other_mutation_paths():
     ("execute", 2, 8),
     ("confirm", 0, 1),
     ("malformed", 0, 1),
+    ("observe", 1, 0),
+    ("missing-checkpoint", 0, 1),
 ])
 @pytest.mark.parametrize("reimage_failed_os", ["False", "True"])
 def test_recovery_step_plans_before_exact_execution(
@@ -116,6 +122,7 @@ def test_recovery_step_plans_before_exact_execution(
     script = template(STEP)["steps"][0]["script"]
     script = script.replace("$(Build.ArtifactStagingDirectory)", str(tmp_path / "artifacts"))
     script = script.replace("$(Pipeline.Workspace)/s", str(REPOSITORY))
+    script = script.replace("$(Pipeline.Workspace)", str(tmp_path / "workspace"))
     script = script.replace(
         "${{ parameters.tfvars_path }}",
         "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars",
@@ -165,6 +172,14 @@ def test_recovery_step_plans_before_exact_execution(
         environment["CONFIRM_RESUME"] = "different"
     if failure == "malformed":
         environment["RECOVERY_PLAN_JSON"] = "[]"
+    if failure in ("observe", "missing-checkpoint"):
+        environment["OBSERVE_BUILD_ID"] = "79880"
+        if reimage_failed_os == "False":
+            expected_calls, expected_code = 0, 1
+        if failure == "observe":
+            checkpoint = tmp_path / "workspace" / "accepted-host-action-79880" / "recovery.json"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text('{"accepted": true}', encoding="utf-8")
     result = subprocess.run(
         ["bash", "-c", script], env=environment, capture_output=True,
         text=True, check=False, timeout=10,
@@ -185,6 +200,9 @@ def test_recovery_step_plans_before_exact_execution(
         assert plan_path.stat().st_mode & 0o777 == 0o600
         if failure != "mutate-plan":
             assert json.loads(plan_path.read_text(encoding="utf-8")) == PLAN
+        if failure == "observe":
+            assert "--observe-accepted-action" in calls[0]
+            assert len(calls) == 1 and "--execute" not in calls[0]
     if len(calls) == 2:
         assert calls[1][-1] == "--execute"
         assert calls[0][:calls[0].index("--summary-file")] == calls[1][:calls[1].index("--summary-file")]

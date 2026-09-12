@@ -14,6 +14,9 @@ parameters:
   - name: reimage_failed_os
     type: boolean
     default: false
+  - name: observe_build_id
+    type: number
+    default: 0
 
 steps:
   - script: |
@@ -52,6 +55,24 @@ steps:
         false) ;;
         *) echo "REIMAGE_FAILED_OS must be true or false." >&2; exit 1 ;;
       esac
+      observe_build_id="${OBSERVE_BUILD_ID:-0}"
+      if ! [[ "$observe_build_id" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "OBSERVE_BUILD_ID must be a canonical non-negative integer." >&2
+        exit 1
+      fi
+      if [ "$observe_build_id" != "0" ]; then
+        accepted="$(Pipeline.Workspace)/accepted-host-action-$observe_build_id/recovery.json"
+        if [ "${reimage_failed_os,,}" != "true" ] || [ ! -s "$accepted" ]; then
+          echo "The accepted OS-action receipt is required for read-only observation." >&2
+          exit 1
+        fi
+        echo "Read-only observation of the accepted host action from build $observe_build_id; no mutation path will run."
+        cp "$accepted" "$summary_dir/accepted-action.json"
+        python3 "$helper" "${args[@]}" \
+          --observe-accepted-action "$summary_dir/accepted-action.json" \
+          --summary-file "$summary_dir/observation.json"
+        exit 0
+      fi
       python3 "$helper" "${args[@]}" \
         --summary-file "$summary_dir/plan-only.json"
       jq -e '.execute == false and .mutation_started == false
@@ -71,6 +92,7 @@ steps:
       EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
       RECOVERY_PLAN_JSON: ${{ parameters.plan_json }}
       REIMAGE_FAILED_OS: "${{ parameters.reimage_failed_os }}"
+      OBSERVE_BUILD_ID: "${{ parameters.observe_build_id }}"
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish unreachable-worker recovery evidence"

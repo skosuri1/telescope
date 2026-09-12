@@ -82,6 +82,9 @@ parameters:
   - name: scaleDebugUnreachableWorkerReimageFailedOs
     type: boolean
     default: false
+  - name: scaleDebugUnreachableWorkerObserveBuildId
+    type: number
+    default: 0
   - name: scaleDebugArmRepairOnly
     type: boolean
     default: false
@@ -3147,6 +3150,7 @@ stages:
               run_workload: ${{ parameters.scaleDebugRunWorkload }}
               plan_json: ${{ parameters.scaleDebugUnreachableWorkerPlanJson }}
               reimage_failed_os: ${{ parameters.scaleDebugUnreachableWorkerReimageFailedOs }}
+              observe_build_id: ${{ parameters.scaleDebugUnreachableWorkerObserveBuildId }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}

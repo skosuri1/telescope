@@ -295,6 +295,8 @@ def validate_args(args) -> None:
             "timeout-seconds must be between 1 and 3600")
     require(Path(args.plan_file).resolve() != Path(args.summary_file).resolve(),
             "Plan and summary must be different files")
+    require(not getattr(args, "observe_accepted_action", None) or not args.execute,
+            "Accepted-action observation cannot be combined with --execute")
 
 
 def frozen_controllers(snapshot: dict) -> dict:
@@ -1672,6 +1674,9 @@ class Recovery(maintenance.ClusterOperator):
 
     def execute(self):
         self.authority()
+        if getattr(self.args, "observe_accepted_action", None):
+            self.observe_accepted_action()
+            return
         self.models(allow_failed_os=self.host_action == "reimage")
         super().run([
             "az", "aks", "get-credentials", "--resource-group", RESOURCE_GROUP, "--name", CLUSTER,
@@ -1721,6 +1726,79 @@ class Recovery(maintenance.ClusterOperator):
             self.summary["cleanup_errors"].append(f"Restart marker cleanup failed: {error}")
             raise
         self.summary.update({"repaired": True, "status": "repaired"})
+
+    def observe_accepted_action(self):
+        """Observe a proven accepted reimage without submitting any resource write."""
+
+        require(not self.args.execute and self.host_action == "reimage",
+                "Accepted reimage observation is strictly read-only")
+        with open(self.args.observe_accepted_action, encoding="utf-8") as handle:
+            prior = json.load(handle)
+        action = prior.get("restart") or {}
+        marker = action.get("marker") or {}
+        require(
+            prior.get("execute") is True and prior.get("mutation_started") is True
+            and prior.get("plan_sha256") == self.summary["plan_sha256"]
+            and action.get("action") == "reimage" and action.get("attempted") is True
+            and action.get("accepted") is True and action.get("ambiguous") is False
+            and marker.get("owner") == OWNER and marker.get("schema_version") == 1
+            and marker.get("action") == "single-instance-reimage"
+            and marker.get("node_uid") == REAL_UIDS[PROM_NODE]
+            and marker.get("provider_id") == PROVIDER
+            and marker.get("plan_sha256") == self.summary["plan_sha256"]
+            and isinstance(marker.get("token"), str) and maintenance.UUID_RE.fullmatch(marker["token"])
+            and action.get("previous_boot_id") == marker.get("previous_boot_id")
+            and bool(marker.get("previous_boot_id")),
+            "Accepted-action checkpoint does not prove this exact owned reimage",
+        )
+        requested = timestamp(action.get("requested_at"), "accepted reimage request")
+        require(timestamp(marker.get("recorded_at"), "owned reimage marker") <= requested
+                <= datetime.now(timezone.utc), "Accepted-action timestamps are invalid")
+        original_instances = (prior.get("arm_metadata") or {}).get("instances") or {}
+        require(
+            (original_instances.get(PROM_NODE) or {}).get("vm_id") == FAILED_PROM_VM_ID
+            and (original_instances.get(PROM_NODE) or {}).get("instance_id") == "0",
+            "Accepted-action checkpoint has a different VM identity",
+        )
+        self.summary["observation_only"] = True
+        self.summary["observed_action"] = {
+            "action": "reimage", "accepted_at": action["requested_at"],
+            "marker_token": marker["token"], "node_uid": REAL_UIDS[PROM_NODE],
+            "vm_id": FAILED_PROM_VM_ID, "previous_boot_id": marker["previous_boot_id"],
+        }
+        self.summary["restart"]["requested_at"] = action["requested_at"]
+        self.save()
+        super().run([
+            "az", "aks", "get-credentials", "--resource-group", RESOURCE_GROUP, "--name", CLUSTER,
+            "--file", self.args.kubeconfig, "--context", CLUSTER, "--only-show-errors",
+        ], 45)
+        Path(self.args.kubeconfig).chmod(0o600)
+        self.initial = self.snapshot()
+        expected_marker = json.dumps(marker, sort_keys=True, separators=(",", ":"))
+        while True:
+            stable = self.models(restarting=True)
+            current_vm = self.summary["arm_metadata"]["instances"][PROM_NODE]
+            require(current_vm["vm_id"] == FAILED_PROM_VM_ID,
+                    "The accepted reimage target VM identity changed")
+            snapshot = self.snapshot()
+            nodes, _ = self.guard(snapshot)
+            host = nodes[PROM_NODE]
+            require(maintenance._annotations(host).get(MARKER_KEY) == expected_marker,
+                    "The accepted-action marker changed or disappeared")
+            boot = node_boot(host)
+            ready = workers.node_is_ready(host)
+            self.summary["observed_action"].update({
+                "current_boot_id": boot, "node_ready": ready,
+                "models_stable": stable, "observed_at": workers.utc_now(),
+            })
+            self.save()
+            if stable and ready and boot != marker["previous_boot_id"] and self.system_ready(snapshot):
+                self.summary.update({
+                    "status": "plan_valid", "plan_valid": True,
+                    "observed_host_ready": True, "repaired": False,
+                })
+                return
+            self.wait(self.work_deadline, "Read-only accepted-reimage observation")
 
 
 def execute_recovery(args, summary: dict, runner=workers.run_command, delete_pod=None):
@@ -1806,6 +1884,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--reimage-failed-os", action="store_true")
+    parser.add_argument("--observe-accepted-action")
     return parser.parse_args(argv)
 
 
