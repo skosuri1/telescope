@@ -76,11 +76,15 @@ steps:
         --query '{id:id,name:name,location:location,nodeResourceGroup:nodeResourceGroup,tags:tags,provisioningState:provisioningState,powerState:powerState}' \
         --output json --only-show-errors > "$directory/cluster.json"
       cluster_id="/subscriptions/$EXPECTED_SUBSCRIPTION_ID/resourceGroups/$RUN_ID/providers/Microsoft.ContainerService/managedClusters/clustermesh-96"
-      jq -e --arg id "$cluster_id" '
+      if ! jq -e --arg id "$cluster_id" '
         (.id | ascii_downcase) == ($id | ascii_downcase)
-        and .nodeResourceGroup == "mc_78751-f36f3d5a_clustermesh-96_eastus2euap"
-        and .location == "eastus2euap" and .tags.role == "mesh-96"' \
-        "$directory/cluster.json" >/dev/null
+        and (.nodeResourceGroup | ascii_downcase) == "mc_78751-f36f3d5a_clustermesh-96_eastus2euap"
+        and (.location | ascii_downcase) == "eastus2euap" and .tags.role == "mesh-96"' \
+        "$directory/cluster.json" >/dev/null; then
+        echo "Observed cluster identity does not match the preserved scope; no worker reads or writes will proceed." >&2
+        jq '{id,location,nodeResourceGroup,role:.tags.role}' "$directory/cluster.json" >&2
+        exit 1
+      fi
       az aks operation show-latest --subscription "$EXPECTED_SUBSCRIPTION_ID" \
         --resource-group "$RUN_ID" --name clustermesh-96 \
         --query '{name:name,status:status,operationType:operationType,startTime:startTime,endTime:endTime,errorCode:error.code}' \

@@ -105,7 +105,7 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                 value = {"id": prefix + "78751-f36f3d5a/providers/Microsoft.ContainerService/managedClusters/clustermesh-96",
                          "name": "clustermesh-96", "provisioningState": "Succeeded",
                          "location": "eastus2euap", "tags": {"role": "mesh-96"},
-                         "nodeResourceGroup": "mc_78751-f36f3d5a_clustermesh-96_eastus2euap"}
+                         "nodeResourceGroup": "MC_78751-f36f3d5a_clustermesh-96_eastus2euap"}
                 if fault == "cluster-scope":
                     value["nodeResourceGroup"] = "foreign-group"
             elif args[:2] == ["aks", "get-credentials"]:
