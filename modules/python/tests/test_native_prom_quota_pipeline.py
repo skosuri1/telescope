@@ -18,6 +18,7 @@ SUBSCRIPTION = "37deca37-c375-4a14-b90a-043849bd2bf1"
 
 @pytest.mark.parametrize("fault", [
     "none", "scope", "checkpoint", "absent", "forbidden", "timeout", "foreign-cluster", "bad-counter",
+    "managed-absent", "managed-forbidden",
 ])
 @pytest.mark.parametrize("family,total", [(32, 100), (8, 100), (0, 100), (100, 0), (-16, 100)])
 @pytest.mark.parametrize("counter_type", ["number", "string"])
@@ -70,6 +71,7 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                     for name, remaining in [
                         ("standardDv3Family", int(os.environ["FAMILY"])),
                         ("cores", int(os.environ["TOTAL"])),
+                        ("standardDSv5Family", 900),
                     ]
                 ]
                 if os.environ["COUNTER_TYPE"] == "string":
@@ -79,6 +81,10 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                     value[0]["currentValue"] = "100.5"
             elif args[:2] == ["group", "show"]:
                 name = arg("--name")
+                if name.startswith("mc_79825-24946a3a_") and fault in ("managed-absent", "managed-forbidden"):
+                    code = "ResourceGroupNotFound" if fault == "managed-absent" else "AuthorizationFailed"
+                    print(f"ERROR: ({code}) explicit fake managed-group read", file=sys.stderr)
+                    sys.exit(1)
                 if name == "79825-24946a3a" and fault in ("absent", "forbidden", "timeout"):
                     code = {"absent": "ResourceGroupNotFound", "forbidden": "AuthorizationFailed",
                             "timeout": "GatewayTimeout"}[fault]
@@ -108,6 +114,11 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                 assert group.startswith(("mc_78751-f36f3d5a_clustermesh-96_", "mc_79825-24946a3a_"))
                 value = [{"name": "allowed-vmss", "sku": {"name": "Standard_D8_v3", "capacity": 0},
                           "provisioningState": "Succeeded"}]
+            elif args[:2] == ["vm", "list-skus"]:
+                assert arg("--size") == "Standard_D8s_v5" and arg("--location") == "eastus2euap"
+                value = [{"name": "Standard_D8s_v5", "family": "standardDSv5Family",
+                          "locations": ["eastus2euap"], "restrictions": [],
+                          "capabilities": [{"name": "vCPUs", "value": "8"}, {"name": "MemoryGB", "value": "32"}]}]
             else:
                 assert args[:2] == ["vmss", "list-instances"]
                 assert arg("--name") == "aks-prompool-38822163-vmss"
@@ -135,7 +146,7 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
     result = subprocess.run(
         ["bash", "-c", script], env=environment, capture_output=True, text=True, check=False, timeout=20,
     )
-    success = fault in ("none", "absent")
+    success = fault in ("none", "absent", "managed-absent")
     assert (result.returncode == 0) is success, result.stderr
     directory = tmp_path / "artifacts" / "n100-unreachable-worker-recovery"
     if success:
@@ -144,9 +155,17 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
         assert summary["headroom_for_restore"] is (min(family, total) >= 8)
         assert summary["headroom_for_restore_and_cni"] is (min(family, total) >= 24)
         assert summary["prom_instances"] == []
+        modern = json.loads((directory / "supported-family-quota.json").read_text(encoding="utf-8"))
+        assert modern[0]["remaining"] == 900
+        sku = json.loads((directory / "supported-vm-sku.json").read_text(encoding="utf-8"))
+        assert sku[0]["name"] == "Standard_D8s_v5" and sku[0]["restrictions"] == []
         if fault == "absent":
             assert json.loads((directory / "accidental-group.json").read_text(encoding="utf-8"))["proof"] \
                 == "ResourceGroupNotFound"
+        if fault == "managed-absent":
+            for name in ("clustermesh-1", "clustermesh-2"):
+                assert json.loads((directory / f"accidental-{name}-node-group.json").read_text(encoding="utf-8"))["absent"]
+                assert not (directory / f"accidental-{name}-vmsses.json").exists()
     else:
         assert not (directory / "quota-observation.json").exists()
     if fault in ("scope", "checkpoint"):

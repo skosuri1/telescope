@@ -225,6 +225,11 @@ current regional/family quota, the monitoring pool and VM inventory, the latest
 AKS operation, and the previously audited accidental n2 resource group in the
 same subscription. It never retries restoration, raises quota, or deletes
 resources. Its completed observation is not host recovery or workload readiness.
+The observation also records supported Dsv5-family headroom, the regional
+`Standard_D8s_v5` capability/restriction response, and nonsecret pool configuration
+for evaluating an explicit migration plan. These reads do not authorize a SKU or
+pool-layout change. Missing accidental-run managed groups require an explicit
+`ResourceGroupNotFound` response and are not treated as failed capacity reads.
 
 Capacity continuation uses the same original accepted-action and native-operation
 builds, with `scaleDebugUnreachableWorkerQuotaObserveOnly=false`. It accepts only
