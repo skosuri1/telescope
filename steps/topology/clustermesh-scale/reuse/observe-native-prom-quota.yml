@@ -133,14 +133,18 @@ steps:
         > "$directory/current-controllers.json"
       timeout 45 "${kube[@]}" get pdb -A -o json > "$directory/current-pdbs.json"
       timeout 45 "${kube[@]}" get nodenetworkconfigs -n kube-system -o json > "$directory/current-nnc.json"
-      resource_health_complete=true
-      vm_id="/subscriptions/$EXPECTED_SUBSCRIPTION_ID/resourceGroups/$node_group/providers/Microsoft.Compute/virtualMachineScaleSets/aks-default-28928250-vmss/virtualMachines/1"
-      if ! timeout 60 az rest --subscription "$EXPECTED_SUBSCRIPTION_ID" --method get \
-        --url "https://management.azure.com$vm_id/providers/Microsoft.ResourceHealth/availabilityStatuses/current?api-version=2025-05-01" \
-        --output json --only-show-errors > "$directory/default-1-resource-health.json" \
-        2> "$directory/default-1-resource-health-read.log"; then
-        resource_health_complete=false
-      fi
+      timeout 60 az vmss get-instance-view --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-group "$node_group" --name aks-default-28928250-vmss \
+        --query '{statuses:statuses,virtualMachines:virtualMachine.statusesSummary}' \
+        --output json --only-show-errors > "$directory/default-vmss-instance-view.json"
+      vmss_id="/subscriptions/$EXPECTED_SUBSCRIPTION_ID/resourceGroups/$node_group/providers/Microsoft.Compute/virtualMachineScaleSets/aks-default-28928250-vmss"
+      timeout 90 az monitor activity-log list --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+        --resource-id "$vmss_id" --offset 2h --max-events 100 \
+        --query '[].{eventTimestamp:eventTimestamp,submissionTimestamp:submissionTimestamp,operation:operationName.value,status:status.value,subStatus:subStatus.value,resourceId:resourceId,correlationId:correlationId,operationId:operationId,eventDataId:eventDataId,level:level,properties:properties}' \
+        --output json --only-show-errors > "$directory/default-vmss-activity-log.json"
+      jq -n '{supported:false,queried:false,provider_error:"UnsupportedResourceType",
+        evidence_build:79941,reason:"Resource Health does not support this Uniform VMSS instance type",
+        worker_health_inferred:false}' > "$directory/default-1-resource-health.json"
       accidental_group="79825-24946a3a"
       if az group show --subscription "$EXPECTED_SUBSCRIPTION_ID" --name "$accidental_group" \
         --query '{id:id,name:name,location:location,tags:tags,provisioningState:properties.provisioningState}' \
@@ -178,19 +182,16 @@ steps:
         echo "Accidental-group read failed; absence is not proved. No resource writes were attempted." >&2
         exit 1
       fi
-      jq -n --argjson build "$NATIVE_BUILD_ID" --argjson health_complete "$resource_health_complete" \
+      jq -n --argjson build "$NATIVE_BUILD_ID" \
         --slurpfile quota "$directory/quota.json" \
         --slurpfile pools "$directory/pools.json" --slurpfile instances "$directory/prom-instances.json" \
         '{observation_only:true,mutation_started:false,workloads_ready:false,
-          source_native_build:$build,observation_complete:$health_complete,
-          worker_state_collected:true,resource_health_complete:$health_complete,quota:$quota[0],
+          source_native_build:$build,observation_complete:true,
+          worker_state_collected:true,resource_health_complete:false,resource_health_supported:false,quota:$quota[0],
           headroom_for_restore:(all($quota[0][]; .remaining >= 8)),
           headroom_for_restore_and_cni:(all($quota[0][]; .remaining >= 24)),
           pools:$pools[0],prom_instances:$instances[0]}' > "$directory/quota-observation.json"
-      if [ "$resource_health_complete" != "true" ]; then
-        echo "Resource Health could not be read; captured worker state does not prove maintenance completion." >&2
-        exit 1
-      fi
+      echo "Resource Health is unsupported for this instance type; no health result is inferred from that gap."
       echo "Completed read-only native-outcome and quota observation; no repair or cleanup was submitted."
     displayName: "Observe worker maintenance, native outcome and quota without changes"
     retryCountOnTaskFailure: 0

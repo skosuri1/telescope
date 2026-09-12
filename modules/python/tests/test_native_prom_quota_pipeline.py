@@ -18,7 +18,7 @@ SUBSCRIPTION = "37deca37-c375-4a14-b90a-043849bd2bf1"
 
 @pytest.mark.parametrize("fault", [
     "none", "scope", "checkpoint", "absent", "forbidden", "timeout", "foreign-cluster", "bad-counter",
-    "managed-absent", "managed-forbidden", "health-forbidden", "kube-forbidden", "cluster-scope",
+    "managed-absent", "managed-forbidden", "activity-forbidden", "kube-forbidden", "cluster-scope",
 ])
 @pytest.mark.parametrize("family,total", [(32, 100), (8, 100), (0, 100), (100, 0), (-16, 100)])
 @pytest.mark.parametrize("counter_type", ["number", "string"])
@@ -116,21 +116,26 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                 target.write_text("private-test-credentials", encoding="utf-8")
                 sys.exit(0)
             elif args[:2] == ["vmss", "get-instance-view"]:
-                assert arg("--name") == "aks-default-28928250-vmss" and arg("--instance-id") in ("0", "1")
-                value = {"statuses": [{"code": "PowerState/running"}], "extensions": [],
-                         "maintenanceRedeployStatus": {"isCustomerInitiatedMaintenanceAllowed": False}}
-            elif args[0] == "rest":
-                assert arg("--method") == "get"
-                assert arg("--url") == (
-                    f"https://management.azure.com/subscriptions/{sub}/resourceGroups/"
+                assert arg("--name") == "aks-default-28928250-vmss"
+                if "--instance-id" in args:
+                    assert arg("--instance-id") in ("0", "1")
+                    value = {"statuses": [{"code": "PowerState/running"}], "extensions": [],
+                             "maintenanceRedeployStatus": {"isCustomerInitiatedMaintenanceAllowed": False}}
+                else:
+                    value = {"statuses": [{"code": "ProvisioningState/failed"}],
+                             "virtualMachine": {"statusesSummary": [{"code": "ProvisioningState/failed", "count": 1}]}}
+            elif args[:3] == ["monitor", "activity-log", "list"]:
+                assert arg("--resource-id") == (
+                    f"/subscriptions/{sub}/resourceGroups/"
                     "mc_78751-f36f3d5a_clustermesh-96_eastus2euap/providers/Microsoft.Compute/"
-                    "virtualMachineScaleSets/aks-default-28928250-vmss/virtualMachines/1/providers/"
-                    "Microsoft.ResourceHealth/availabilityStatuses/current?api-version=2025-05-01"
+                    "virtualMachineScaleSets/aks-default-28928250-vmss"
                 )
-                if fault == "health-forbidden":
-                    print("ERROR: (AuthorizationFailed) Resource Health is not readable", file=sys.stderr)
+                assert arg("--offset") == "2h" and arg("--max-events") == "100"
+                if fault == "activity-forbidden":
+                    print("ERROR: (AuthorizationFailed) Activity Log is not readable", file=sys.stderr)
                     sys.exit(1)
-                value = {"properties": {"availabilityState": "Unavailable", "reasonType": "PlatformInitiated"}}
+                value = [{"operationName": {"value": "Microsoft.Compute/virtualMachineScaleSets/restart/action"},
+                          "status": {"value": "Failed"}, "properties": {"statusMessage": "captured provider error"}}]
             elif args[:2] == ["aks", "list"]:
                 assert arg("--resource-group") == "79825-24946a3a"
                 names = ["foreign"] if fault == "foreign-cluster" else ["clustermesh-1", "clustermesh-2"]
@@ -214,11 +219,16 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
     if success:
         summary = json.loads((directory / "quota-observation.json").read_text(encoding="utf-8"))
         assert summary["observation_only"] and not summary["mutation_started"] and not summary["workloads_ready"]
-        assert summary["worker_state_collected"] and summary["resource_health_complete"]
+        assert summary["worker_state_collected"] and not summary["resource_health_complete"]
+        assert summary["resource_health_supported"] is False
         current = json.loads((directory / "current-nodes.json").read_text(encoding="utf-8"))
         assert current["items"][0]["status"]["conditions"][0]["status"] == "Unknown"
-        assert json.loads((directory / "default-1-resource-health.json").read_text(encoding="utf-8")) \
-            ["properties"]["availabilityState"] == "Unavailable"
+        health = json.loads((directory / "default-1-resource-health.json").read_text(encoding="utf-8"))
+        assert health["supported"] is False and health["queried"] is False and health["evidence_build"] == 79941
+        activity = json.loads((directory / "default-vmss-activity-log.json").read_text(encoding="utf-8"))
+        assert activity[0]["status"] == "Failed" and activity[0]["properties"]["statusMessage"] == "captured provider error"
+        aggregate = json.loads((directory / "default-vmss-instance-view.json").read_text(encoding="utf-8"))
+        assert aggregate["virtualMachines"] == [{"code": "ProvisioningState/failed", "count": 1}]
         assert summary["headroom_for_restore"] is (min(family, total) >= 8)
         assert summary["headroom_for_restore_and_cni"] is (min(family, total) >= 24)
         assert summary["prom_instances"] == []
@@ -233,13 +243,10 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
             for name in ("clustermesh-1", "clustermesh-2"):
                 assert json.loads((directory / f"accidental-{name}-node-group.json").read_text(encoding="utf-8"))["absent"]
                 assert not (directory / f"accidental-{name}-vmsses.json").exists()
-    elif fault == "health-forbidden":
-        summary = json.loads((directory / "quota-observation.json").read_text(encoding="utf-8"))
-        assert not summary["observation_complete"] and not summary["resource_health_complete"]
-        assert not summary["mutation_started"] and not summary["workloads_ready"]
-        assert (directory / "current-nodes.json").is_file()
     else:
         assert not (directory / "quota-observation.json").exists()
+        if fault == "activity-forbidden":
+            assert (directory / "current-nodes.json").is_file()
     assert not list(private_root.iterdir())
     if fault == "cluster-scope":
         calls = [json.loads(row) for row in calls_file.read_text(encoding="utf-8").splitlines()]
@@ -253,4 +260,5 @@ def test_quota_observer_has_no_helper_execution_or_retries():
     operation, artifact = template["steps"]
     assert operation["retryCountOnTaskFailure"] == 0
     assert "--execute" not in operation["script"] and "python3" not in operation["script"]
+    assert "az rest" not in operation["script"]
     assert artifact["task"] == "PublishPipelineArtifact@1" and "always()" in artifact["condition"]
