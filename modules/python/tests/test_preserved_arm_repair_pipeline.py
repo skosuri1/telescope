@@ -30,7 +30,7 @@ def test_arm_only_requires_exact_existing_n100_scope(
         ["bash", "-c", job["steps"][0]["script"]],
         env=dict(
             os.environ, EXPECTED_CLUSTER_COUNT=count, OVERLAY_MODE=mode,
-            RETIREMENT_ONLY=retirement_only,
+            RETIREMENT_ONLY=retirement_only, CNI_MAINTENANCE_ONLY="false",
             CLUSTERMESH_PRESERVED_AKS_ARM_RECONCILE_ENABLED=enabled,
         ),
         capture_output=True, text=True, check=False, timeout=10,
@@ -87,11 +87,14 @@ def test_only_selected_resume_stage_exposes_arm_only_job():
     assert stage["variables"]["CLUSTERMESH_ARM_REPAIR_ONLY"] == (
         "${{ parameters.scaleDebugArmRepairOnly }}"
     )
-    entry = next(
-        item for item in stage["jobs"]
-        if "${{ if eq(parameters.scaleDebugArmRepairOnly, true) }}" in item
+    condition = (
+        "${{ if and(parameters.scaleDebugArmRepairOnly, "
+        "not(parameters.scaleDebugPreparedRetirementObserveOnly), "
+        "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), "
+        "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)) }}"
     )
-    maintenance = entry["${{ if eq(parameters.scaleDebugArmRepairOnly, true) }}"][0]
+    entry = next(item for item in stage["jobs"] if condition in item)
+    maintenance = entry[condition][0]
     assert maintenance["template"] == "/jobs/clustermesh-arm-repair.yml"
     assert maintenance["parameters"]["target_run_id"] == "${{ parameters.debugTargetRunId }}"
     assert maintenance["parameters"]["expected_subscription_id"] == (

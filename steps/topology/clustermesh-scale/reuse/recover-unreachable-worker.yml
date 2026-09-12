@@ -17,15 +17,20 @@ parameters:
   - name: observe_build_id
     type: number
     default: 0
+  - name: replace_failed_host_build_id
+    type: number
+    default: 0
 
 steps:
   - script: |
       set -euo pipefail
       umask 077
+      replace_build_id="${REPLACE_FAILED_HOST_BUILD_ID:-0}"
       if [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
         [ "$CONFIRM_RESUME" != "$RUN_ID" ] ||
         ! [[ "$RUN_ID" =~ ^[0-9]+-[0-9a-f]{8}$ ]] ||
-        [ -z "$RECOVERY_PLAN_JSON" ] ||
+        ! [[ "$replace_build_id" =~ ^(0|[1-9][0-9]*)$ ]] ||
+        { [ -z "$RECOVERY_PLAN_JSON" ] && [ "$replace_build_id" = "0" ]; } ||
         [ "${#RECOVERY_PLAN_JSON}" -gt 32768 ]; then
         echo "Unreachable-worker recovery requires confirmed preserved n100 scope and an explicit bounded plan." >&2
         exit 1
@@ -33,7 +38,16 @@ steps:
       summary_dir="$(Build.ArtifactStagingDirectory)/n100-unreachable-worker-recovery"
       mkdir -p "$summary_dir"
       echo "##vso[task.setvariable variable=UNREACHABLE_WORKER_DIAGNOSTICS_READY]true"
-      printf '%s\n' "$RECOVERY_PLAN_JSON" > "$summary_dir/input-plan.json"
+      if [ -n "$RECOVERY_PLAN_JSON" ]; then
+        printf '%s\n' "$RECOVERY_PLAN_JSON" > "$summary_dir/input-plan.json"
+      else
+        original_plan="$(Pipeline.Workspace)/accepted-failed-host-$replace_build_id/input-plan.json"
+        if [ ! -s "$original_plan" ] || [ "$(wc -c < "$original_plan")" -gt 32769 ]; then
+          echo "The bounded original identity plan is missing from the accepted-action artifact." >&2
+          exit 1
+        fi
+        cp "$original_plan" "$summary_dir/input-plan.json"
+      fi
       jq -e 'type == "object" and .schema_version == 1' \
         "$summary_dir/input-plan.json" >/dev/null
       plan_sha=$(sha256sum "$summary_dir/input-plan.json" | awk '{print $1}')
@@ -47,7 +61,6 @@ steps:
         --expected-region "${{ parameters.expected_region }}"
         --expected-tfvars-sha "$expected_tfvars_sha"
         --plan-file "$summary_dir/input-plan.json"
-        --timeout-seconds 1800
       )
       reimage_failed_os="${REIMAGE_FAILED_OS:-false}"
       case "${reimage_failed_os,,}" in
@@ -60,6 +73,26 @@ steps:
         echo "OBSERVE_BUILD_ID must be a canonical non-negative integer." >&2
         exit 1
       fi
+      if ! [[ "$replace_build_id" =~ ^(0|[1-9][0-9]*)$ ]] ||
+        { [ "$replace_build_id" != "0" ] &&
+          { [ "$observe_build_id" != "0" ] || [ "${reimage_failed_os,,}" != "false" ]; }; }; then
+        echo "Failed-host replacement must have its own source build and no observer/reimage mode." >&2
+        exit 1
+      fi
+      timeout_seconds=1800
+      accepted_sha=""
+      if [ "$replace_build_id" != "0" ]; then
+        accepted="$(Pipeline.Workspace)/accepted-failed-host-$replace_build_id/recovery.json"
+        if [ ! -s "$accepted" ]; then
+          echo "The exact accepted-action lineage is required before failed-host replacement." >&2
+          exit 1
+        fi
+        cp "$accepted" "$summary_dir/accepted-action.json"
+        accepted_sha=$(sha256sum "$summary_dir/accepted-action.json" | awk '{print $1}')
+        args+=(--replace-failed-host "$summary_dir/accepted-action.json")
+        timeout_seconds=3600
+      fi
+      args+=(--timeout-seconds "$timeout_seconds")
       if [ "$observe_build_id" != "0" ]; then
         accepted="$(Pipeline.Workspace)/accepted-host-action-$observe_build_id/recovery.json"
         if [ "${reimage_failed_os,,}" != "true" ] || [ ! -s "$accepted" ]; then
@@ -82,6 +115,11 @@ steps:
         echo "The explicit recovery plan changed during read-only planning." >&2
         exit 1
       fi
+      if [ -n "$accepted_sha" ] &&
+        [ "$(sha256sum "$summary_dir/accepted-action.json" | awk '{print $1}')" != "$accepted_sha" ]; then
+        echo "The accepted-action lineage changed during read-only planning." >&2
+        exit 1
+      fi
       python3 "$helper" "${args[@]}" \
         --summary-file "$summary_dir/recovery.json" --execute
     displayName: "Plan then recover the exact unreachable worker and failed framework pods"
@@ -93,6 +131,7 @@ steps:
       RECOVERY_PLAN_JSON: ${{ parameters.plan_json }}
       REIMAGE_FAILED_OS: "${{ parameters.reimage_failed_os }}"
       OBSERVE_BUILD_ID: "${{ parameters.observe_build_id }}"
+      REPLACE_FAILED_HOST_BUILD_ID: "${{ parameters.replace_failed_host_build_id }}"
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish unreachable-worker recovery evidence"

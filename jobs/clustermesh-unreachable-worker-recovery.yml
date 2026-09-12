@@ -21,6 +21,9 @@ parameters:
   - name: observe_build_id
     type: number
     default: 0
+  - name: replace_failed_host_build_id
+    type: number
+    default: 0
 
 jobs:
   - job: unreachable_worker_recovery
@@ -48,21 +51,29 @@ jobs:
             echo "Unreachable-worker recovery requires existing n100 and no workload or other maintenance mode." >&2
             exit 1
           fi
-          if [ -z "$RECOVERY_PLAN_JSON" ] ||
-            [ "${#RECOVERY_PLAN_JSON}" -gt 32768 ]; then
-            echo "An explicit bounded unreachable-worker identity plan is required." >&2
-            exit 1
-          fi
-          jq -e \
-            'type == "object" and .schema_version == 1
-             and (.role | type == "string")
-             and (.node_name | type == "string")
-             and (.node_uid | type == "string")' \
-            <<< "$RECOVERY_PLAN_JSON" >/dev/null
           if ! [[ "$OBSERVE_BUILD_ID" =~ ^(0|[1-9][0-9]*)$ ]] ||
             { [ "$OBSERVE_BUILD_ID" != "0" ] && [ "${REIMAGE_FAILED_OS,,}" != "true" ]; }; then
             echo "Accepted-action observation requires a positive source build ID and the OS-reimage mode." >&2
             exit 1
+          fi
+          if ! [[ "$REPLACE_FAILED_HOST_BUILD_ID" =~ ^(0|[1-9][0-9]*)$ ]] ||
+            { [ "$REPLACE_FAILED_HOST_BUILD_ID" != "0" ] &&
+              { [ "$OBSERVE_BUILD_ID" != "0" ] || [ "${REIMAGE_FAILED_OS,,}" != "false" ]; }; }; then
+            echo "Failed-host replacement requires its accepted-action build and excludes observation or reimage." >&2
+            exit 1
+          fi
+          if { [ -z "$RECOVERY_PLAN_JSON" ] && [ "$REPLACE_FAILED_HOST_BUILD_ID" = "0" ]; } ||
+            [ "${#RECOVERY_PLAN_JSON}" -gt 32768 ]; then
+            echo "An explicit bounded identity plan or the failed-host source artifact is required." >&2
+            exit 1
+          fi
+          if [ -n "$RECOVERY_PLAN_JSON" ]; then
+            jq -e \
+              'type == "object" and .schema_version == 1
+               and (.role | type == "string")
+               and (.node_name | type == "string")
+               and (.node_uid | type == "string")' \
+              <<< "$RECOVERY_PLAN_JSON" >/dev/null
           fi
         displayName: "Require one exclusive unreachable-worker recovery plan"
         env:
@@ -76,6 +87,7 @@ jobs:
           CNI_MAINTENANCE_ONLY: $(CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY)
           RECOVERY_PLAN_JSON: ${{ parameters.plan_json }}
           OBSERVE_BUILD_ID: "${{ parameters.observe_build_id }}"
+          REPLACE_FAILED_HOST_BUILD_ID: "${{ parameters.replace_failed_host_build_id }}"
           REIMAGE_FAILED_OS: "${{ parameters.reimage_failed_os }}"
 
       - template: /steps/setup-tests.yml
@@ -99,6 +111,19 @@ jobs:
               artifactName: n100-unreachable-worker-recovery-${{ parameters.observe_build_id }}-1
               targetPath: $(Pipeline.Workspace)/accepted-host-action-${{ parameters.observe_build_id }}
 
+      - ${{ if gt(parameters.replace_failed_host_build_id, 0) }}:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download the failed host's accepted-action lineage"
+            inputs:
+              buildType: specific
+              project: $(System.TeamProjectId)
+              definition: $(System.DefinitionId)
+              specificBuildWithTriggering: false
+              buildVersionToDownload: specific
+              pipelineId: ${{ parameters.replace_failed_host_build_id }}
+              artifactName: n100-unreachable-worker-recovery-${{ parameters.replace_failed_host_build_id }}-1
+              targetPath: $(Pipeline.Workspace)/accepted-failed-host-${{ parameters.replace_failed_host_build_id }}
+
       - template: /steps/topology/clustermesh-scale/reuse/recover-unreachable-worker.yml
         parameters:
           target_run_id: ${{ parameters.target_run_id }}
@@ -109,3 +134,4 @@ jobs:
           plan_json: ${{ parameters.plan_json }}
           reimage_failed_os: ${{ parameters.reimage_failed_os }}
           observe_build_id: ${{ parameters.observe_build_id }}
+          replace_failed_host_build_id: ${{ parameters.replace_failed_host_build_id }}

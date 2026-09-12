@@ -193,6 +193,29 @@ waits only for the already submitted action. It never recreates markers,
 reimages again, moves Pods, or clears the marker. A Ready host observation is
 not a full framework/CNI recovery or workload-ready result.
 
+For the captured terminal `OSProvisioningInternalError` **after** that accepted
+reimage, `scaleDebugUnreachableWorkerReplaceFailedHostBuildId` supplies the
+original acceptance receipt to a separate native replacement path. Observation
+and reimage must both be disabled. The original identity plan can be loaded from
+that same artifact by leaving `scaleDebugUnreachableWorkerPlanJson` empty; it
+must still match the accepted receipt and live marker, and is never regenerated
+from later live state. Planning requires the exact live action marker,
+failed VM identity, original Node/Pod identities, and a PVC-free, entirely
+Pod-Unready target. The live monitoring pool must be a fixed-count **User** pool
+with one instance; the two healthy default workers must remain in the unchanged
+System pool. A System monitoring pool or ambiguous state stops without mutation.
+
+The operator submits one exact `az aks nodepool delete-machines` request, then
+waits for native removal of the old VM, Node, Pod references, and network
+container and a quiescent zero-count User pool. Only then may it submit one
+native scale back to one. It does not delete/recreate the pool, retry a host
+operation, manipulate the default pool, force-delete old Kubernetes objects,
+or treat a failed model as healthy. A replacement receives a separately recorded
+VM/Node/network-container identity; the original input manifest is never
+rewritten. Framework moves still require actual capacity/IP and strict peer/Fleet
+proof. Failed or ambiguous operations retain their receipts for diagnosis,
+without automatic rollback or resubmission.
+
 ### Planned single-worker CNI maintenance
 
 `cni_worker_maintenance.py` provides the local operator path for one explicitly

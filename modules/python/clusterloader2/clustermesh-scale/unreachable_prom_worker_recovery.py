@@ -2,7 +2,8 @@
 """Recover only the approved mesh-96 system host and explicitly pinned Pods.
 
 The default mode proves a plan without changing Azure or Kubernetes resources.
-This is not mock-agent recovery, worker replacement, or a workload-ready gate.
+Failed-host replacement requires a separate accepted-action checkpoint.
+This is not mock-agent recovery or a workload-ready gate.
 """
 
 # pylint: disable=too-many-lines,protected-access,too-many-boolean-expressions
@@ -282,6 +283,16 @@ def load_plan(path: str) -> dict:
     return validate_plan(json.loads(serialized.decode("utf-8"), object_pairs_hook=unique_keys))
 
 
+def validate_paths(args) -> None:
+    require(Path(args.plan_file).resolve() != Path(args.summary_file).resolve(),
+            "Plan and summary must be different files")
+    for name in ("observe_accepted_action", "replace_failed_host"):
+        checkpoint = getattr(args, name, None)
+        require(not checkpoint or Path(checkpoint).resolve() not in {
+            Path(args.plan_file).resolve(), Path(args.summary_file).resolve(),
+        }, "Accepted-action checkpoint must differ from the plan and summary")
+
+
 def validate_args(args) -> None:
     require(
         args.resource_group == args.confirm_resource_group == RESOURCE_GROUP
@@ -293,10 +304,52 @@ def validate_args(args) -> None:
             "The preserved tfvars SHA256 must be exact")
     require(integer(args.timeout_seconds) and 0 < args.timeout_seconds <= 3600,
             "timeout-seconds must be between 1 and 3600")
-    require(Path(args.plan_file).resolve() != Path(args.summary_file).resolve(),
-            "Plan and summary must be different files")
+    validate_paths(args)
     require(not getattr(args, "observe_accepted_action", None) or not args.execute,
             "Accepted-action observation cannot be combined with --execute")
+    require(not getattr(args, "replace_failed_host", None) or not (
+        getattr(args, "observe_accepted_action", None) or getattr(args, "reimage_failed_os", False)
+    ), "Failed-host replacement cannot be combined with observation or another reimage")
+
+
+def validate_accepted_reimage(prior, plan_sha256):
+    """Bind subsequent recovery to the original accepted action, not a retry."""
+
+    require(isinstance(prior, dict), "Accepted-action checkpoint must be an object")
+    action = prior.get("restart") or {}
+    require(isinstance(action, dict), "Accepted-action restart receipt is malformed")
+    marker = action.get("marker") or {}
+    require(isinstance(marker, dict), "Accepted-action marker is malformed")
+    require(
+        prior.get("execute") is True and prior.get("mutation_started") is True
+        and prior.get("plan_sha256") == plan_sha256
+        and action.get("action") == "reimage" and action.get("attempted") is True
+        and action.get("accepted") is True and action.get("ambiguous") is False
+        and marker.get("owner") == OWNER
+        and integer(marker.get("schema_version")) and marker["schema_version"] == 1
+        and marker.get("action") == "single-instance-reimage"
+        and marker.get("node_uid") == REAL_UIDS[PROM_NODE]
+        and marker.get("provider_id") == PROVIDER
+        and marker.get("plan_sha256") == plan_sha256
+        and isinstance(marker.get("token"), str) and maintenance.UUID_RE.fullmatch(marker["token"])
+        and action.get("previous_boot_id") == marker.get("previous_boot_id")
+        and bool(marker.get("previous_boot_id")),
+        "Accepted-action checkpoint does not prove this exact owned reimage",
+    )
+    requested = timestamp(action.get("requested_at"), "accepted reimage request")
+    require(timestamp(marker.get("recorded_at"), "owned reimage marker") <= requested
+            <= datetime.now(timezone.utc), "Accepted-action timestamps are invalid")
+    metadata = prior.get("arm_metadata")
+    require(isinstance(metadata, dict) and isinstance(metadata.get("instances"), dict),
+            "Accepted-action VM inventory is malformed")
+    original_instances = metadata["instances"]
+    original_vm = original_instances.get(PROM_NODE)
+    require(
+        isinstance(original_vm, dict) and original_vm.get("vm_id") == FAILED_PROM_VM_ID
+        and original_vm.get("instance_id") == "0",
+        "Accepted-action checkpoint has a different VM identity",
+    )
+    return action, marker
 
 
 def frozen_controllers(snapshot: dict) -> dict:
@@ -432,6 +485,10 @@ class Recovery(maintenance.ClusterOperator):
         self.exclusions = []
         self.cleanup_done = False
         self.host_action = "reimage" if getattr(args, "reimage_failed_os", False) else "restart"
+        self.host_node = PROM_NODE
+        self.host_provider_id = PROVIDER
+        self.real_uids = dict(REAL_UIDS)
+        self.system_origin_node = PROM_NODE
         self.targets = [{
             "namespace": "kube-system", "pod_name": plan["api_pod_name"], "pod_uid": plan["api_pod_uid"],
             "replica_set_name": plan["api_replica_set_name"], "replica_set_uid": plan["api_replica_set_uid"],
@@ -492,6 +549,15 @@ class Recovery(maintenance.ClusterOperator):
     def kube(self, *command):
         output = self.run(["kubectl", "--request-timeout=45s", *command])
         return workers.parse_json(output, "recovery Kubernetes read")
+
+    def open_cluster(self):
+        super().run([
+            "az", "aks", "get-credentials", "--resource-group", RESOURCE_GROUP, "--name", CLUSTER,
+            "--file", self.args.kubeconfig, "--context", CLUSTER, "--only-show-errors",
+        ], 45)
+        require(Path(self.args.kubeconfig).is_file() and Path(self.args.kubeconfig).stat().st_size > 0,
+                "Private selected-cluster kubeconfig was not produced")
+        Path(self.args.kubeconfig).chmod(0o600)
 
     def authority(self, *, strict=False):
         account = self.az_json("account", "show", "--query", "{id:id}")
@@ -815,33 +881,44 @@ class Recovery(maintenance.ClusterOperator):
             "cilium_config": self.kube("-n", "kube-system", "get", "configmap", "cilium-config", "-o", "json"),
         }
 
-    def guard(self, snapshot, *, host_unready=False):
+    def guard(self, snapshot, *, host_unready=False, host_optional=False):
+        require(not host_optional or bool(getattr(self.args, "replace_failed_host", None)),
+                "Only explicit failed-host replacement may observe native host removal")
         nodes = mocks._items(snapshot["nodes"], "Nodes")
         mapping = {row["metadata"]["name"]: row for row in nodes}
-        expected = {**self.plan["kwok_node_uids"], **REAL_UIDS}
-        require(len(nodes) == len(mapping) == 103 and set(mapping) == set(expected),
-                "The complete original 103-Node inventory must remain exact")
+        expected = {**self.plan["kwok_node_uids"], **self.real_uids}
+        if host_optional and self.host_node not in mapping:
+            expected.pop(self.host_node)
+        require(len(nodes) == len(mapping) == len(expected) and set(mapping) == set(expected),
+                "The complete pinned Node inventory must remain exact")
         for name, uid in expected.items():
             node = mapping[name]
-            require(object_uid(node) == uid and not node["metadata"].get("deletionTimestamp"),
+            require(object_uid(node) == uid and (
+                not node["metadata"].get("deletionTimestamp") or (host_optional and name == self.host_node)
+            ),
                     f"{name}: original Node UID/deletion state changed")
-            if name in REAL_UIDS:
+            if name in self.real_uids:
                 maintenance._validate_real_node_scope(node, subscription=SUBSCRIPTION, node_resource_group=NODE_GROUP)
-                vmss = PROM_VMSS if name == PROM_NODE else DEFAULT_VMSS
-                instance = "1" if name == f"{DEFAULT_VMSS}000001" else "0"
-                require(workers.provider_identity(node) == (vmss, instance)
-                        and mocks._node_pool_name(node) == ("prompool" if name == PROM_NODE else "default"),
+                if name == self.host_node:
+                    exact_provider = prepared.resource_equal(
+                        node["spec"].get("providerID"), self.host_provider_id,
+                    )
+                else:
+                    instance = "1" if name == f"{DEFAULT_VMSS}000001" else "0"
+                    exact_provider = workers.provider_identity(node) == (DEFAULT_VMSS, instance)
+                require(exact_provider
+                        and mocks._node_pool_name(node) == ("prompool" if name == self.host_node else "default"),
                         f"{name}: real provider or pool identity changed")
             else:
                 require((node["metadata"].get("labels") or {}).get("type") == "kwok",
                         f"{name}: KWOK Node label changed")
-            if name != PROM_NODE:
+            if name != self.host_node:
                 require(workers.node_is_ready(node), f"{name}: original healthy Node is no longer Ready")
                 if self.initial is not None:
                     original = next(row for row in self.initial["nodes"]["items"] if row["metadata"]["name"] == name)
                     require(node["spec"].get("unschedulable", False) == original["spec"].get("unschedulable", False),
                             f"{name}: original scheduling state changed")
-                    if name in REAL_UIDS:
+                    if name in self.real_uids:
                         require(node_boot(node) == node_boot(original), f"{name}: an original default worker rebooted")
         mock_controller = controller(snapshot, "StatefulSet", mocks.DEFAULT_NAMESPACE, "kwok-node",
                                      self.plan["mock_controller_uid"])
@@ -849,7 +926,7 @@ class Recovery(maintenance.ClusterOperator):
         agents = maintenance._require_exact_agents(snapshot["pods"], self.plan["mock_controller_uid"])
         require({name: object_uid(pod) for name, pod in agents.items()} == self.plan["mock_pod_uids"],
                 "An original mock Pod UID changed")
-        require(all((pod.get("spec") or {}).get("nodeName") in set(REAL_UIDS) - {PROM_NODE}
+        require(all((pod.get("spec") or {}).get("nodeName") in set(self.real_uids) - {self.host_node}
                     for pod in agents.values()), "A mock agent is on the target or an unexpected worker")
         require(all(pod_ready(agents[name]) for name in self.plan["ready_mock_pod_uids"]),
                 "An originally healthy mock agent regressed (including healthy agents on the CNI source)")
@@ -879,16 +956,19 @@ class Recovery(maintenance.ClusterOperator):
         require(SOURCE_NODE in nncs and nncs[SOURCE_NODE]["node_uid"] == REAL_UIDS[SOURCE_NODE]
                 and nncs[SOURCE_NODE]["network_container_id"] == SOURCE_NC,
                 "Pinned CNI source NodeNetworkConfig identity changed")
-        host = mapping[PROM_NODE]
-        require(prepared.resource_equal(host["spec"].get("providerID"), self.plan["provider_id"]),
-                "Target provider ID changed")
-        node_boot(host)
+        host = mapping.get(self.host_node)
+        require(host is not None or (host_optional and not host_unready),
+                "The pinned host is missing outside owned replacement observation")
+        if host is not None:
+            require(prepared.resource_equal(host["spec"].get("providerID"), self.host_provider_id),
+                    "Target provider ID changed")
+            node_boot(host)
         if self.summary["restart"].get("host_proven"):
-            require(workers.node_is_ready(host)
+            require(host is not None and workers.node_is_ready(host)
                     and node_boot(host) == self.summary["restart"]["current_boot_id"],
                     "The IP-qualified prom host lost readiness or rebooted again")
         for pod in mocks._items(snapshot["pods"], "Pods"):
-            if (pod.get("spec") or {}).get("nodeName") != PROM_NODE:
+            if (pod.get("spec") or {}).get("nodeName") != self.host_node:
                 continue
             meta = pod["metadata"]
             if self.probe and meta.get("name") == self.probe["name"]:
@@ -919,11 +999,11 @@ class Recovery(maintenance.ClusterOperator):
 
     def system_ready(self, snapshot):
         pods = mocks._items(snapshot["pods"], "Pods")
-        host_pods = [row for row in pods if (row.get("spec") or {}).get("nodeName") == PROM_NODE]
+        host_pods = [row for row in pods if (row.get("spec") or {}).get("nodeName") == self.host_node]
         expected = {
             (row["metadata"]["namespace"], owner["name"], owner["uid"])
             for row in mocks._items(self.initial["pods"], "initial host Pods")
-            if (row.get("spec") or {}).get("nodeName") == PROM_NODE
+            if (row.get("spec") or {}).get("nodeName") == self.system_origin_node
             for owner in row["metadata"].get("ownerReferences", [])
             if owner.get("controller") is True and owner.get("kind") == "DaemonSet"
         }
@@ -1104,7 +1184,7 @@ class Recovery(maintenance.ClusterOperator):
             node = maintenance._real_node_map(snapshot["nodes"]).get(node_name)
             require(node is not None and workers.node_is_ready(node), "Ready replacement is not on a Ready real node")
             if after_delete:
-                require(not same and object_uid(pod) not in binding["known_uids"] and node_name == PROM_NODE,
+                require(not same and object_uid(pod) not in binding["known_uids"] and node_name == self.host_node,
                         "New Pod must have a new owned UID on the IP-qualified prom host")
             previous = self.ready_targets.get(target_key(target))
             require(previous is None or object_uid(pod) == previous["uid"], "A recovered Pod UID changed again")
@@ -1255,7 +1335,7 @@ class Recovery(maintenance.ClusterOperator):
     def node_metric(self):
         metrics = self.kube("get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes")
         matches = [row for row in mocks._items(metrics, "actual node metrics")
-                   if (row.get("metadata") or {}).get("name") == PROM_NODE]
+                   if (row.get("metadata") or {}).get("name") == self.host_node]
         require(len(matches) == 1, "Actual prom-host memory/CPU metrics are missing")
         return matches[0]
 
@@ -1287,7 +1367,7 @@ class Recovery(maintenance.ClusterOperator):
 
     def qualify_capacity(self, snapshot, target):
         nodes, _ = self.guard(snapshot)
-        node = nodes[PROM_NODE]
+        node = nodes[self.host_node]
         require(workers.node_is_ready(node) and self.system_ready(snapshot), "Prom host/system readiness regressed")
         binding = self.bind_target(snapshot, target)
         template = binding["template"]
@@ -1306,7 +1386,7 @@ class Recovery(maintenance.ClusterOperator):
         effective_reserved = self.prove_memory(node, metric, reserve, pod_uid=target["pod_uid"], probe=True)
         alloc = node["status"].get("allocatable") or {}
         active = [row for row in mocks._items(snapshot["pods"], "capacity Pods")
-                  if (row.get("spec") or {}).get("nodeName") == PROM_NODE
+                  if (row.get("spec") or {}).get("nodeName") == self.host_node
                   and (row.get("status") or {}).get("phase") not in ("Succeeded", "Failed")]
         cpu_requests = sum(mocks._resource_requests(row)[0] for row in active)
         actual_cpu = int(mocks._quantity((metric.get("usage") or {}).get("cpu"), "actual node CPU") * 1000)
@@ -1320,7 +1400,7 @@ class Recovery(maintenance.ClusterOperator):
         require(free_cpu >= max(requested_cpu, 500) + 250 and free_slots >= 7,
                 "Actual CPU/request headroom or reserved Pod slots are insufficient")
         self.summary["last_capacity_proof"] = {
-            "node_uid": REAL_UIDS[PROM_NODE], "metric_timestamp": metric["timestamp"],
+            "node_uid": self.real_uids[self.host_node], "metric_timestamp": metric["timestamp"],
             "actual_memory": metric["usage"]["memory"], "actual_cpu": metric["usage"]["cpu"],
             "next_memory_reserve_bytes": reserve, "prior_move_reserve_bytes": self.reserved_memory,
             "baseline_high_water_bytes": self.memory_baseline,
@@ -1334,7 +1414,7 @@ class Recovery(maintenance.ClusterOperator):
 
     def commit_memory(self, target, pod):
         key = target_key(target)
-        if pod["spec"]["nodeName"] != PROM_NODE or object_uid(pod) in self.reservations:
+        if pod["spec"]["nodeName"] != self.host_node or object_uid(pod) in self.reservations:
             return
         template = self.bindings[key]["template"]
         reserve = memory_reserve(target, template)
@@ -1342,7 +1422,7 @@ class Recovery(maintenance.ClusterOperator):
         self.reserved_cpu += max(mocks._resource_requests({"spec": template})[0], 500)
         self.reservations.add(object_uid(pod))
         self.summary.setdefault("memory_commitments", {})[f"{target['namespace']}/{pod['metadata']['name']}"] = {
-            "pod_uid": object_uid(pod), "node_uid": REAL_UIDS[PROM_NODE],
+            "pod_uid": object_uid(pod), "node_uid": self.real_uids[self.host_node],
             "reserved_memory_bytes": reserve, "reservation_is_not_a_container_limit": True,
         }
         if "memory_state" in self.summary:
@@ -1358,8 +1438,8 @@ class Recovery(maintenance.ClusterOperator):
     def add_exclusions(self):
         if self.exclusions:
             return
-        for name, uid in REAL_UIDS.items():
-            if name == PROM_NODE:
+        for name, uid in self.real_uids.items():
+            if name == self.host_node:
                 continue
             node = self.kube("get", "node", name, "-o", "json")
             require(object_uid(node) == uid and workers.node_is_ready(node), "Exclusion Node identity/readiness changed")
@@ -1391,7 +1471,7 @@ class Recovery(maintenance.ClusterOperator):
             self.probe is not None and pod["metadata"].get("namespace") == "kube-system"
             and pod["metadata"]["name"] == self.probe["name"]
             and (pod["metadata"].get("labels") or {}).get(PROBE_KEY) == self.probe["token"]
-            and pod.get("spec", {}).get("nodeName") == PROM_NODE
+            and pod.get("spec", {}).get("nodeName") == self.host_node
             and (not self.probe.get("uid") or self.probe["uid"] == object_uid(pod)),
             "Probe UID/token/node ownership changed",
         )
@@ -1431,7 +1511,7 @@ class Recovery(maintenance.ClusterOperator):
         overrides = {
             "apiVersion": "v1",
             "spec": {
-                "nodeName": PROM_NODE, "hostNetwork": False, "restartPolicy": "Never",
+                "nodeName": self.host_node, "hostNetwork": False, "restartPolicy": "Never",
                 "automountServiceAccountToken": False, "enableServiceLinks": False,
                 "containers": [{
                     "name": name, "image": maintenance.DEFAULT_PROBE_IMAGE,
@@ -1459,7 +1539,7 @@ class Recovery(maintenance.ClusterOperator):
             self.prove_probe_owner(candidates[0])
             if pod_ready(candidates[0]):
                 self.summary.setdefault("ip_proofs", []).append({
-                    "pod_name": name, "pod_uid": self.probe["uid"], "node_uid": REAL_UIDS[PROM_NODE],
+                    "pod_name": name, "pod_uid": self.probe["uid"], "node_uid": self.real_uids[self.host_node],
                     "pod_ip": candidates[0]["status"]["podIP"], "ready": True,
                 })
                 self.save()
@@ -1596,7 +1676,7 @@ class Recovery(maintenance.ClusterOperator):
         while True:
             snapshot = self.snapshot()
             nodes, agents = self.guard(snapshot)
-            require(workers.node_is_ready(nodes[PROM_NODE]) and self.system_ready(snapshot),
+            require(workers.node_is_ready(nodes[self.host_node]) and self.system_ready(snapshot),
                     "Recovered host/system readiness regressed")
             require(self.dns_ready(snapshot), "CoreDNS regressed before strict postproof")
             require(not self.exclusions and self.probe is None and not self.summary["cleanup_errors"],
@@ -1609,7 +1689,7 @@ class Recovery(maintenance.ClusterOperator):
                 require(pod_ready(pod) and object_uid(pod) == receipt["ready_pod_uid"],
                         "A recovered framework/API Pod changed or regressed")
             self.models()
-            self.prove_memory(nodes[PROM_NODE], self.node_metric(), 0)
+            self.prove_memory(nodes[self.host_node], self.node_metric(), 0)
             _, connected = self.authority()
             proof = maintenance._read_cilium_proof(self, self.args, self.identities)
             self.summary["cilium_proof"] = proof
@@ -1632,7 +1712,7 @@ class Recovery(maintenance.ClusterOperator):
                         "Cilium peer proof includes a foreign agent owner")
             good = (
                 proof.get("healthy") is True and proof.get("cilium_agent_count") == 3
-                and len(proof.get("agents") or []) == 3 and set(covered) == set(REAL_UIDS)
+                and len(proof.get("agents") or []) == 3 and set(covered) == set(self.real_uids)
                 and len(live_agents) == 3
                 and {pod["metadata"]["name"] for pod in live_agents}
                 == {row["pod_name"] for row in proof.get("agents") or []}
@@ -1678,13 +1758,7 @@ class Recovery(maintenance.ClusterOperator):
             self.observe_accepted_action()
             return
         self.models(allow_failed_os=self.host_action == "reimage")
-        super().run([
-            "az", "aks", "get-credentials", "--resource-group", RESOURCE_GROUP, "--name", CLUSTER,
-            "--file", self.args.kubeconfig, "--context", CLUSTER, "--only-show-errors",
-        ], 45)
-        require(Path(self.args.kubeconfig).is_file() and Path(self.args.kubeconfig).stat().st_size > 0,
-                "Private selected-cluster kubeconfig was not produced")
-        Path(self.args.kubeconfig).chmod(0o600)
+        self.open_cluster()
         self.initial = self.snapshot()
         nodes, agents = self.guard(self.initial)
         self.prior_marker(nodes[PROM_NODE])
@@ -1734,32 +1808,7 @@ class Recovery(maintenance.ClusterOperator):
                 "Accepted reimage observation is strictly read-only")
         with open(self.args.observe_accepted_action, encoding="utf-8") as handle:
             prior = json.load(handle)
-        action = prior.get("restart") or {}
-        marker = action.get("marker") or {}
-        require(
-            prior.get("execute") is True and prior.get("mutation_started") is True
-            and prior.get("plan_sha256") == self.summary["plan_sha256"]
-            and action.get("action") == "reimage" and action.get("attempted") is True
-            and action.get("accepted") is True and action.get("ambiguous") is False
-            and marker.get("owner") == OWNER and marker.get("schema_version") == 1
-            and marker.get("action") == "single-instance-reimage"
-            and marker.get("node_uid") == REAL_UIDS[PROM_NODE]
-            and marker.get("provider_id") == PROVIDER
-            and marker.get("plan_sha256") == self.summary["plan_sha256"]
-            and isinstance(marker.get("token"), str) and maintenance.UUID_RE.fullmatch(marker["token"])
-            and action.get("previous_boot_id") == marker.get("previous_boot_id")
-            and bool(marker.get("previous_boot_id")),
-            "Accepted-action checkpoint does not prove this exact owned reimage",
-        )
-        requested = timestamp(action.get("requested_at"), "accepted reimage request")
-        require(timestamp(marker.get("recorded_at"), "owned reimage marker") <= requested
-                <= datetime.now(timezone.utc), "Accepted-action timestamps are invalid")
-        original_instances = (prior.get("arm_metadata") or {}).get("instances") or {}
-        require(
-            (original_instances.get(PROM_NODE) or {}).get("vm_id") == FAILED_PROM_VM_ID
-            and (original_instances.get(PROM_NODE) or {}).get("instance_id") == "0",
-            "Accepted-action checkpoint has a different VM identity",
-        )
+        action, marker = validate_accepted_reimage(prior, self.summary["plan_sha256"])
         self.summary["observation_only"] = True
         self.summary["observed_action"] = {
             "action": "reimage", "accepted_at": action["requested_at"],
@@ -1768,11 +1817,7 @@ class Recovery(maintenance.ClusterOperator):
         }
         self.summary["restart"]["requested_at"] = action["requested_at"]
         self.save()
-        super().run([
-            "az", "aks", "get-credentials", "--resource-group", RESOURCE_GROUP, "--name", CLUSTER,
-            "--file", self.args.kubeconfig, "--context", CLUSTER, "--only-show-errors",
-        ], 45)
-        Path(self.args.kubeconfig).chmod(0o600)
+        self.open_cluster()
         self.initial = self.snapshot()
         expected_marker = json.dumps(marker, sort_keys=True, separators=(",", ":"))
         while True:
@@ -1804,6 +1849,7 @@ class Recovery(maintenance.ClusterOperator):
 def execute_recovery(args, summary: dict, runner=workers.run_command, delete_pod=None):
     """Persist truthful failure receipts and always clean only this run's resources."""
 
+    validate_paths(args)
     summary.update({
         "status": "reading", "execute": bool(args.execute), "plan_valid": False, "repaired": False,
         "success": False,
@@ -1830,7 +1876,12 @@ def execute_recovery(args, summary: dict, runner=workers.run_command, delete_pod
         config_path = private / "cluster.config"
         config_path.touch(mode=0o600, exist_ok=False)
         args.kubeconfig = str(config_path)
-        operator = Recovery(args, plan, summary, runner, delete_pod or mocks.delete_pod_with_uid_precondition)
+        operator_type = Recovery
+        if getattr(args, "replace_failed_host", None):
+            # The subclass is loaded only after this base module is fully initialized.
+            from failed_prom_worker_replacement import ReplacementRecovery  # pylint: disable=import-outside-toplevel,cyclic-import
+            operator_type = ReplacementRecovery
+        operator = operator_type(args, plan, summary, runner, delete_pod or mocks.delete_pod_with_uid_precondition)
         operator.execute()
     finally:
         error = sys.exc_info()[1]
@@ -1885,6 +1936,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--reimage-failed-os", action="store_true")
     parser.add_argument("--observe-accepted-action")
+    parser.add_argument("--replace-failed-host")
     return parser.parse_args(argv)
 
 
@@ -1909,4 +1961,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    sys.modules["unreachable_prom_worker_recovery"] = sys.modules[__name__]
     raise SystemExit(main())

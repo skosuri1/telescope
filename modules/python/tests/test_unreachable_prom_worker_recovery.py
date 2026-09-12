@@ -1034,6 +1034,47 @@ def test_accepted_action_observer_forbids_execute(environment):
     assert not fake.commands and not fake.writes
 
 
+@pytest.mark.parametrize("other_mode", ["reimage_failed_os", "observe_accepted_action"])
+def test_failed_host_replacement_cannot_combine_with_a_different_action(environment, other_mode):
+    args, _, fake = environment
+    args.replace_failed_host = "accepted.json"
+    setattr(args, other_mode, True if other_mode == "reimage_failed_os" else "observed.json")
+    with pytest.raises(recovery.workers.ReconcileError, match="cannot be combined"):
+        run(environment)
+    assert not fake.commands and not fake.writes
+
+
+@pytest.mark.parametrize("mode", ["observe_accepted_action", "replace_failed_host"])
+@pytest.mark.parametrize("path_name", ["plan_file", "summary_file"])
+def test_accepted_checkpoint_cannot_be_overwritten_by_plan_or_summary(environment, mode, path_name):
+    args, _, fake = environment
+    path = Path(getattr(args, path_name))
+    if not path.exists():
+        path.write_text('{"accepted": "retain-the-existing-receipt"}', encoding="utf-8")
+    original = path.read_bytes()
+    setattr(args, mode, str(path))
+    with pytest.raises(recovery.workers.ReconcileError, match="must differ"):
+        run(environment)
+    assert path.read_bytes() == original
+    assert not fake.commands and not fake.writes
+
+
+@pytest.mark.parametrize("change", [
+    lambda checkpoint: checkpoint.update(arm_metadata=[]),
+    lambda checkpoint: checkpoint["arm_metadata"].update(instances=[]),
+    lambda checkpoint: checkpoint["arm_metadata"]["instances"].update({recovery.PROM_NODE: []}),
+    lambda checkpoint: checkpoint["restart"].update(marker=[]),
+    lambda checkpoint: checkpoint["restart"]["marker"].update(schema_version=True),
+])
+def test_shared_accepted_receipt_validator_rejects_malformed_shapes(environment, change):
+    checkpoint = accepted_observation(environment, healthy=False)
+    _, plan, fake = environment
+    change(checkpoint)
+    with pytest.raises(recovery.workers.ReconcileError):
+        recovery.validate_accepted_reimage(checkpoint, recovery.digest(plan))
+    assert not fake.writes and not fake.deleted
+
+
 @pytest.mark.parametrize("fault", [
     "node-uid", "node-provider", "default-unready", "kwok-uid", "kwok-unready",
     "mock-uid", "healthy-on-source", "mock-on-host", "pvc-host", "unknown-controller",

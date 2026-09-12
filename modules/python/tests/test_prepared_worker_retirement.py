@@ -699,11 +699,12 @@ def test_pipeline_wires_retirement_before_arm_recovery():
         "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'), "
         "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY'], 'true'), "
         "ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY'], 'true'), "
+        "eq(variables['CLUSTERMESH_UNREACHABLE_WORKER_REPLACE_FAILED_HOST_BUILD_ID'], '0'), "
         "ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'), "
         "ne(variables['CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY'], 'true'))"
     )
     retirement_jobs = stage["jobs"][0][
-        "${{ if or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly))) }}"
+        "${{ if and(eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)))) }}"
     ]
     assert retirement_jobs[0]["template"] == (
         "/jobs/clustermesh-prepared-worker-retirement.yml"
@@ -711,8 +712,8 @@ def test_pipeline_wires_retirement_before_arm_recovery():
     assert retirement_jobs[0]["parameters"]["observe_only"] == (
         "${{ parameters.scaleDebugPreparedRetirementObserveOnly }}"
     )
-    assert "${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)) }}" in stage["jobs"][1]
-    assert "${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)) }}" in stage["jobs"][2]
+    assert "${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)) }}" in stage["jobs"][1]
+    assert "${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)) }}" in stage["jobs"][2]
 
 
 @pytest.mark.parametrize("observe_only", ["true", "false", "invalid"])

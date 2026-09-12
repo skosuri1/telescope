@@ -33,6 +33,7 @@ ENVIRONMENT = {
     "RUN_ID": "78751-f36f3d5a",
     "CONFIRM_RESUME": "78751-f36f3d5a",
     "OBSERVE_BUILD_ID": "0",
+    "REPLACE_FAILED_HOST_BUILD_ID": "0",
     "REIMAGE_FAILED_OS": "False",
 }
 
@@ -60,6 +61,12 @@ def template(path):
     {"RECOVERY_PLAN_JSON": "x" * 32769},
     {"OBSERVE_BUILD_ID": "-1"},
     {"OBSERVE_BUILD_ID": "79880"},
+    {"REPLACE_FAILED_HOST_BUILD_ID": "-1"},
+    {"REPLACE_FAILED_HOST_BUILD_ID": "079880"},
+    {"REPLACE_FAILED_HOST_BUILD_ID": "79880", "REIMAGE_FAILED_OS": "True"},
+    {"REPLACE_FAILED_HOST_BUILD_ID": "79880", "OBSERVE_BUILD_ID": "79880", "REIMAGE_FAILED_OS": "True"},
+    {"REPLACE_FAILED_HOST_BUILD_ID": "79880", "RECOVERY_ONLY": "False"},
+    {"REPLACE_FAILED_HOST_BUILD_ID": "79880", "RUN_WORKLOAD": "True"},
 ])
 def test_recovery_job_requires_complete_exclusive_mode(changes):
     result = subprocess.run(
@@ -71,28 +78,53 @@ def test_recovery_job_requires_complete_exclusive_mode(changes):
     assert "unbound variable" not in result.stderr
 
 
+@pytest.mark.parametrize("changes", [
+    {"REPLACE_FAILED_HOST_BUILD_ID": "79880"},
+    {"REPLACE_FAILED_HOST_BUILD_ID": "79880", "RECOVERY_PLAN_JSON": ""},
+    {"OBSERVE_BUILD_ID": "79880", "REIMAGE_FAILED_OS": "True"},
+])
+def test_recovery_job_accepts_distinct_checkpoint_modes(changes):
+    result = subprocess.run(
+        ["bash", "-c", template(JOB)["jobs"][0]["steps"][0]["script"]],
+        env={**os.environ, **ENVIRONMENT, **changes},
+        text=True, capture_output=True, check=False, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_recovery_mode_excludes_other_mutation_paths():
     pipeline = template("pipelines/system/new-pipeline-test.yml")
     parameters = {row["name"]: row for row in pipeline["parameters"]}
     assert parameters["scaleDebugUnreachableWorkerRecoveryOnly"]["default"] is False
     assert parameters["scaleDebugUnreachableWorkerPlanJson"]["default"] == ""
+    assert parameters["scaleDebugUnreachableWorkerReplaceFailedHostBuildId"]["default"] == 0
     stage = next(
         row for row in pipeline["stages"]
         if row.get("stage") == "azure_eastus2euap_n100_debug_resume_37deca"
     )
     key = (
-        "${{ if and(parameters.scaleDebugUnreachableWorkerRecoveryOnly, "
-        "not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}"
+        "${{ if or(ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "
+        "and(parameters.scaleDebugUnreachableWorkerRecoveryOnly, "
+        "not(parameters.scaleDebugPreparedRetirementObserveOnly))) }}"
     )
     invocation = next(row[key][0] for row in stage["jobs"] if key in row)
     assert invocation["template"] == f"/{JOB}"
     assert invocation["parameters"]["plan_json"] == "${{ parameters.scaleDebugUnreachableWorkerPlanJson }}"
     assert invocation["parameters"]["run_workload"] == "${{ parameters.scaleDebugRunWorkload }}"
     assert invocation["parameters"]["reimage_failed_os"] == "${{ parameters.scaleDebugUnreachableWorkerReimageFailedOs }}"
+    assert invocation["parameters"]["replace_failed_host_build_id"] == (
+        "${{ parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId }}"
+    )
     for key in stage["jobs"][1:3]:
         assert "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)" in next(iter(key))
+    for key in stage["jobs"][:3]:
+        assert "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0)" in next(iter(key))
     normal = template("jobs/clustermesh-debug-resume.yml")["jobs"][0]
     assert "ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY'], 'true')" in normal["condition"]
+    assert "eq(variables['CLUSTERMESH_UNREACHABLE_WORKER_REPLACE_FAILED_HOST_BUILD_ID'], '0')" in normal["condition"]
+    assert stage["variables"]["CLUSTERMESH_UNREACHABLE_WORKER_REPLACE_FAILED_HOST_BUILD_ID"] == (
+        "${{ parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId }}"
+    )
     job = template(JOB)["jobs"][0]
     assert job["variables"]["SCENARIO_NAME"] == "clustermesh-scale"
     assert [row.get("template") for row in job["steps"] if "template" in row] == [
@@ -102,6 +134,11 @@ def test_recovery_mode_excludes_other_mutation_paths():
     assert job["steps"][1]["parameters"]["ssh_key_enabled"] is False
     assert template(STEP)["steps"][0]["retryCountOnTaskFailure"] == 0
     assert "always()" in template(STEP)["steps"][1]["condition"]
+    replacement_key = "${{ if gt(parameters.replace_failed_host_build_id, 0) }}"
+    download = next(row[replacement_key][0] for row in job["steps"] if replacement_key in row)
+    assert download["task"] == "DownloadPipelineArtifact@2"
+    assert download["inputs"]["pipelineId"] == "${{ parameters.replace_failed_host_build_id }}"
+    assert download["inputs"]["definition"] == "$(System.DefinitionId)"
 
 
 @pytest.mark.parametrize("failure,expected_calls,expected_code", [
@@ -114,6 +151,11 @@ def test_recovery_mode_excludes_other_mutation_paths():
     ("malformed", 0, 1),
     ("observe", 1, 0),
     ("missing-checkpoint", 0, 1),
+    ("replace", 2, 0),
+    ("missing-replacement-checkpoint", 0, 1),
+    ("mutate-checkpoint", 1, 1),
+    ("artifact-plan", 2, 0),
+    ("missing-artifact-plan", 0, 1),
 ])
 @pytest.mark.parametrize("reimage_failed_os", ["False", "True"])
 def test_recovery_step_plans_before_exact_execution(
@@ -154,6 +196,9 @@ def test_recovery_step_plans_before_exact_execution(
             if failure == "mutate-plan" and not execute:
                 plan = Path(args[args.index("--plan-file") + 1])
                 plan.write_text("{}", encoding="utf-8")
+            if failure == "mutate-checkpoint" and not execute:
+                checkpoint = Path(args[args.index("--replace-failed-host") + 1])
+                checkpoint.write_text("{}", encoding="utf-8")
             if failure == "plan" and not execute:
                 sys.exit(7)
             if failure == "execute" and execute:
@@ -180,6 +225,22 @@ def test_recovery_step_plans_before_exact_execution(
             checkpoint = tmp_path / "workspace" / "accepted-host-action-79880" / "recovery.json"
             checkpoint.parent.mkdir(parents=True)
             checkpoint.write_text('{"accepted": true}', encoding="utf-8")
+    replacing = failure in (
+        "replace", "missing-replacement-checkpoint", "mutate-checkpoint",
+        "artifact-plan", "missing-artifact-plan",
+    )
+    if replacing:
+        environment["REPLACE_FAILED_HOST_BUILD_ID"] = "79880"
+        if reimage_failed_os == "True":
+            expected_calls, expected_code = 0, 1
+        if failure != "missing-replacement-checkpoint":
+            checkpoint = tmp_path / "workspace" / "accepted-failed-host-79880" / "recovery.json"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text('{"accepted": true}', encoding="utf-8")
+            if failure == "artifact-plan":
+                (checkpoint.parent / "input-plan.json").write_text(json.dumps(PLAN), encoding="utf-8")
+        if failure in ("artifact-plan", "missing-artifact-plan"):
+            environment["RECOVERY_PLAN_JSON"] = ""
     result = subprocess.run(
         ["bash", "-c", script], env=environment, capture_output=True,
         text=True, check=False, timeout=10,
@@ -195,7 +256,7 @@ def test_recovery_step_plans_before_exact_execution(
         assert calls[0][0].endswith("/unreachable_prom_worker_recovery.py")
         assert calls[0][calls[0].index("--resource-group") + 1] == ENVIRONMENT["RUN_ID"]
         assert calls[0][calls[0].index("--expected-subscription") + 1] == "test-subscription"
-        assert calls[0][calls[0].index("--timeout-seconds") + 1] == "1800"
+        assert calls[0][calls[0].index("--timeout-seconds") + 1] == ("3600" if replacing else "1800")
         plan_path = Path(calls[0][calls[0].index("--plan-file") + 1])
         assert plan_path.stat().st_mode & 0o777 == 0o600
         if failure != "mutate-plan":
@@ -203,6 +264,10 @@ def test_recovery_step_plans_before_exact_execution(
         if failure == "observe":
             assert "--observe-accepted-action" in calls[0]
             assert len(calls) == 1 and "--execute" not in calls[0]
+        if replacing:
+            assert "--replace-failed-host" in calls[0]
+            assert "--observe-accepted-action" not in calls[0]
+            assert "--reimage-failed-os" not in calls[0]
     if len(calls) == 2:
         assert calls[1][-1] == "--execute"
         assert calls[0][:calls[0].index("--summary-file")] == calls[1][:calls[1].index("--summary-file")]
