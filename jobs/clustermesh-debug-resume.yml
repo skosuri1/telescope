@@ -92,6 +92,7 @@ jobs:
     and(succeeded(),
     ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'),
     ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY'], 'true'),
+    ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY'], 'true'),
     ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'),
     ne(variables['CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY'], 'true'))
   variables:

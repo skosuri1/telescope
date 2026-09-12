@@ -126,7 +126,8 @@ def test_pipeline_binds_complete_plan_and_disables_normal_resume():
     )
     condition = (
         "${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, "
-        "not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}"
+        "not(parameters.scaleDebugPreparedRetirementObserveOnly), "
+        "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)) }}"
     )
     invocation = next(item[condition][0] for item in stage["jobs"] if condition in item)
     assert invocation["template"] == f"/{JOB}"

@@ -73,6 +73,12 @@ parameters:
   - name: scaleDebugPreparedRetirementObserveOnly
     type: boolean
     default: false
+  - name: scaleDebugUnreachableWorkerRecoveryOnly
+    type: boolean
+    default: false
+  - name: scaleDebugUnreachableWorkerPlanJson
+    type: string
+    default: ""
   - name: scaleDebugArmRepairOnly
     type: boolean
     default: false
@@ -2977,6 +2983,7 @@ stages:
     variables:
       CLUSTERMESH_PREPARED_RETIREMENT_ONLY: ${{ parameters.scaleDebugPreparedRetirementOnly }}
       CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY: ${{ parameters.scaleDebugPreparedRetirementObserveOnly }}
+      CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY: ${{ parameters.scaleDebugUnreachableWorkerRecoveryOnly }}
       CLUSTERMESH_ARM_REPAIR_ONLY: ${{ parameters.scaleDebugArmRepairOnly }}
       CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY: ${{ parameters.scaleDebugCniWorkerMaintenanceOnly }}
       AZURE_SUBSCRIPTION_ID: ${{ parameters.lifecycleSubscriptionId }}
@@ -3083,7 +3090,7 @@ stages:
       CL2_PROBE_WINDOW_DURATION: "60m"
       CL2_PROBE_PREWAIT_S: "600"
     jobs:
-      - ${{ if or(parameters.scaleDebugPreparedRetirementOnly, parameters.scaleDebugPreparedRetirementObserveOnly) }}:
+      - ${{ if or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly))) }}:
           - template: /jobs/clustermesh-prepared-worker-retirement.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3096,7 +3103,7 @@ stages:
               retirement_uid: ${{ parameters.scaleDebugPreparedRetirementUid }}
               observe_only: ${{ parameters.scaleDebugPreparedRetirementObserveOnly }}
               run_workload: ${{ parameters.scaleDebugRunWorkload }}
-      - ${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}:
+      - ${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)) }}:
           - template: /jobs/clustermesh-arm-repair.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3105,7 +3112,7 @@ stages:
               expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
               tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
               overlay_mode: ${{ parameters.debugMode }}
-      - ${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}:
+      - ${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)) }}:
           - template: /jobs/clustermesh-cni-worker-maintenance.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3125,6 +3132,17 @@ stages:
               recover_empty_fresh_node: ${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshNode }}
               recover_empty_fresh_uid: ${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshUid }}
               replace_empty_fresh: ${{ parameters.scaleDebugCniWorkerReplaceEmptyFresh }}
+      - ${{ if and(parameters.scaleDebugUnreachableWorkerRecoveryOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}:
+          - template: /jobs/clustermesh-unreachable-worker-recovery.yml
+            parameters:
+              target_run_id: ${{ parameters.debugTargetRunId }}
+              expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
+              expected_region: ${{ parameters.scaleDebugRegion }}
+              expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
+              tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
+              overlay_mode: ${{ parameters.debugMode }}
+              run_workload: ${{ parameters.scaleDebugRunWorkload }}
+              plan_json: ${{ parameters.scaleDebugUnreachableWorkerPlanJson }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}

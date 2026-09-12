@@ -1,0 +1,83 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: tfvars_path
+    type: string
+  - name: overlay_mode
+    type: string
+  - name: run_workload
+    type: boolean
+  - name: plan_json
+    type: string
+
+jobs:
+  - job: unreachable_worker_recovery
+    displayName: "Recover one explicitly selected unreachable n100 worker"
+    variables:
+      SCENARIO_NAME: clustermesh-scale
+      CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "90"
+      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "30"
+      SUITE_TOTAL_BUDGET_SECONDS: "0"
+      AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
+    timeoutInMinutes: 90
+    cancelTimeoutInMinutes: 30
+    steps:
+      - script: |
+          set -euo pipefail
+          if [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
+            [ "$OVERLAY_MODE" != "resume-existing" ] ||
+            [ "${RUN_WORKLOAD,,}" != "false" ] ||
+            [ "${RECOVERY_ONLY,,}" != "true" ] ||
+            [ "${ARM_REPAIR_ONLY,,}" = "true" ] ||
+            [ "${RETIREMENT_ONLY,,}" = "true" ] ||
+            [ "${OBSERVE_ONLY,,}" = "true" ] ||
+            [ "${CNI_MAINTENANCE_ONLY,,}" = "true" ]; then
+            echo "Unreachable-worker recovery requires existing n100 and no workload or other maintenance mode." >&2
+            exit 1
+          fi
+          if [ -z "$RECOVERY_PLAN_JSON" ] ||
+            [ "${#RECOVERY_PLAN_JSON}" -gt 32768 ]; then
+            echo "An explicit bounded unreachable-worker identity plan is required." >&2
+            exit 1
+          fi
+          jq -e \
+            'type == "object" and .schema_version == 1
+             and (.role | type == "string")
+             and (.node_name | type == "string")
+             and (.node_uid | type == "string")' \
+            <<< "$RECOVERY_PLAN_JSON" >/dev/null
+        displayName: "Require one exclusive unreachable-worker recovery plan"
+        env:
+          EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+          OVERLAY_MODE: ${{ parameters.overlay_mode }}
+          RUN_WORKLOAD: "${{ parameters.run_workload }}"
+          RECOVERY_ONLY: $(CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY)
+          ARM_REPAIR_ONLY: $(CLUSTERMESH_ARM_REPAIR_ONLY)
+          RETIREMENT_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_ONLY)
+          OBSERVE_ONLY: $(CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY)
+          CNI_MAINTENANCE_ONLY: $(CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY)
+          RECOVERY_PLAN_JSON: ${{ parameters.plan_json }}
+
+      - template: /steps/setup-tests.yml
+        parameters:
+          cloud: azure
+          region: ${{ parameters.expected_region }}
+          run_id: ${{ parameters.target_run_id }}
+          credential_type: service_connection
+          ssh_key_enabled: false
+
+      - template: /steps/topology/clustermesh-scale/reuse/recover-unreachable-worker.yml
+        parameters:
+          target_run_id: ${{ parameters.target_run_id }}
+          expected_subscription_id: ${{ parameters.expected_subscription_id }}
+          expected_region: ${{ parameters.expected_region }}
+          expected_cluster_count: ${{ parameters.expected_cluster_count }}
+          tfvars_path: ${{ parameters.tfvars_path }}
+          plan_json: ${{ parameters.plan_json }}

@@ -698,11 +698,12 @@ def test_pipeline_wires_retirement_before_arm_recovery():
         "and(succeeded(), "
         "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'), "
         "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY'], 'true'), "
+        "ne(variables['CLUSTERMESH_UNREACHABLE_WORKER_RECOVERY_ONLY'], 'true'), "
         "ne(variables['CLUSTERMESH_ARM_REPAIR_ONLY'], 'true'), "
         "ne(variables['CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY'], 'true'))"
     )
     retirement_jobs = stage["jobs"][0][
-        "${{ if or(parameters.scaleDebugPreparedRetirementOnly, parameters.scaleDebugPreparedRetirementObserveOnly) }}"
+        "${{ if or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly))) }}"
     ]
     assert retirement_jobs[0]["template"] == (
         "/jobs/clustermesh-prepared-worker-retirement.yml"
@@ -710,8 +711,8 @@ def test_pipeline_wires_retirement_before_arm_recovery():
     assert retirement_jobs[0]["parameters"]["observe_only"] == (
         "${{ parameters.scaleDebugPreparedRetirementObserveOnly }}"
     )
-    assert "${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}" in stage["jobs"][1]
-    assert "${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}" in stage["jobs"][2]
+    assert "${{ if and(parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)) }}" in stage["jobs"][1]
+    assert "${{ if and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)) }}" in stage["jobs"][2]
 
 
 @pytest.mark.parametrize("observe_only", ["true", "false", "invalid"])
@@ -760,7 +761,7 @@ def test_pipeline_observation_never_passes_execute(tmp_path, observe_only):
         assert "Read-only observation" in result.stdout
 
 
-@pytest.mark.parametrize("fault", ["none", "workload", "not-exclusive", "arm", "cni"])
+@pytest.mark.parametrize("fault", ["none", "workload", "not-exclusive", "arm", "cni", "unreachable"])
 def test_observation_job_rejects_conflicting_modes_before_observation(fault):
     repository = MODULE_DIR.parents[3]
     job = yaml.safe_load(
@@ -771,6 +772,7 @@ def test_observation_job_rejects_conflicting_modes_before_observation(fault):
         **os.environ, "EXPECTED_CLUSTER_COUNT": "100", "ARM_REPAIR_ONLY": "false",
         "CNI_MAINTENANCE_ONLY": "false", "RETIREMENT_ONLY": "true",
         "OBSERVE_ONLY": "true", "RUN_WORKLOAD": "false",
+        "UNREACHABLE_RECOVERY_ONLY": "false",
         "RETIREMENT_ROLE": "mesh-38", "RETIREMENT_NODE": SOURCE,
         "RETIREMENT_UID": SOURCE_UID,
     }
@@ -779,6 +781,7 @@ def test_observation_job_rejects_conflicting_modes_before_observation(fault):
         "not-exclusive": ("RETIREMENT_ONLY", "false"),
         "arm": ("ARM_REPAIR_ONLY", "true"),
         "cni": ("CNI_MAINTENANCE_ONLY", "true"),
+        "unreachable": ("UNREACHABLE_RECOVERY_ONLY", "True"),
     }
     if fault in changes:
         key, value = changes[fault]

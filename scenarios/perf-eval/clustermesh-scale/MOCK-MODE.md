@@ -144,6 +144,29 @@ even healthy Cilium results do not waive the Fleet Connected gate or allow write
 Transient read timeouts have bounded retries; deletion requests and authorization
 failures are never retried automatically.
 
+### Recovering an unreachable monitoring worker
+
+`scaleDebugUnreachableWorkerRecoveryOnly=true` selects an isolated recovery job
+for one explicitly pinned, unreachable `prompool` worker. Set
+`scaleDebugRunWorkload=false`, leave other maintenance-only modes disabled, and
+provide `scaleDebugUnreachableWorkerPlanJson`. The bounded JSON plan carries the
+worker/provider identity, the complete mock/KWOK UID inventory, the failed
+ClusterMesh API-server Pod/controller identities, and any explicitly selected
+never-started framework replacements.
+
+The job calls `unreachable_prom_worker_recovery.py` first without `--execute`.
+It requires a read-only plan receipt and an unchanged input-plan hash before
+calling the executable path once; task-level retries are disabled. Read-only
+observation takes precedence over this recovery mode, and ordinary workload,
+ARM-repair, and CNI-maintenance jobs cannot run alongside it in the same stage.
+The job contains no CL2, lease-renewal, or generic resource-cleanup templates.
+
+This phase is limited to the qualified unhealthy monitoring host and selected
+failed framework Pods. It is not a substitute for the separate bounded CNI
+worker-maintenance gates or the full workload handoff. Evidence is published as
+`n100-unreachable-worker-recovery-<build>-<attempt>`, including the original plan,
+read-only assessment, and execution summary; credentials remain private.
+
 ### Planned single-worker CNI maintenance
 
 `cni_worker_maintenance.py` provides the local operator path for one explicitly

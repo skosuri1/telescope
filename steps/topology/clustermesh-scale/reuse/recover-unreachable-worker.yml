@@ -1,0 +1,72 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: tfvars_path
+    type: string
+  - name: plan_json
+    type: string
+
+steps:
+  - script: |
+      set -euo pipefail
+      umask 077
+      if [ "$EXPECTED_CLUSTER_COUNT" != "100" ] ||
+        [ "$CONFIRM_RESUME" != "$RUN_ID" ] ||
+        ! [[ "$RUN_ID" =~ ^[0-9]+-[0-9a-f]{8}$ ]] ||
+        [ -z "$RECOVERY_PLAN_JSON" ] ||
+        [ "${#RECOVERY_PLAN_JSON}" -gt 32768 ]; then
+        echo "Unreachable-worker recovery requires confirmed preserved n100 scope and an explicit bounded plan." >&2
+        exit 1
+      fi
+      summary_dir="$(Build.ArtifactStagingDirectory)/n100-unreachable-worker-recovery"
+      mkdir -p "$summary_dir"
+      echo "##vso[task.setvariable variable=UNREACHABLE_WORKER_DIAGNOSTICS_READY]true"
+      printf '%s\n' "$RECOVERY_PLAN_JSON" > "$summary_dir/input-plan.json"
+      jq -e 'type == "object" and .schema_version == 1' \
+        "$summary_dir/input-plan.json" >/dev/null
+      plan_sha=$(sha256sum "$summary_dir/input-plan.json" | awk '{print $1}')
+      expected_tfvars_sha=$(sha256sum \
+        "$(Pipeline.Workspace)/s/${{ parameters.tfvars_path }}" | awk '{print $1}')
+      helper="$(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale/unreachable_prom_worker_recovery.py"
+      args=(
+        --resource-group "$RUN_ID"
+        --confirm-resource-group "$CONFIRM_RESUME"
+        --expected-subscription "${{ parameters.expected_subscription_id }}"
+        --expected-region "${{ parameters.expected_region }}"
+        --expected-tfvars-sha "$expected_tfvars_sha"
+        --plan-file "$summary_dir/input-plan.json"
+        --timeout-seconds 1800
+      )
+      python3 "$helper" "${args[@]}" \
+        --summary-file "$summary_dir/plan-only.json"
+      jq -e '.execute == false and .mutation_started == false
+        and (.plan_valid == true or .success == true)' \
+        "$summary_dir/plan-only.json" >/dev/null
+      if [ "$(sha256sum "$summary_dir/input-plan.json" | awk '{print $1}')" != "$plan_sha" ]; then
+        echo "The explicit recovery plan changed during read-only planning." >&2
+        exit 1
+      fi
+      python3 "$helper" "${args[@]}" \
+        --summary-file "$summary_dir/recovery.json" --execute
+    displayName: "Plan then recover the exact unreachable worker and failed framework pods"
+    retryCountOnTaskFailure: 0
+    env:
+      RUN_ID: ${{ parameters.target_run_id }}
+      CONFIRM_RESUME: $(CLUSTERMESH_DEBUG_CONFIRM_RESUME)
+      EXPECTED_CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      RECOVERY_PLAN_JSON: ${{ parameters.plan_json }}
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish unreachable-worker recovery evidence"
+    condition: >-
+      and(always(),
+      eq(variables['UNREACHABLE_WORKER_DIAGNOSTICS_READY'], 'true'))
+    inputs:
+      targetPath: "$(Build.ArtifactStagingDirectory)/n100-unreachable-worker-recovery"
+      artifact: "n100-unreachable-worker-recovery-$(Build.BuildId)-$(System.JobAttempt)"
