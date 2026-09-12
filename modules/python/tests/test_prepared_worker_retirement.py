@@ -696,6 +696,7 @@ def test_pipeline_wires_retirement_before_arm_recovery():
     )
     assert job["jobs"][0]["condition"] == (
         "and(succeeded(), "
+        "eq(${{ parameters.capacity_first_build_id }}, 0), "
         "eq(${{ parameters.retained_worker_restart_build_id }}, 0), "
         "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'), "
         "ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_OBSERVE_ONLY'], 'true'), "
@@ -711,7 +712,7 @@ def test_pipeline_wires_retirement_before_arm_recovery():
         "ne(variables['CLUSTERMESH_CNI_WORKER_MAINTENANCE_ONLY'], 'true'))"
     )
     retirement_jobs = stage["jobs"][0][
-        "${{ if and(eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)))) }}"
+        "${{ if and(eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)))) }}"
     ]
     assert retirement_jobs[0]["template"] == (
         "/jobs/clustermesh-prepared-worker-retirement.yml"
@@ -719,8 +720,8 @@ def test_pipeline_wires_retirement_before_arm_recovery():
     assert retirement_jobs[0]["parameters"]["observe_only"] == (
         "${{ parameters.scaleDebugPreparedRetirementObserveOnly }}"
     )
-    assert "${{ if and(eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}" in stage["jobs"][1]
-    assert "${{ if and(eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}" in stage["jobs"][2]
+    assert "${{ if and(eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}" in stage["jobs"][1]
+    assert "${{ if and(eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}" in stage["jobs"][2]
 
 
 @pytest.mark.parametrize("observe_only", ["true", "false", "invalid"])

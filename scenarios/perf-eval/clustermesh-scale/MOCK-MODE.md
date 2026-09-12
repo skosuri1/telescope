@@ -267,6 +267,14 @@ status is distinct from approved quota or available worker capacity.
 
 ### Explicit supported-family recovery baseline
 
+`scaleDebugCapacityFirstRecoveryBuildId` selects the separate capacity-only phase
+after the retained worker's restart has terminally failed. Its source observation
+and accepted-restart receipt are immutable inputs. This phase creates only the
+two supported-family `cniv5` System workers; it neither retires an old worker nor
+moves mock or framework Pods. Registration evidence is not full IP-growth,
+memory, bootstrap, fencing, or workload qualification. Those remain required
+before any later movement or failure-scenario execution.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,

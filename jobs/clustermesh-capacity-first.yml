@@ -1,0 +1,152 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: confirm_resume
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: tfvars_path
+    type: string
+  - name: overlay_mode
+    type: string
+  - name: run_workload
+    type: boolean
+  - name: source_state_build_id
+    type: number
+  - name: accepted_restart_build_id
+    type: number
+  - name: exclusive_modes
+    type: boolean
+
+jobs:
+  - job: capacity_first_recovery
+    displayName: "Create supported mesh96 replacement capacity without retiring any worker"
+    variables:
+      SCENARIO_NAME: clustermesh-scale
+      CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "75"
+      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "30"
+      SUITE_TOTAL_BUDGET_SECONDS: "0"
+      AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
+    timeoutInMinutes: 75
+    cancelTimeoutInMinutes: 30
+    steps:
+      - script: |
+          set -euo pipefail
+          jq -e '
+            .target_run_id == "78751-f36f3d5a" and .confirm_resume == .target_run_id
+            and .expected_subscription_id == "37deca37-c375-4a14-b90a-043849bd2bf1"
+            and .expected_region == "eastus2euap" and .expected_cluster_count == 100
+            and .tfvars_path == "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars"
+            and .overlay_mode == "resume-existing" and .run_workload == false
+            and (.source_state_build_id | type == "number" and . > 0 and floor == .)
+            and .accepted_restart_build_id == 79950
+            and .exclusive_modes == true' <<< "$CAPACITY_SCOPE_JSON" >/dev/null
+        displayName: "Require exclusive capacity-only recovery and terminal restart evidence"
+        env:
+          CAPACITY_SCOPE_JSON: ${{ convertToJson(parameters) }}
+
+      - template: /steps/setup-tests.yml
+        parameters:
+          cloud: azure
+          region: ${{ parameters.expected_region }}
+          run_id: ${{ parameters.target_run_id }}
+          credential_type: service_connection
+          ssh_key_enabled: false
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download current worker state and provider terminal-failure proof"
+        inputs:
+          buildType: specific
+          project: $(System.TeamProjectId)
+          definition: $(System.DefinitionId)
+          specificBuildWithTriggering: false
+          buildVersionToDownload: specific
+          pipelineId: ${{ parameters.source_state_build_id }}
+          artifactName: n100-unreachable-worker-recovery-${{ parameters.source_state_build_id }}-1
+          targetPath: $(Pipeline.Workspace)/capacity-first-source
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download the sole accepted restart receipt"
+        inputs:
+          buildType: specific
+          project: $(System.TeamProjectId)
+          definition: $(System.DefinitionId)
+          specificBuildWithTriggering: false
+          buildVersionToDownload: specific
+          pipelineId: ${{ parameters.accepted_restart_build_id }}
+          artifactName: n100-retained-worker-restart-${{ parameters.accepted_restart_build_id }}-1
+          targetPath: $(Pipeline.Workspace)/capacity-first-restart
+
+      - script: |
+          set -euo pipefail
+          umask 077
+          directory="$ARTIFACT_DIRECTORY/n100-capacity-first"
+          mkdir -p "$directory"
+          echo "##vso[task.setvariable variable=CAPACITY_FIRST_DIAGNOSTICS_READY]true"
+          cp -R "$SOURCE_DIRECTORY" "$directory/source-state"
+          source="$directory/source-state"
+          if find "$source" -type l -print -quit | grep -q .; then
+            echo "Capacity source evidence must contain regular files, not symlinks." >&2
+            exit 1
+          fi
+          cp "$RESTART_DIRECTORY/recovery.json" "$directory/accepted-restart.json"
+          restart_sha=$(sha256sum "$directory/accepted-restart.json" | awk '{print $1}')
+          snapshot_hashes() {
+            (cd "$source" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
+          }
+          snapshot_hashes > "$directory/source-files.sha256"
+          tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
+          private=$(mktemp -d "$AGENT_TEMP_DIRECTORY/capacity-first.XXXXXX")
+          cleanup() {
+            rm -f -- "$private/cluster.config"
+            rmdir -- "$private"
+          }
+          trap cleanup EXIT
+          timeout 90 az aks get-credentials --subscription "$SUBSCRIPTION" --resource-group "$RUN_ID" \
+            --name clustermesh-96 --file "$private/cluster.config" --context clustermesh-96 --only-show-errors
+          chmod 600 "$private/cluster.config"
+          helper="$REPOSITORY_DIRECTORY/modules/python/clusterloader2/clustermesh-scale/capacity_first_worker_recovery.py"
+          args=(
+            --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
+            --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
+            --expected-tfvars-sha "$tfvars_sha" --source-state-directory "$source"
+            --restart-checkpoint "$directory/accepted-restart.json"
+            --kubeconfig "$private/cluster.config" --context clustermesh-96 --timeout-seconds 2400
+          )
+          python3 -u "$helper" "${args[@]}" --summary-file "$directory/plan.json"
+          jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+            "$directory/plan.json" >/dev/null
+          snapshot_hashes > "$directory/source-files-after-plan.sha256"
+          if ! cmp -s "$directory/source-files.sha256" "$directory/source-files-after-plan.sha256" ||
+            [ "$(sha256sum "$directory/accepted-restart.json" | awk '{print $1}')" != "$restart_sha" ] ||
+            [ "$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')" != "$tfvars_sha" ]; then
+            echo "Capacity source evidence changed during read-only planning; no pool add will be submitted." >&2
+            exit 1
+          fi
+          python3 -u "$helper" "${args[@]}" --summary-file "$directory/recovery.json" --execute
+        displayName: "Plan then create only the two supported replacement workers"
+        retryCountOnTaskFailure: 0
+        env:
+          RUN_ID: ${{ parameters.target_run_id }}
+          CONFIRM_RESUME: ${{ parameters.confirm_resume }}
+          SUBSCRIPTION: ${{ parameters.expected_subscription_id }}
+          REGION: ${{ parameters.expected_region }}
+          TFVARS_PATH: ${{ parameters.tfvars_path }}
+          SOURCE_DIRECTORY: $(Pipeline.Workspace)/capacity-first-source
+          RESTART_DIRECTORY: $(Pipeline.Workspace)/capacity-first-restart
+          ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
+          REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
+          AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish capacity-only receipts and registration evidence"
+        condition: >-
+          and(always(), eq(variables['CAPACITY_FIRST_DIAGNOSTICS_READY'], 'true'))
+        inputs:
+          targetPath: "$(Build.ArtifactStagingDirectory)/n100-capacity-first"
+          artifact: "n100-capacity-first-$(Build.BuildId)-$(System.JobAttempt)"
