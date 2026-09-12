@@ -837,8 +837,10 @@ def diagnosed_os_failure(environment):
     return fake
 
 
-def test_exact_os_failure_plan_is_read_only_and_names_reimage(environment):
+@pytest.mark.parametrize("extension_statuses", [None, []])
+def test_exact_os_failure_plan_is_read_only_and_names_reimage(environment, extension_statuses):
     fake = diagnosed_os_failure(environment)
+    fake.views[(recovery.PROM_VMSS, "0")]["extensions"][0]["statuses"] = extension_statuses
     summary = run(environment, execute=False)
     assert summary["plan_valid"] and not summary["mutation_started"]
     assert summary["planned_actions"]["host_action"] == "reimage"
@@ -846,8 +848,10 @@ def test_exact_os_failure_plan_is_read_only_and_names_reimage(environment):
     assert not fake.writes and not fake.deleted
 
 
-def test_exact_os_failure_reimages_one_vm_then_requires_full_postproof(environment):
+@pytest.mark.parametrize("extension_statuses", [None, []])
+def test_exact_os_failure_reimages_one_vm_then_requires_full_postproof(environment, extension_statuses):
     fake = diagnosed_os_failure(environment)
+    fake.views[(recovery.PROM_VMSS, "0")]["extensions"][0]["statuses"] = extension_statuses
     summary = run(environment, execute=True)
     operations = [command for command in fake.writes if command[0] == "az"]
     assert len(operations) == 1 and operations[0][1:3] == ["vmss", "reimage"]
@@ -920,6 +924,25 @@ def test_failed_reimage_is_not_repeated_or_accepted_as_healthy(environment):
     assert len([row for row in fake.writes if row[1:3] == ["vmss", "reimage"]]) == 1
     assert not receipt()["success"] and not receipt()["repaired"]
     assert recovery.MARKER_KEY in fake.nodes[recovery.PROM_NODE]["metadata"]["annotations"]
+    assert not fake.deleted
+
+
+def test_null_extension_state_is_never_accepted_by_normal_restart(environment):
+    _, _, fake = environment
+    fake.views[(recovery.PROM_VMSS, "0")]["extensions"][0]["statuses"] = None
+    with pytest.raises(recovery.workers.ReconcileError, match="extension operations"):
+        run(environment, execute=True)
+    assert not fake.writes and not fake.deleted
+
+
+def test_reimage_postproof_requires_actual_succeeded_extension_status(environment, monkeypatch):
+    fake = diagnosed_os_failure(environment)
+    abort_wait(monkeypatch)
+    fake.restart_callback = lambda: fake.views[(recovery.PROM_VMSS, "0")]["extensions"][0].update(statuses=None)
+    with pytest.raises(recovery.workers.ReconcileError, match="convergence"):
+        run(environment, execute=True)
+    assert len([row for row in fake.writes if row[1:3] == ["vmss", "reimage"]]) == 1
+    assert not receipt()["success"] and not receipt()["repaired"]
     assert not fake.deleted
 
 

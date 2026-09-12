@@ -707,17 +707,23 @@ class Recovery(maintenance.ClusterOperator):
                     extension_states.update(("ProvisioningState/creating", "ProvisioningState/updating",
                                              "ProvisioningState/transitioning"))
                 require(all(
-                    isinstance(row, dict) and isinstance(row.get("statuses"), list)
-                    and (row["statuses"] or pending_extensions)
-                    and all(status.get("code") in extension_states for status in row["statuses"])
+                    isinstance(row, dict) and (
+                        (row.get("statuses") is None and pending_extensions)
+                        or (
+                            isinstance(row.get("statuses"), list)
+                            and (row["statuses"] or pending_extensions)
+                            and all(status.get("code") in extension_states for status in row["statuses"])
+                        )
+                    )
                     for row in extensions
                 ), f"{name}: VM extension operations are not safely Succeeded")
                 is_stable = (
                     vmss.get("provisioningState") == "Succeeded"
                     and instance["provisioningState"] == "Succeeded"
                     and {"PowerState/running", "ProvisioningState/succeeded"} <= set(codes)
-                    and all(row["statuses"] and all(status.get("code") == "ProvisioningState/succeeded"
-                                                   for status in row["statuses"]) for row in extensions)
+                    and all(isinstance(row.get("statuses"), list) and row["statuses"]
+                            and all(status.get("code") == "ProvisioningState/succeeded"
+                                    for status in row["statuses"]) for row in extensions)
                 )
                 stable = stable and is_stable
         pin = {"pools": evidence["pools"],
@@ -786,7 +792,7 @@ class Recovery(maintenance.ClusterOperator):
         require(isinstance(extensions, list) and all(isinstance(row, dict) for row in extensions),
                 "Failed prompool extension statuses are unreadable")
         diagnostic["extensions"] = [
-            {"name": row.get("name"), "statuses": [
+            {"name": row.get("name"), "reported_status_type": type(row.get("statuses")).__name__, "statuses": [
                 {key: status.get(key) for key in fields}
                 for status in row.get("statuses") or [] if isinstance(status, dict)
             ]}
