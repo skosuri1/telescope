@@ -1,0 +1,284 @@
+parameters:
+  - name: phase
+    type: string
+    values:
+      - plan
+      - execute
+  - name: scope
+    type: object
+
+steps:
+  - script: |
+      set -euo pipefail
+      umask 077
+      directory="$ARTIFACT_DIRECTORY/n100-secondary-qualification"
+
+      snapshot_hashes() {
+        test -d "$directory/capacity-input"
+        test ! -L "$directory/capacity-input"
+        if find "$directory/capacity-input" -type l -print -quit | grep -q .; then
+          echo "Frozen secondary-capacity input contains a symlink." >&2
+          return 1
+        fi
+        (
+          cd "$directory/capacity-input"
+          find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --
+        ) | sed 's|  ./|  capacity-input/|'
+      }
+
+      require_whole_capacity_artifact() {
+        test -f "$directory/capacity-input/recovery.json"
+        test -f "$directory/capacity-input/plan.json"
+        test -d "$directory/capacity-input/source-input"
+        test -d "$directory/capacity-input/accepted-input"
+        test -f "$directory/capacity-input/accepted-input/recovery.json"
+        test -f "$directory/capacity-input/accepted-input/plan.json"
+        test -d "$directory/capacity-input/accepted-input/source-input"
+        for receipt in \
+          "$directory/capacity-input/recovery.json" \
+          "$directory/capacity-input/plan.json" \
+          "$directory/capacity-input/accepted-input/recovery.json" \
+          "$directory/capacity-input/accepted-input/plan.json"; do
+          test ! -L "$receipt"
+          bytes=$(wc -c < "$receipt")
+          if [ "$bytes" -le 0 ] || [ "$bytes" -gt $((128 * 1024 * 1024)) ]; then
+            echo "Secondary-capacity receipt is empty or exceeds 128MiB." >&2
+            return 1
+          fi
+        done
+      }
+
+      require_evidence_directory() {
+        stem="$1"
+        include_final="$2"
+        summary="$directory/$stem.json"
+        evidence="$directory/$stem-evidence"
+        test -f "$summary"
+        test ! -L "$summary"
+        test -d "$evidence"
+        test ! -L "$evidence"
+        if find "$evidence" -type l -print -quit | grep -q .; then
+          echo "$stem evidence contains a symlink." >&2
+          return 1
+        fi
+        for role in mesh-51 mesh-66 mesh-79 mesh-89; do
+          kinds=(observation preflight-objects)
+          if [ "$include_final" = "true" ]; then
+            kinds+=(final-objects)
+          fi
+          for kind in "${kinds[@]}"; do
+            file="$evidence/$role-$kind.json"
+            test -f "$file"
+            test ! -L "$file"
+            bytes=$(wc -c < "$file")
+            if [ "$bytes" -le 0 ] || [ "$bytes" -gt $((128 * 1024 * 1024)) ]; then
+              echo "$stem evidence file is empty or exceeds 128MiB." >&2
+              return 1
+            fi
+            relative="$stem-evidence/$role-$kind.json"
+            sha=$(sha256sum "$file" | awk '{print $1}')
+            jq -e --arg path "$relative" --arg sha "$sha" \
+              '[.. | objects | select(.path? == $path and .sha256? == $sha)] | length > 0' \
+              "$summary" >/dev/null
+          done
+        done
+      }
+
+      if [ "$PHASE" = "plan" ]; then
+        python3 - "$CAPACITY_DIRECTORY" "$directory" "$AGENT_TEMP_DIRECTORY" <<'PY'
+      import sys
+      from pathlib import Path
+
+      source = Path(sys.argv[1])
+      output = Path(sys.argv[2]).resolve()
+      private_root = Path(sys.argv[3]).resolve()
+      if source.is_symlink() or not source.is_dir():
+          raise SystemExit("Secondary-capacity input must be a real directory.")
+      source = source.resolve()
+      if output.exists():
+          raise SystemExit("An existing secondary-qualification output cannot be reused.")
+      if source == output or source in output.parents or output in source.parents:
+          raise SystemExit("Qualification output must be disjoint from downloaded input.")
+      if private_root == output or private_root in output.parents or output in private_root.parents:
+          raise SystemExit("Qualification output must be disjoint from private credentials.")
+      PY
+        if find "$CAPACITY_DIRECTORY" -type l -print -quit | grep -q .; then
+          echo "Downloaded secondary-capacity input must not contain symlinks." >&2
+          exit 1
+        fi
+        test -f "$REPOSITORY_DIRECTORY/$TFVARS_PATH"
+        test ! -L "$REPOSITORY_DIRECTORY/$TFVARS_PATH"
+        mkdir -p "$ARTIFACT_DIRECTORY"
+        mkdir "$directory"
+        echo "##vso[task.setvariable variable=SECONDARY_QUALIFICATION_DIAGNOSTICS_READY]true"
+        cp -R -- "$CAPACITY_DIRECTORY" "$directory/capacity-input"
+        require_whole_capacity_artifact
+        snapshot_hashes > "$directory/inputs.sha256"
+        inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
+        tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
+        echo "##vso[task.setvariable variable=SECONDARY_QUALIFICATION_INPUTS_SHA;isReadOnly=true]$inputs_sha"
+        echo "##vso[task.setvariable variable=SECONDARY_QUALIFICATION_TFVARS_SHA;isReadOnly=true]$tfvars_sha"
+      elif [ "$PHASE" = "execute" ]; then
+        if ! [[ "$INPUTS_SHA" =~ ^[0-9a-f]{64}$ ]] ||
+          ! [[ "$TFVARS_SHA" =~ ^[0-9a-f]{64}$ ]] ||
+          ! [[ "$PLAN_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "Execution requires frozen input, tfvars, and plan hashes." >&2
+          exit 1
+        fi
+        inputs_sha="$INPUTS_SHA"
+        tfvars_sha="$TFVARS_SHA"
+        require_whole_capacity_artifact
+        if [ "$(sha256sum "$directory/plan.json" | awk '{print $1}')" != "$PLAN_SHA" ]; then
+          echo "Published qualification plan bytes changed before execution." >&2
+          exit 1
+        fi
+        jq -e '
+          .execute == false and .mutation_started == false
+          and .capacity_source_build_id == 80039
+          and .plan_valid == true and .success == true
+          and .capacity_qualified == false
+          and .workloads_ready == false
+          and .completed_global_baseline == false' \
+          "$directory/plan.json" >/dev/null
+        require_evidence_directory plan false
+      else
+        echo "Unknown secondary-qualification phase; no command is authorized." >&2
+        exit 1
+      fi
+
+      verify_inputs() {
+        snapshot_hashes > "$directory/inputs-$PHASE.sha256"
+        if [ "$(sha256sum "$directory/inputs-$PHASE.sha256" | awk '{print $1}')" != "$inputs_sha" ] ||
+          [ "$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')" != "$tfvars_sha" ]; then
+          echo "Secondary-qualification inputs changed; no probes are authorized." >&2
+          return 1
+        fi
+      }
+
+      verify_inputs
+      private="$AGENT_TEMP_DIRECTORY/secondary-qualification.$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+      mkdir -m 700 -- "$private"
+      cleanup() {
+        for role in 51 66 79 89; do
+          rm -f -- "$private/mesh-$role.config"
+        done
+        rmdir -- "$private"
+      }
+      trap cleanup EXIT
+
+      for role in 51 66 79 89; do
+        timeout 45 az aks get-credentials \
+          --subscription "$SUBSCRIPTION" --resource-group "$RUN_ID" \
+          --name "clustermesh-$role" --file "$private/mesh-$role.config" \
+          --context "clustermesh-$role" --only-show-errors
+        chmod 600 "$private/mesh-$role.config"
+      done
+      test "$(find "$private" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 4
+
+      args=(
+        --capacity-directory "$directory/capacity-input"
+        --source-build-id "$SOURCE_BUILD_ID"
+        --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
+        --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
+        --expected-tfvars-sha "$tfvars_sha"
+        --kubeconfig-directory "$private"
+        --timeout-seconds 7200
+      )
+      if [ "$PHASE" = "plan" ]; then
+        args+=(--summary-file "$directory/plan.json")
+      else
+        args+=(--summary-file "$directory/qualification.json" --execute)
+      fi
+
+      echo "Starting secondary-capacity qualification $PHASE at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+      timeout 7260 python3 -u \
+        "$REPOSITORY_DIRECTORY/modules/python/clusterloader2/clustermesh-scale/secondary_capacity_qualification.py" \
+        "${args[@]}"
+      verify_inputs
+
+      if [ "$PHASE" = "plan" ]; then
+        jq -e '
+          .execute == false and .mutation_started == false
+          and .capacity_source_build_id == 80039
+          and .plan_valid == true and .success == true
+          and .capacity_qualified == false
+          and .workloads_ready == false
+          and .completed_global_baseline == false' \
+          "$directory/plan.json" >/dev/null
+        require_evidence_directory plan false
+        mkdir "$directory/plan-publication"
+        cp -- "$directory/plan.json" "$directory/plan-publication/plan.json"
+        cp -R -- "$directory/plan-evidence" "$directory/plan-publication/plan-evidence"
+        plan_sha=$(sha256sum "$directory/plan.json" | awk '{print $1}')
+        echo "##vso[task.setvariable variable=SECONDARY_QUALIFICATION_PLAN_SHA;isReadOnly=true]$plan_sha"
+      else
+        if [ "$(sha256sum "$directory/plan.json" | awk '{print $1}')" != "$PLAN_SHA" ]; then
+          echo "Qualification plan bytes changed during execution." >&2
+          exit 1
+        fi
+        jq -e '
+          .schema_version == 1 and .execute == true
+          and .capacity_source_build_id == 80039
+          and .accepted_capacity_build_id == 80029
+          and .source_diagnostic_build_id == 80022
+          and .mutation_started == true and .plan_valid == true
+          and .success == true and .capacity_qualified == true
+          and .actual_ip_growth_proven == true
+          and .actual_headroom_proven == true
+          and .workloads_ready == false
+          and .completed_global_baseline == false
+          and .bootstrap_complete == false
+          and (.cleanup_errors | type == "array" and length == 0)
+          and (.per_role | keys == ["mesh-51", "mesh-66", "mesh-79", "mesh-89"])
+          and ([.per_role[] |
+            .capacity_qualified == true
+            and .actual_ip_growth_proven == true
+            and .actual_headroom_proven == true
+            and .workloads_ready == false
+            and .completed_global_baseline == false
+            and (.probe_cleanup_pending | type == "array" and length == 0)
+            and .journal.accepted == true and .journal.ambiguous == false
+            and .placement_headroom.actual_metrics == true
+            and .final_evidence.phase == "probe-cleaned-final"
+            and .final_evidence.production_pods_deleted == false
+            and .final_evidence.nodes_or_pools_mutated == false
+            and .final_evidence.target_host.controller_pods_force_deleted == false
+            and .final_evidence.future_native_fencing_hold.applied_in_qualification == false
+            and ([.ip_growth[] |
+              .http_proven == true
+              and (.after.version > .before.version)
+              and (.after.assigned_ip_count > .before.assigned_ip_count)] | all)
+          ] | all)
+          and (.native_fencing_bundle_sha256 | test("^[0-9a-f]{64}$"))
+          and .native_fencing_bundle.schema_version == 1
+          and .native_fencing_bundle.capacity_source_build_id == 80039
+          and .native_fencing_bundle.qualification_complete == true
+          and .native_fencing_bundle.retirement_authorized_by_execution == false
+          and .native_fencing_bundle.workloads_ready == false
+          and .native_fencing_bundle.completed_global_baseline == false
+          and (.native_fencing_bundle.roles | keys == ["mesh-51", "mesh-66", "mesh-79", "mesh-89"])' \
+          "$directory/qualification.json" >/dev/null
+        require_evidence_directory qualification true
+      fi
+    ${{ if eq(parameters.phase, 'plan') }}:
+      displayName: "Plan all secondary qualification proofs without changes"
+      timeoutInMinutes: 25
+    ${{ else }}:
+      displayName: "Qualify seven workers with owned HTTP probes and cleanup"
+      timeoutInMinutes: 125
+    retryCountOnTaskFailure: 0
+    env:
+      PHASE: ${{ parameters.phase }}
+      RUN_ID: ${{ parameters.scope.target_run_id }}
+      CONFIRM_RESUME: ${{ parameters.scope.confirm_resume }}
+      SUBSCRIPTION: ${{ parameters.scope.expected_subscription_id }}
+      REGION: ${{ parameters.scope.expected_region }}
+      TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
+      SOURCE_BUILD_ID: ${{ parameters.scope.source_build_id }}
+      CAPACITY_DIRECTORY: $(Pipeline.Workspace)/secondary-qualification-input
+      ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
+      REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
+      AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)
+      INPUTS_SHA: $(SECONDARY_QUALIFICATION_INPUTS_SHA)
+      TFVARS_SHA: $(SECONDARY_QUALIFICATION_TFVARS_SHA)
+      PLAN_SHA: $(SECONDARY_QUALIFICATION_PLAN_SHA)

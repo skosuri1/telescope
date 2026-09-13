@@ -378,6 +378,22 @@ or failure; operation identity, VMSS generation, terminal status, and real
 worker readiness still have to agree. A later partial failure is not an
 automatically resumable checkpoint and cannot authorize another accepted add.
 
+`scaleDebugPostRetirementPromBuildId=80039` selects qualification of the seven
+workers from the completed secondary-capacity artifact. All four pool additions
+are already complete and cannot be replayed. This mode preserves their original
+journals and permits only separate qualification journals and token/UID-owned
+HTTP probes. Probe demand must demonstrate enough versioned IP growth for the
+61/48/40 projected mock replacements, not merely a larger initial allocation.
+Fresh CPU, memory, scheduler eligibility, and Pod-slot evidence are required,
+including a 16 GiB Prometheus reserve on mesh 89 and its naturally scheduled
+original operator UID. The failed hosts and production Pods are not deleted.
+The entire input tree is frozen across read-only planning and execution.
+Large observations are published as hash-bound sibling evidence files rather
+than repeatedly copied into each probe receipt; retain the complete artifact.
+Successful qualification requires complete owned-probe cleanup and captures
+controller, PDB, KWOK lease, and worker identities for a later native-fencing
+decision. It does not claim a completed global baseline or workload results.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,
