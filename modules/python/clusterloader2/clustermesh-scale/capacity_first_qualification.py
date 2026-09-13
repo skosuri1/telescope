@@ -37,6 +37,8 @@ JOURNAL = "mesh96-cniv5-qualification-79971"
 OWNER = "capacity-first-qualification"
 OBSERVATION_BUILD = 79975
 CAPACITY_BUILD = 79971
+COMPLETED_PROBE_BUILD = 79979
+COMPLETED_JOURNAL_UID = "a94ad391-c28f-4211-bc5c-88ed6d03615c"
 RESERVE_SECONDS = 300
 OBSERVATION_FILES = (
     "cniv5-observation.json", "cniv5-operation.json", "cniv5-capacity-journal.json",
@@ -267,6 +269,70 @@ def load_inputs(args):
             "capacity_hashes": capacity_hashes}
 
 
+def load_completed_proof(args, inputs):
+    path = getattr(args, "completed_qualification_checkpoint", None)
+    if not path:
+        return None, ""
+    checksum = capacity.checkpoint_hash(path)
+    prior = stalled.read_json(path)
+    require(prior.get("execute") is True and prior.get("plan_valid") is True
+            and prior.get("mutation_started") is True and prior.get("capacity_qualified") is False
+            and prior.get("error") == "The pinned allocated IP baseline regressed"
+            and prior.get("journal", {}).get("uid") == COMPLETED_JOURNAL_UID
+            and prior["journal"].get("accepted") is True and prior["journal"].get("ambiguous") is False
+            and prior.get("input_hashes") == {
+                "observation": inputs["observation_hashes"], "capacity": inputs["capacity_hashes"]}
+            and prior.get("identities") == inputs["identities"]
+            and prior.get("probe_cleanup_pending") == [] and prior.get("cleanup_errors") == [],
+            "Only the exact cleaned 79979 probe proof may be completed read-only")
+    proofs, receipts = prior.get("ip_growth") or {}, prior.get("probe_receipts") or {}
+    require(set(proofs) == set(inputs["identities"]) and len(receipts) == 32,
+            "Both original worker growth proofs and all 32 probe receipts are required")
+    tokens = {row.get("token") for row in receipts.values()}
+    require(len(tokens) == 1 and re.fullmatch(r"[0-9a-f]{32}", str(next(iter(tokens)))),
+            "Completed probe ownership token is ambiguous")
+    recorded = prior.get("read_only_capacity_guard", {}).get("kubernetes_diagnostics") or {}
+    final_networks = allocation_map(recorded["nnc"])
+    pods = recorded["pods"]["items"]
+    require(not any(pod["metadata"].get("name") in receipts for pod in pods
+                    if pod["metadata"].get("namespace") == mocks.DEFAULT_NAMESPACE),
+            "The completed source still contains a probe name")
+    proved_uids = set()
+    for name, proof in proofs.items():
+        before, after = proof["before"], proof["after"]
+        expected, final = inputs["identities"][name], final_networks[name]
+        require(proof.get("http_proven") is True and proof.get("probe_count") == len(proof.get("probe_uids") or [])
+                == len(proof.get("ready_ips") or [])
+                and before["version"] == 0 and after["version"] == 1 and final["version"] == 2
+                and before["assigned_ip_count"] == final["assigned_ip_count"] == 16
+                and after["assigned_ip_count"] == 32
+                and len(set(before["ip_addresses"])) == 16
+                and len(set(after["ip_addresses"])) == 32
+                and len(set(proof["ready_ips"])) == proof["probe_count"]
+                and set(before["ip_addresses"]) < set(after["ip_addresses"])
+                and set(proof["ready_ips"]) <= set(after["ip_addresses"])
+                and bool(set(proof["ready_ips"]) - set(before["ip_addresses"])),
+                "The recorded real growth/HTTP/cleanup sequence is incomplete")
+        for row in (before, after, final):
+            require(row["node_uid"] == expected["node_uid"] and row["uid"] == expected["nnc_uid"]
+                    and row["network_container_id"] == expected["network_container_id"],
+                    "A completed network proof changed physical ownership")
+        matching = [row for row in receipts.values() if row.get("node_name") == name]
+        require({row.get("uid") for row in matching} == set(proof["probe_uids"])
+                and len(matching) == proof["probe_count"], "Completed HTTP and cleanup UIDs differ")
+        for row in matching:
+            require(row.get("node_uid") == expected["node_uid"]
+                    and row.get("create_submission_started") is True and row.get("create_accepted") is True
+                    and row.get("create_ambiguous") is False and row.get("delete_attempted") is True
+                    and row.get("delete_accepted") is True and row.get("delete_ambiguous") is False,
+                    "An ambiguous or unclean probe cannot establish completion")
+        proved_uids.update(proof["probe_uids"])
+    require(len(proved_uids) == 32 and not proved_uids & {uid(pod) for pod in pods},
+            "Completed probe UIDs are duplicated or remain present")
+    require(capacity.checkpoint_hash(path) == checksum, "Completed proof changed while loading")
+    return prior, checksum
+
+
 class ReadOnlyCapacityGuard(capacity.CapacityFirst):
     """Use the existing guards with historical creation evidence, never its executor."""
 
@@ -305,7 +371,7 @@ class ReadOnlyCapacityGuard(capacity.CapacityFirst):
 class Qualification(maintenance.ClusterOperator):
     """Only journal/probe writes; all production and provider mutation paths are absent."""
 
-    def __init__(self, args, inputs, summary, runner, delete_pod):
+    def __init__(self, args, inputs, summary, runner, delete_pod, *, completed=None, completed_hash=""):
         deadline = time.monotonic() + args.timeout_seconds
         super().__init__(args, base.CLUSTER, runner, deadline - RESERVE_SECONDS, deadline)
         self.inputs, self.summary, self.delete_pod = inputs, summary, delete_pod
@@ -318,6 +384,13 @@ class Qualification(maintenance.ClusterOperator):
         self.node_high = {}
         self.growth_done = False
         self.persisted_journal_data = None
+        self.probes_cleaned = False
+        self.completed, self.completed_hash = completed, completed_hash
+        if completed:
+            self.summary["ip_growth"] = copy.deepcopy(completed["ip_growth"])
+            self.growth_done = self.probes_cleaned = True
+            self.rss_high = completed["memory_projection"]["healthy_agent_rss_high_water_bytes"]
+            self.node_high = copy.deepcopy(completed["memory_projection"]["node_high_water"])
 
     def save(self):
         mocks.write_json_atomic(self.args.summary_file, self.summary)
@@ -326,6 +399,9 @@ class Qualification(maintenance.ClusterOperator):
         require(hash_tree(self.args.observation_directory) == self.inputs["observation_hashes"]
                 and hash_tree(self.args.capacity_directory) == self.inputs["capacity_hashes"],
                 "Immutable qualification input hashes changed")
+        if self.completed:
+            require(capacity.checkpoint_hash(self.args.completed_qualification_checkpoint) == self.completed_hash,
+                    "Completed qualification proof changed")
 
     def read_command(self, command, timeout_seconds):
         command = list(command)
@@ -393,8 +469,26 @@ class Qualification(maintenance.ClusterOperator):
                     "New VM guest/extension readiness is missing or stale")
             baseline = self.summary.get("ip_growth", {}).get(name, {}).get("before")
             if baseline:
-                require(row["version"] >= baseline["version"] and set(baseline["ip_addresses"]) <= set(row["ip_addresses"]),
-                        "The pinned allocated IP baseline regressed")
+                require(row["version"] >= baseline["version"], "The allocated IP version regressed")
+                if not self.probes_cleaned:
+                    require(set(baseline["ip_addresses"]) <= set(row["ip_addresses"]),
+                            "The pinned allocated IP baseline regressed")
+                else:
+                    after = self.summary["ip_growth"][name]["after"]
+                    require(row["version"] >= after["version"]
+                            and (set(row["ip_addresses"]) == set(after["ip_addresses"])
+                                 or row["version"] > after["version"]),
+                            "Post-cleanup allocation changed without a newer version")
+                    residents = {pod.get("status", {}).get("podIP") for pod in snapshot["pods"]["items"]
+                                 if pod["spec"].get("nodeName") == name and not pod["spec"].get("hostNetwork")
+                                 and pod.get("status", {}).get("podIP")}
+                    require(residents <= set(row["ip_addresses"]), "Post-cleanup allocation lost a resident Pod IP")
+                    self.summary.setdefault("post_cleanup_allocation", {})[name] = {
+                        "version": row["version"], "assigned_ip_count": row["assigned_ip_count"],
+                        "proven_growth_capacity": after["assigned_ip_count"],
+                        "resident_ip_count": len(residents),
+                        "unused_ips_released": sorted(set(after["ip_addresses"]) - set(row["ip_addresses"])),
+                    }
         agents = maintenance._agent_map(snapshot["pods"])
         for name, expected_uid in self.inputs["healthy_agents"].items():
             require(name in agents and uid(agents[name]) == expected_uid and base.pod_ready(agents[name]),
@@ -588,9 +682,13 @@ class Qualification(maintenance.ClusterOperator):
             if self.growth_done:
                 occupied = {pod.get("status", {}).get("podIP") for pod in snapshot["pods"]["items"]
                             if pod["spec"].get("nodeName") == name and not pod["spec"].get("hostNetwork")}
-                seats = min(seats, len(set(networks[name]["ip_addresses"]) - occupied))
+                occupied.discard(None)
+                proven = self.summary["ip_growth"][name]["after"]["assigned_ip_count"]
+                seats = min(seats, proven - len(occupied))
             capacities[name] = {"safe_slots": int(seats), "free_memory": free_memory, "free_cpu": free_cpu,
-                                "free_pod_slots": free_slots, "metric_timestamp": metric["timestamp"]}
+                                "free_pod_slots": free_slots, "metric_timestamp": metric["timestamp"],
+                                "current_allocated_ips": networks[name]["assigned_ip_count"],
+                                "proven_demand_allocation": self.summary["ip_growth"][name].get("after", {}).get("assigned_ip_count")}
         slots = {name: row["safe_slots"] for name, row in capacities.items()}
         placements = {}
         for pod in remaining:
@@ -819,8 +917,49 @@ class Qualification(maintenance.ClusterOperator):
             if remaining:
                 time.sleep(self.remaining_seconds(5, cleanup=True))
         self.persist_journal(cleanup=True)
+        self.probes_cleaned = True
+
+    def complete_read_only(self):
+        require(not self.args.execute and self.completed is not None, "Completion must be read-only")
+        snapshot, networks = self.observe()
+        prior = self.completed
+        journal = self.kube("-n", "kube-system", "get", "configmap", JOURNAL, "-o", "json")
+        token = next(iter(prior["probe_receipts"].values()))["token"]
+        expected_data = {
+            "owner": OWNER, "token": token, "capacity_build": str(CAPACITY_BUILD),
+            "observation_build": str(OBSERVATION_BUILD), "input_sha256": digest(prior["input_hashes"]),
+            "probe_receipts": json.dumps(prior["probe_receipts"], sort_keys=True),
+            "state": "proving-real-ip-growth",
+        }
+        require(uid(journal) == COMPLETED_JOURNAL_UID and journal.get("data") == expected_data
+                and journal["metadata"].get("name") == JOURNAL
+                and journal["metadata"].get("namespace") == "kube-system"
+                and not journal["metadata"].get("deletionTimestamp") and not journal["metadata"].get("ownerReferences"),
+                "The original completed-probe journal changed")
+        require(not any(maintenance.PROBE_LABEL_KEY in pod["metadata"].get("labels", {})
+                        or pod["metadata"]["name"].startswith("cni-maint-probe-") for pod in snapshot["pods"]["items"]),
+                "Live probe residue prevents read-only completion")
+        captured = allocation_map(prior["read_only_capacity_guard"]["kubernetes_diagnostics"]["nnc"])
+        require(all(networks[name]["version"] >= captured[name]["version"] for name in self.identities),
+                "The current allocation predates the recorded clean probe outcome")
+        self.metrics(snapshot, networks)
+        self.kwok_diagnostics(snapshot)
+        self.historical_journal()
+        final = self.kube("-n", "kube-system", "get", "configmap", JOURNAL, "-o", "json")
+        require(uid(final) == uid(journal) and final.get("data") == expected_data,
+                "Completed-probe journal changed during read-only finalization")
+        require(not final["metadata"].get("deletionTimestamp") and not final["metadata"].get("ownerReferences"),
+                "Completed-probe journal lifecycle changed during finalization")
+        self.summary["journal"].update(uid=uid(journal), observed_existing=True, attempted=False)
+        self.summary.update(plan_valid=True, success=True, capacity_qualified=True,
+                            actual_ip_growth_proven=True, actual_memory_headroom_proven=True,
+                            status="capacity-qualified-read-only-from-cleaned-probes")
+        self.save()
 
     def execute(self):
+        if self.completed:
+            self.complete_read_only()
+            return
         snapshot, networks = self.observe()
         require(not self.kube("-n", "kube-system", "get", "configmaps", "--field-selector",
                               f"metadata.name={JOURNAL}", "-o", "json")["items"], "Existing qualification journal blocks replay")
@@ -849,10 +988,6 @@ class Qualification(maintenance.ClusterOperator):
         self.prove_growth()
         self.cleanup()
         snapshot, networks = self.observe()
-        for name, proof in self.summary["ip_growth"].items():
-            require(networks[name]["version"] >= proof["after"]["version"]
-                    and set(proof["after"]["ip_addresses"]) <= set(networks[name]["ip_addresses"]),
-                    "Proven allocation regressed after probe cleanup")
         self.metrics(snapshot, networks)
         require(not self.summary["probe_cleanup_pending"] and not self.summary["cleanup_errors"],
                 "Uncertain cleanup prevents qualification")
@@ -871,11 +1006,19 @@ def validate_args(args):
             "Only observations 79975 and accepted capacity 79971 are supported")
     require(base.integer(args.timeout_seconds) and 600 <= args.timeout_seconds <= 2400, "Timeout must be 600..2400 seconds")
     require(args.kubeconfig and args.context == base.CLUSTER, "Private explicit mesh96 context is required")
+    completed_path = getattr(args, "completed_qualification_checkpoint", None)
+    completed_build = getattr(args, "completed_qualification_build_id", 0)
+    require((not completed_path and completed_build == 0)
+            or (completed_path and completed_build == COMPLETED_PROBE_BUILD and not args.execute),
+            "Cleaned-probe completion requires exact build 79979 and cannot execute mutations")
     observation, capacity_dir, output, config = (Path(value).resolve() for value in (
         args.observation_directory, args.capacity_directory, args.summary_file, args.kubeconfig))
     require(len({observation, capacity_dir, output, config}) == 4 and not output.exists()
             and observation not in output.parents and capacity_dir not in output.parents,
             "Summary must be new and outside immutable inputs/private credentials")
+    if completed_path:
+        require(Path(completed_path).resolve() not in (observation, capacity_dir, output, config),
+                "Completed proof must be separate from outputs and other inputs")
     args.role = base.ROLE
     args.probe_image = maintenance.DEFAULT_PROBE_IMAGE
     args.request_timeout_seconds = 45
@@ -891,6 +1034,7 @@ def execute_qualification(args, summary, runner=workers.run_command, delete_pod=
     operation = None
     try:
         inputs = load_inputs(args)
+        completed, completed_hash = load_completed_proof(args, inputs)
         summary.update(input_hashes={"observation": inputs["observation_hashes"], "capacity": inputs["capacity_hashes"]},
                        historical_capacity_create=inputs["receipt"]["create"],
                        historical_capacity_journal_uid=uid(inputs["observation"]["cniv5-capacity-journal.json"]),
@@ -899,7 +1043,11 @@ def execute_qualification(args, summary, runner=workers.run_command, delete_pod=
                        original_mock_uids=inputs["receipt"]["original_mock_pod_uids"],
                        preserved_kwok_uids=inputs["receipt"]["preserved_kwok_node_uids"],
                        plan_sha256=stalled.PLAN_SHA)
-        operation = Qualification(args, inputs, summary, runner, delete_pod or mocks.delete_pod_with_uid_precondition)
+        if completed:
+            summary.update(completion_only=True, completed_probe_build=COMPLETED_PROBE_BUILD,
+                           completed_probe_checkpoint_sha256=completed_hash)
+        operation = Qualification(args, inputs, summary, runner, delete_pod or mocks.delete_pod_with_uid_precondition,
+                                  completed=completed, completed_hash=completed_hash)
         operation.execute()
     except EXPECTED_ERRORS as error:
         summary.update(success=False, capacity_qualified=False, actual_ip_growth_proven=False,
@@ -925,6 +1073,8 @@ def parse_args(argv=None):
     parser.add_argument("--context", default=base.CLUSTER)
     parser.add_argument("--timeout-seconds", type=int, default=2400)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--completed-qualification-checkpoint")
+    parser.add_argument("--completed-qualification-build-id", type=int, default=0)
     return parser.parse_args(argv)
 
 

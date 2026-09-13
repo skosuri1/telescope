@@ -306,6 +306,16 @@ workers, actual CPU/memory/Pod-slot headroom, and empty UID-owned probe cleanup.
 It does not authorize worker retirement, production Pod movement, Prometheus
 creation, or benchmark execution.
 
+Source build `79979` selects a read-only completion of its existing, fully
+cleaned probe evidence instead. Both workers grew real allocation from 16 to 32
+addresses, answered the HTTP probes, then returned unused addresses after probe
+cleanup. A newer allocation version with every resident Pod IP retained is not
+a networking regression. Completion revalidates the original journal, absence
+of every probe, physical identities, and current headroom for all 56 replacements.
+It uses the demonstrated dynamic allocation capacity, not a claim that all future
+IPs are already reserved. Neither phase passes `--execute` in completion mode;
+the old receipt and journal are never rewritten and no probes are replayed.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,

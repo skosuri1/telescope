@@ -30,7 +30,8 @@ def job():
 
 
 @pytest.mark.parametrize("changes", [
-    {}, {"target_run_id": "other"}, {"confirm_resume": "other"}, {"expected_subscription_id": "other"},
+    {}, {"observation_build_id": 79979},
+    {"target_run_id": "other"}, {"confirm_resume": "other"}, {"expected_subscription_id": "other"},
     {"expected_region": "westus"}, {"expected_cluster_count": 2}, {"expected_cluster_count": "100"},
     {"tfvars_path": "other"}, {"overlay_mode": "resume"}, {"run_workload": True},
     {"observation_build_id": 79971}, {"observation_build_id": "79975"},
@@ -42,7 +43,7 @@ def test_scope_fails_before_setup_for_any_different_or_untyped_authority(changes
         env={**os.environ, "QUALIFICATION_SCOPE_JSON": json.dumps({**SCOPE, **changes})},
         capture_output=True, text=True, check=False, timeout=5,
     )
-    assert (result.returncode == 0) is (not changes)
+    assert (result.returncode == 0) is (not changes or changes == {"observation_build_id": 79979})
 
 
 def test_qualification_mode_excludes_every_other_mutation_and_normal_job():
@@ -84,10 +85,9 @@ def test_plan_and_probe_tasks_are_distinct_and_plan_is_published_first():
                        if step.get("displayName") == "Publish qualification plan before any probes")
     assert phases[0][0] < publication < phases[1][0]
     downloads = [step["inputs"] for step in steps if step.get("task") == "DownloadPipelineArtifact@2"]
-    assert [row["artifactName"] for row in downloads] == [
-        "n100-unreachable-worker-recovery-${{ parameters.observation_build_id }}-1",
-        "n100-capacity-first-${{ parameters.accepted_capacity_build_id }}-1",
-    ]
+    assert downloads[0]["${{ if eq(parameters.observation_build_id, 79979) }}"]["artifactName"] == "n100-capacity-qualification-79979-1"
+    assert downloads[0]["${{ else }}"]["artifactName"] == "n100-unreachable-worker-recovery-${{ parameters.observation_build_id }}-1"
+    assert downloads[1]["artifactName"] == "n100-capacity-first-${{ parameters.accepted_capacity_build_id }}-1"
     step = yaml.safe_load(STEP.read_text(encoding="utf-8"))["steps"][0]
     assert step["retryCountOnTaskFailure"] == 0
     assert step["${{ if eq(parameters.phase, 'plan') }}"]["timeoutInMinutes"] == 15
@@ -95,6 +95,7 @@ def test_plan_and_probe_tasks_are_distinct_and_plan_is_published_first():
     assert "always()" in steps[-1]["condition"] and "DIAGNOSTICS_READY" in steps[-1]["condition"]
 
 
+@pytest.mark.parametrize("source_build", [79975, 79979])
 @pytest.mark.parametrize("fault,expected_calls", [
     ("none", 2), ("initial-symlink", 0), ("output-alias", 0), ("existing-output", 0),
     ("credentials-plan", 0), ("plan-error", 1), ("unsafe-plan", 1),
@@ -102,14 +103,18 @@ def test_plan_and_probe_tasks_are_distinct_and_plan_is_published_first():
     ("plan-symlink", 1), ("between-change", 1), ("missing-freeze", 1), ("between-symlink", 1),
     ("credentials-execute", 1), ("execute-error", 2), ("false-qualified", 2), ("cleanup-left", 2),
 ])
-def test_phase_inputs_are_frozen_and_credentials_never_enter_artifacts(tmp_path, fault, expected_calls):
+def test_phase_inputs_are_frozen_and_credentials_never_enter_artifacts(tmp_path, source_build, fault, expected_calls):
     script = yaml.safe_load(STEP.read_text(encoding="utf-8"))["steps"][0]["script"]
     observation, creation, checkout, private, binaries = (
         tmp_path / name for name in ("observation", "creation", "checkout", "private", "bin")
     )
     for path in (observation, creation, checkout, private, binaries):
         path.mkdir()
-    (observation / "current-nodes.json").write_text('{"source":79975}', encoding="utf-8")
+    observation_input = observation / "observation" if source_build == 79979 else observation
+    observation_input.mkdir(exist_ok=True)
+    (observation_input / "current-nodes.json").write_text('{"source":79975}', encoding="utf-8")
+    if source_build == 79979:
+        (observation / "qualification.json").write_text('{"source":79979}', encoding="utf-8")
     (creation / "recovery.json").write_text('{"source":79971}', encoding="utf-8")
     (creation / "source-state").mkdir()
     (creation / "source-state" / "current-nodes.json").write_text('{"source":79955}', encoding="utf-8")
@@ -131,8 +136,15 @@ def test_phase_inputs_are_frozen_and_credentials_never_enter_artifacts(tmp_path,
             return args[args.index(name) + 1]
         with Path(os.environ["CALLS"]).open("a") as handle:
             handle.write(json.dumps(args) + "\\n")
+        complete = os.environ["SOURCE_BUILD_ID"] == "79979"
         execute = "--execute" in args
-        assert execute == (os.environ["PHASE"] == "execute")
+        finish = os.environ["PHASE"] == "execute"
+        assert execute == (finish and not complete)
+        if complete:
+            assert value("--completed-qualification-build-id") == "79979"
+            assert json.loads(Path(value("--completed-qualification-checkpoint")).read_text())["source"] == 79979
+        else:
+            assert "--completed-qualification-checkpoint" not in args
         assert value("--observation-build-id") == "79975" and value("--capacity-build-id") == "79971"
         assert value("--context") == "clustermesh-96" and value("--timeout-seconds") == "2400"
         config = Path(value("--kubeconfig"))
@@ -143,7 +155,7 @@ def test_phase_inputs_are_frozen_and_credentials_never_enter_artifacts(tmp_path,
         assert json.loads((observation / "current-nodes.json").read_text())["source"] == 79975
         assert json.loads((creation / "source-state/current-nodes.json").read_text())["source"] == 79955
         fault = os.environ["FAULT"]
-        if not execute:
+        if not finish:
             paths = {
                 "observation-change": observation / "current-nodes.json",
                 "capacity-change": creation / "recovery.json",
@@ -156,12 +168,13 @@ def test_phase_inputs_are_frozen_and_credentials_never_enter_artifacts(tmp_path,
                 (observation / "new-symlink.json").symlink_to(creation / "recovery.json")
         output.write_text(json.dumps({
             "execute": execute, "mutation_started": execute,
-            "plan_valid": fault != "unsafe-plan", "capacity_qualified": execute,
-            "actual_ip_growth_proven": execute and fault != "false-qualified",
-            "actual_memory_headroom_proven": execute, "workloads_ready": False, "bootstrap_complete": False,
+            "plan_valid": fault != "unsafe-plan", "capacity_qualified": finish,
+            "actual_ip_growth_proven": finish and fault != "false-qualified",
+            "actual_memory_headroom_proven": finish, "workloads_ready": False, "bootstrap_complete": False,
+            "completion_only": complete,
             "probe_cleanup_pending": ["not-clean"] if fault == "cleanup-left" else [],
         }))
-        sys.exit(1 if fault == ("execute-error" if execute else "plan-error") else 0)
+        sys.exit(1 if fault == ("execute-error" if finish else "plan-error") else 0)
         """
     ), encoding="utf-8")
     az = binaries / "az"
@@ -188,6 +201,7 @@ def test_phase_inputs_are_frozen_and_credentials_never_enter_artifacts(tmp_path,
         "RUN_ID": SCOPE["target_run_id"], "CONFIRM_RESUME": SCOPE["confirm_resume"],
         "SUBSCRIPTION": SCOPE["expected_subscription_id"], "REGION": SCOPE["expected_region"],
         "TFVARS_PATH": TFVARS, "OBSERVATION_BUILD_ID": "79975", "CAPACITY_BUILD_ID": "79971",
+        "SOURCE_BUILD_ID": str(source_build),
         "OBSERVATION_DIRECTORY": str(observation), "CAPACITY_DIRECTORY": str(creation),
         "REPOSITORY_DIRECTORY": str(checkout), "AGENT_TEMP_DIRECTORY": str(private),
         "ARTIFACT_DIRECTORY": str(artifacts), "INPUTS_SHA": "", "TFVARS_SHA": "",
@@ -220,6 +234,6 @@ def test_phase_inputs_are_frozen_and_credentials_never_enter_artifacts(tmp_path,
     if calls:
         assert "--execute" not in calls[0]
     if len(calls) == 2:
-        assert "--execute" in calls[1]
+        assert ("--execute" in calls[1]) is (source_build == 79975)
     assert not any(b"private-qualification-credentials" in path.read_bytes()
                    for path in artifacts.rglob("*") if path.is_file() and not path.is_symlink())

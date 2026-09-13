@@ -67,6 +67,7 @@ class QualificationCloud(CapacityCloud):
         self.missing_node_lease = False
         self.node_memory = {name: "2Gi" for name in NAMES}
         self.qual_journal_error = False
+        self.qual_journal_uid = None
         self.operation_record = None
         self.creation_receipt = None
         for row in self.nncs:
@@ -92,6 +93,9 @@ class QualificationCloud(CapacityCloud):
         old_kwok["spec"]["nodeName"] = stalled.SOURCE
         old_kwok["status"] = status(True)
         super().add_new_pool()
+        for row in self.pods:
+            if row["spec"].get("nodeName") in NAMES:
+                row["spec"]["hostNetwork"] = True
         self.operation_record = {
             "name": uid("created-agent-pool-operation"), "operationType": "PutAgentPool", "status": "Succeeded",
             "startTime": (datetime.now(timezone.utc) - timedelta(minutes=4)).isoformat(),
@@ -188,7 +192,7 @@ class QualificationCloud(CapacityCloud):
             if "create" in command:
                 assert qualification.JOURNAL not in self.journals
                 self.journals[qualification.JOURNAL] = {
-                    "metadata": metadata(qualification.JOURNAL, "kube-system"),
+                    "metadata": metadata(qualification.JOURNAL, "kube-system", self.qual_journal_uid),
                     "data": dict(item.removeprefix("--from-literal=").split("=", 1)
                                  for item in command if item.startswith("--from-literal=")),
                 }
@@ -643,3 +647,120 @@ def test_accepted_cleanup_is_observed_after_read_error_without_duplicate_deletes
     assert len(cloud.deleted) == 34 and state["reads"] == 2
     assert not cloud.receipt()["probe_cleanup_pending"] and not cloud.receipt()["cleanup_errors"]
     assert not cloud.receipt()["capacity_qualified"]
+
+
+def release_unused_after_cleanup(cloud, *, fault=""):
+    original_delete = cloud.delete_probe
+
+    def remove(cluster, **kwargs):
+        original_delete(cluster, **kwargs)
+        if any(qualification.maintenance.PROBE_LABEL_KEY in pod["metadata"].get("labels", {}) for pod in cloud.pods):
+            return
+        for row in cloud.nncs:
+            name = row["metadata"]["name"]
+            if name not in NAMES:
+                continue
+            container = row["status"]["networkContainers"][0]
+            occupied = {pod["status"]["podIP"] for pod in cloud.pods
+                        if pod["spec"].get("nodeName") == name and not pod["spec"].get("hostNetwork")}
+            spare = [entry["ip"] for entry in reversed(container["ipAssignments"]) if entry["ip"] not in occupied]
+            keep = sorted(occupied) + spare[:16 - len(occupied)]
+            if fault == "resident" and occupied:
+                keep = spare[:16]
+            container["ipAssignments"] = [{"ip": address} for address in keep]
+            if fault != "version":
+                container["version"] += 1
+            row["status"]["assignedIPCount"] = 16
+    cloud.delete_probe = remove
+
+
+@pytest.fixture(name="completed_environment")
+def setup_completed_environment(environment):
+    args, cloud = environment
+    for index, name in enumerate(NAMES):
+        resident = {
+            "metadata": metadata(f"resident-{index}", "kube-system"),
+            "spec": {"nodeName": name, "containers": [{"name": "resident", "image": "pinned",
+                                                       "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}}}]},
+            "status": {**status(True), "podIP": f"10.100.{index}.1"},
+        }
+        cloud.pods.append(resident)
+    (Path(args.observation_directory) / "current-pods.json").write_text(
+        json.dumps({"items": cloud.pods}), encoding="utf-8")
+    cloud.qual_journal_uid = qualification.COMPLETED_JOURNAL_UID
+    release_unused_after_cleanup(cloud)
+    result = run(environment, execute=True)
+    assert result["capacity_qualified"] and len(cloud.deleted) == 32
+    assert all(row["assigned_ip_count"] == 16 and row["version"] == 2
+               for row in result["post_cleanup_allocation"].values())
+    prior = copy.deepcopy(result)
+    prior.update(success=False, capacity_qualified=False, actual_ip_growth_proven=False,
+                 actual_memory_headroom_proven=False, status="failed-closed",
+                 error="The pinned allocated IP baseline regressed")
+    path = Path("completed-probes.json")
+    path.write_text(json.dumps(prior), encoding="utf-8")
+    cloud.journals[qualification.JOURNAL]["data"]["state"] = "proving-real-ip-growth"
+    args.completed_qualification_checkpoint = str(path)
+    args.completed_qualification_build_id = 79979
+    args.summary_file = cloud.args.summary_file = "readonly-completion.json"
+    cloud.writes.clear()
+    cloud.commands.clear()
+    cloud.deleted.clear()
+    return args, cloud
+
+
+def test_dynamic_unused_ip_return_is_not_network_failure_and_completion_has_no_writes(completed_environment):
+    _, cloud = completed_environment
+    journals = copy.deepcopy(cloud.journals)
+    result = run(completed_environment)
+    assert result["completion_only"] and result["capacity_qualified"] and result["plan_valid"]
+    assert not result["execute"] and not result["mutation_started"]
+    assert result["actual_ip_growth_proven"] and result["actual_memory_headroom_proven"]
+    assert not result["probe_cleanup_pending"] and not result["workloads_ready"] and not result["bootstrap_complete"]
+    assert sum(result["memory_projection"]["placement_counts"].values()) == 56
+    assert all(row["current_allocated_ips"] == 16 and row["proven_demand_allocation"] == 32
+               for row in result["memory_projection"]["destinations"].values())
+    assert not cloud.writes and not cloud.deleted and cloud.journals == journals
+
+
+@pytest.mark.parametrize("fault", ["http", "cleanup", "ambiguous", "journal-uid", "network-owner"])
+def test_readonly_completion_rejects_incomplete_historical_proofs(completed_environment, fault):
+    args, cloud = completed_environment
+    path = Path(args.completed_qualification_checkpoint)
+    prior = json.loads(path.read_text(encoding="utf-8"))
+    if fault == "http":
+        prior["ip_growth"][NAMES[0]]["http_proven"] = False
+    elif fault == "cleanup":
+        prior["probe_cleanup_pending"] = [{"name": "not-clean"}]
+    elif fault == "ambiguous":
+        next(iter(prior["probe_receipts"].values()))["delete_ambiguous"] = True
+    elif fault == "journal-uid":
+        prior["journal"]["uid"] = uid("different-qualification")
+    else:
+        prior["ip_growth"][NAMES[0]]["after"]["network_container_id"] = uid("different-network")
+    path.write_text(json.dumps(prior), encoding="utf-8")
+    with pytest.raises(qualification.EXPECTED_ERRORS):
+        run(completed_environment)
+    assert not cloud.commands and not cloud.writes and not cloud.deleted
+
+
+@pytest.mark.parametrize("fault", ["execute", "other-build", "changed-journal", "stale-metrics"])
+def test_readonly_completion_never_replays_or_waives_current_guards(completed_environment, fault):
+    args, cloud = completed_environment
+    if fault == "other-build":
+        args.completed_qualification_build_id = 79975
+    elif fault == "changed-journal":
+        cloud.journals[qualification.JOURNAL]["data"]["state"] = "changed"
+    elif fault == "stale-metrics":
+        cloud.stale_metrics = True
+    with pytest.raises(qualification.EXPECTED_ERRORS):
+        run(completed_environment, execute=fault == "execute")
+    assert not cloud.writes and not cloud.deleted
+
+
+def test_ip_set_change_without_version_progress_still_fails(environment):
+    _, cloud = environment
+    release_unused_after_cleanup(cloud, fault="version")
+    with pytest.raises(qualification.EXPECTED_ERRORS, match="without a newer version"):
+        run(environment, execute=True)
+    assert not cloud.receipt()["capacity_qualified"] and not cloud.receipt()["probe_cleanup_pending"]

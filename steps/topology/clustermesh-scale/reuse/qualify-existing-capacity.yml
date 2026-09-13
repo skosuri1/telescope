@@ -12,6 +12,18 @@ steps:
       set -euo pipefail
       umask 077
       directory="$ARTIFACT_DIRECTORY/n100-capacity-qualification"
+      original_observation="$OBSERVATION_DIRECTORY"
+      completion_args=()
+      if [ "$SOURCE_BUILD_ID" = "79979" ]; then
+        original_observation="$OBSERVATION_DIRECTORY/observation"
+        completion_args=(
+          --completed-qualification-checkpoint "$directory/prior-qualification.json"
+          --completed-qualification-build-id 79979
+        )
+      elif [ "$SOURCE_BUILD_ID" != "79975" ]; then
+        echo "Unknown qualification source; no command is authorized." >&2
+        exit 1
+      fi
       snapshot_hashes() {
         for input in observation capacity-input; do
           test -d "$directory/$input"
@@ -23,6 +35,11 @@ steps:
           (cd "$directory/$input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --) |
             sed "s|  ./|  $input/|"
         done
+        if [ "$SOURCE_BUILD_ID" = "79979" ]; then
+          test -f "$directory/prior-qualification.json"
+          test ! -L "$directory/prior-qualification.json"
+          sha256sum "$directory/prior-qualification.json"
+        fi
       }
       if [ "$PHASE" = "plan" ]; then
         python3 - "$OBSERVATION_DIRECTORY" "$CAPACITY_DIRECTORY" "$directory" <<'PY'
@@ -48,8 +65,13 @@ steps:
         mkdir -p "$ARTIFACT_DIRECTORY"
         mkdir "$directory"
         echo "##vso[task.setvariable variable=CAPACITY_QUALIFICATION_DIAGNOSTICS_READY]true"
-        cp -R -- "$OBSERVATION_DIRECTORY" "$directory/observation"
+        cp -R -- "$original_observation" "$directory/observation"
         cp -R -- "$CAPACITY_DIRECTORY" "$directory/capacity-input"
+        if [ "$SOURCE_BUILD_ID" = "79979" ]; then
+          test -f "$OBSERVATION_DIRECTORY/qualification.json"
+          test ! -L "$OBSERVATION_DIRECTORY/qualification.json"
+          cp -- "$OBSERVATION_DIRECTORY/qualification.json" "$directory/prior-qualification.json"
+        fi
         snapshot_hashes > "$directory/inputs.sha256"
         inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
         tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
@@ -94,11 +116,15 @@ steps:
         --observation-directory "$directory/observation" --observation-build-id "$OBSERVATION_BUILD_ID"
         --capacity-directory "$directory/capacity-input" --capacity-build-id "$CAPACITY_BUILD_ID"
         --kubeconfig "$private/cluster.config" --context clustermesh-96 --timeout-seconds 2400
+        "${completion_args[@]}"
       )
       if [ "$PHASE" = "plan" ]; then
         args+=(--summary-file "$directory/plan.json")
       else
-        args+=(--summary-file "$directory/qualification.json" --execute)
+        args+=(--summary-file "$directory/qualification.json")
+        if [ "$SOURCE_BUILD_ID" = "79975" ]; then
+          args+=(--execute)
+        fi
       fi
       echo "Starting capacity qualification $PHASE at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
       python3 -u "$REPOSITORY_DIRECTORY/modules/python/clusterloader2/clustermesh-scale/capacity_first_qualification.py" "${args[@]}"
@@ -107,7 +133,11 @@ steps:
         jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
           "$directory/plan.json" >/dev/null
       else
-        jq -e '.execute == true and .capacity_qualified == true
+        jq -e --arg source "$SOURCE_BUILD_ID" '
+          (if $source == "79979" then
+            .execute == false and .mutation_started == false and .completion_only == true
+          else .execute == true end)
+          and .capacity_qualified == true
           and .actual_ip_growth_proven == true and .actual_memory_headroom_proven == true
           and .workloads_ready == false and .bootstrap_complete == false
           and (.probe_cleanup_pending | type == "array" and length == 0)' \
@@ -117,7 +147,10 @@ steps:
       displayName: "Plan replacement networking and capacity without changes"
       timeoutInMinutes: 15
     ${{ else }}:
-      displayName: "Qualify both replacements with temporary HTTP probes"
+      ${{ if eq(parameters.scope.observation_build_id, 79979) }}:
+        displayName: "Complete qualification read-only from cleaned probe evidence"
+      ${{ else }}:
+        displayName: "Qualify both replacements with temporary HTTP probes"
       timeoutInMinutes: 45
     retryCountOnTaskFailure: 0
     env:
@@ -127,7 +160,8 @@ steps:
       SUBSCRIPTION: ${{ parameters.scope.expected_subscription_id }}
       REGION: ${{ parameters.scope.expected_region }}
       TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
-      OBSERVATION_BUILD_ID: ${{ parameters.scope.observation_build_id }}
+      SOURCE_BUILD_ID: ${{ parameters.scope.observation_build_id }}
+      OBSERVATION_BUILD_ID: "79975"
       CAPACITY_BUILD_ID: ${{ parameters.scope.accepted_capacity_build_id }}
       OBSERVATION_DIRECTORY: $(Pipeline.Workspace)/capacity-qualification-observation
       CAPACITY_DIRECTORY: $(Pipeline.Workspace)/capacity-qualification-creation

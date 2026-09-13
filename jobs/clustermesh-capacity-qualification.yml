@@ -43,7 +43,8 @@ jobs:
             and .expected_region == "eastus2euap" and .expected_cluster_count == 100
             and .tfvars_path == "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars"
             and .overlay_mode == "resume-existing" and .run_workload == false
-            and .observation_build_id == 79975 and .accepted_capacity_build_id == 79971
+            and (.observation_build_id == 79975 or .observation_build_id == 79979)
+            and .accepted_capacity_build_id == 79971
             and .exclusive_modes == true' <<< "$QUALIFICATION_SCOPE_JSON" >/dev/null
         displayName: "Require exclusive existing-capacity qualification"
         env:
@@ -66,7 +67,10 @@ jobs:
           specificBuildWithTriggering: false
           buildVersionToDownload: specific
           pipelineId: ${{ parameters.observation_build_id }}
-          artifactName: n100-unreachable-worker-recovery-${{ parameters.observation_build_id }}-1
+          ${{ if eq(parameters.observation_build_id, 79979) }}:
+            artifactName: n100-capacity-qualification-79979-1
+          ${{ else }}:
+            artifactName: n100-unreachable-worker-recovery-${{ parameters.observation_build_id }}-1
           targetPath: $(Pipeline.Workspace)/capacity-qualification-observation
 
       - task: DownloadPipelineArtifact@2
