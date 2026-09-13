@@ -195,7 +195,11 @@ def vmss_contract(row):
 
 
 def pool_contract(row):
-    return arm.pool_configuration(row)
+    result = copy.deepcopy(arm.pool_configuration(row))
+    upgrades = result.get("upgradeSettings")
+    if isinstance(upgrades, dict) and upgrades.get("maxBlockedNodes") is None:
+        upgrades.pop("maxBlockedNodes", None)
+    return result
 
 
 def network_record(row, *, allow_pending=False):

@@ -1043,3 +1043,22 @@ def test_invalid_quota_counters_fail_with_raw_read_evidence(environment, invalid
     saved = read_receipt(args)
     assert saved["capacity_diagnostics"]["usage"][0]["currentValue"] == invalid
     assert saved["mutation_started"] is False and not cloud.adds
+
+
+def test_new_nullable_upgrade_field_does_not_change_pool_configuration(environment):
+    tmp_path, source, cloud = environment
+    for state in cloud.states.values():
+        for row in state["pools"]:
+            row["upgradeSettings"]["maxBlockedNodes"] = None
+    summary = {}
+    recovery.execute_recovery(make_args(tmp_path, source, name="nullable-upgrade.json"), summary, cloud)
+    assert summary["plan_valid"] and not cloud.adds
+
+
+@pytest.mark.parametrize("value", [0, 1, "0", "10%"])
+def test_explicit_blocked_node_upgrade_setting_is_not_ignored(environment, value):
+    tmp_path, source, cloud = environment
+    cloud.states["mesh-51"]["pools"][1]["upgradeSettings"]["maxBlockedNodes"] = value
+    with pytest.raises(recovery.workers.ReconcileError, match="pool configuration changed"):
+        recovery.execute_recovery(make_args(tmp_path, source, name="changed-upgrade.json"), {}, cloud)
+    assert not cloud.adds
