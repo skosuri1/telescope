@@ -1392,7 +1392,10 @@ class RoleQualification(maintenance.ClusterOperator):
             renewed = timestamp(spec.get("renewTime"), f"{self.role}/{name} lease renewal")
             require(
                 metadata.get("namespace") == "kube-node-lease"
-                and len(owners) == 1 and owners[0].get("controller") is True
+                and len(owners) == len(metadata.get("ownerReferences") or []) == 1
+                and (owners[0].get("controller") is None
+                     or isinstance(owners[0]["controller"], bool))
+                and not metadata.get("deletionTimestamp")
                 and isinstance(spec.get("holderIdentity"), str)
                 and bool(spec["holderIdentity"])
                 and isinstance(duration, int) and not isinstance(duration, bool)

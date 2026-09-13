@@ -1261,3 +1261,49 @@ def test_same_pending_operator_uid_can_only_gain_its_approved_assignment(tmp_pat
     else:
         with pytest.raises(qualification.workers.ReconcileError):
             qualification._monitoring_pins(root, "mesh-89", recorded)
+
+
+@pytest.mark.parametrize("controller", [None, False, True])
+def test_kwok_node_lease_owner_does_not_require_managing_controller_flag(environment, controller):
+    tmp_path, inputs, cloud = environment
+    snapshot = {"kwok_leases": copy.deepcopy(cloud.states["mesh-51"]["leases"])}
+    for row in snapshot["kwok_leases"]["items"]:
+        if controller is None:
+            row["metadata"]["ownerReferences"][0].pop("controller", None)
+        else:
+            row["metadata"]["ownerReferences"][0]["controller"] = controller
+    operation = qualification.RoleQualification(
+        make_args(tmp_path, inputs, name="leases.json"), inputs, "mesh-51", {},
+        cloud, cloud.delete_pod,
+    )
+    evidence = operation._kwok_lease_evidence(snapshot)
+    assert len(evidence) == 100
+    assert all(row["owner"].get("controller") is controller for row in evidence.values())
+
+
+@pytest.mark.parametrize("fault", ["owner-uid", "extra-owner", "flag-type", "deleting", "stale", "holder"])
+def test_kwok_lease_identity_lifecycle_and_freshness_remain_strict(environment, fault):
+    tmp_path, inputs, cloud = environment
+    snapshot = {"kwok_leases": copy.deepcopy(cloud.states["mesh-51"]["leases"])}
+    row = snapshot["kwok_leases"]["items"][0]
+    row["metadata"]["ownerReferences"][0].pop("controller", None)
+    if fault == "owner-uid":
+        row["metadata"]["ownerReferences"][0]["uid"] = uid("wrong-node")
+    elif fault == "extra-owner":
+        row["metadata"]["ownerReferences"].append({
+            "kind": "ConfigMap", "name": "another-owner", "uid": uid("other"),
+        })
+    elif fault == "flag-type":
+        row["metadata"]["ownerReferences"][0]["controller"] = "true"
+    elif fault == "deleting":
+        row["metadata"]["deletionTimestamp"] = qualification.utc_now()
+    elif fault == "stale":
+        row["spec"]["renewTime"] = "2020-01-01T00:00:00Z"
+    else:
+        row["spec"]["holderIdentity"] = ""
+    operation = qualification.RoleQualification(
+        make_args(tmp_path, inputs, name=f"lease-{fault}.json"), inputs, "mesh-51", {},
+        cloud, cloud.delete_pod,
+    )
+    with pytest.raises(qualification.workers.ReconcileError):
+        operation._kwok_lease_evidence(snapshot)
