@@ -1,0 +1,119 @@
+parameters:
+  - name: phase
+    type: string
+    values:
+      - plan
+      - execute
+  - name: scope
+    type: object
+
+steps:
+  - script: |
+      set -euo pipefail
+      umask 077
+      directory="$ARTIFACT_DIRECTORY/n100-secondary-capacity"
+      snapshot_hashes() {
+        test -d "$directory/source-input"
+        test ! -L "$directory/source-input"
+        if find "$directory/source-input" -type l -print -quit | grep -q .; then
+          echo "Capacity source contains a symlink." >&2
+          return 1
+        fi
+        (cd "$directory/source-input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
+      }
+      if [ "$PHASE" = "plan" ]; then
+        python3 - "$SOURCE_DIRECTORY" "$directory" <<'PY'
+      import sys
+      from pathlib import Path
+      source, output = (Path(value) for value in sys.argv[1:])
+      if source.is_symlink() or not source.is_dir() or any(path.is_symlink() for path in source.rglob("*")):
+          raise SystemExit("Capacity source must be a complete non-symlinked directory.")
+      source, output = source.resolve(), output.resolve()
+      if source == output or source in output.parents or output in source.parents or output.exists():
+          raise SystemExit("Capacity output must be new and disjoint from source evidence.")
+      PY
+        jq -e '.read_only == true and .resource_mutations == 0 and .source_build_id == 80017' \
+          "$SOURCE_DIRECTORY/summary.json" >/dev/null
+        mkdir -p "$ARTIFACT_DIRECTORY"
+        mkdir "$directory"
+        echo "##vso[task.setvariable variable=SECONDARY_CAPACITY_DIAGNOSTICS_READY]true"
+        cp -R -- "$SOURCE_DIRECTORY" "$directory/source-input"
+        snapshot_hashes > "$directory/inputs.sha256"
+        inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
+        tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
+        echo "##vso[task.setvariable variable=SECONDARY_CAPACITY_INPUTS_SHA;isReadOnly=true]$inputs_sha"
+        echo "##vso[task.setvariable variable=SECONDARY_CAPACITY_TFVARS_SHA;isReadOnly=true]$tfvars_sha"
+      elif [ "$PHASE" = "execute" ]; then
+        [[ "$INPUTS_SHA" =~ ^[0-9a-f]{64}$ ]] && [[ "$TFVARS_SHA" =~ ^[0-9a-f]{64}$ ]]
+        inputs_sha="$INPUTS_SHA"
+        tfvars_sha="$TFVARS_SHA"
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+          "$directory/plan.json" >/dev/null
+      else
+        echo "Unknown capacity phase." >&2
+        exit 1
+      fi
+      verify_inputs() {
+        snapshot_hashes > "$directory/inputs-$PHASE.sha256"
+        if [ "$(sha256sum "$directory/inputs-$PHASE.sha256" | awk '{print $1}')" != "$inputs_sha" ] ||
+          [ "$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')" != "$tfvars_sha" ]; then
+          echo "Capacity inputs changed; no further action is authorized." >&2
+          return 1
+        fi
+      }
+      verify_inputs
+      private="$AGENT_TEMP_DIRECTORY/secondary-capacity.$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+      mkdir -m 700 -- "$private"
+      cleanup() {
+        rm -f -- "$private/mesh-51.config" "$private/mesh-66.config" "$private/mesh-79.config" "$private/mesh-89.config"
+        rmdir -- "$private"
+      }
+      trap cleanup EXIT
+      for number in 51 66 79 89; do
+        timeout 120 az aks get-credentials --subscription "$SUBSCRIPTION" --resource-group "$RUN_ID" \
+          --name "clustermesh-$number" --file "$private/mesh-$number.config" \
+          --context "clustermesh-$number" --only-show-errors
+        chmod 600 "$private/mesh-$number.config"
+      done
+      args=(
+        --source-directory "$directory/source-input" --source-build-id "$SOURCE_BUILD_ID"
+        --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
+        --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
+        --expected-tfvars-sha "$tfvars_sha" --kubeconfig-directory "$private"
+        --timeout-seconds 7200
+      )
+      if [ "$PHASE" = "plan" ]; then
+        args+=(--summary-file "$directory/plan.json")
+      else
+        args+=(--summary-file "$directory/recovery.json" --execute)
+      fi
+      python3 -u "$REPOSITORY_DIRECTORY/modules/python/clusterloader2/clustermesh-scale/secondary_capacity_recovery.py" "${args[@]}"
+      verify_inputs
+      if [ "$PHASE" = "plan" ]; then
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' "$directory/plan.json" >/dev/null
+      else
+        jq -e '.execute == true and .success == true and .workloads_ready == false
+          and .capacity_created == true and .initial_network_ready == true
+          and .capacity_qualified == false and .completed_global_baseline == false' "$directory/recovery.json" >/dev/null
+      fi
+    ${{ if eq(parameters.phase, 'plan') }}:
+      displayName: "Plan replacement capacity without touching existing workers"
+      timeoutInMinutes: 25
+    ${{ else }}:
+      displayName: "Add only supported replacement pools and observe their readiness"
+      timeoutInMinutes: 125
+    retryCountOnTaskFailure: 0
+    env:
+      PHASE: ${{ parameters.phase }}
+      RUN_ID: ${{ parameters.scope.target_run_id }}
+      CONFIRM_RESUME: ${{ parameters.scope.confirm_resume }}
+      SUBSCRIPTION: ${{ parameters.scope.expected_subscription_id }}
+      REGION: ${{ parameters.scope.expected_region }}
+      TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
+      SOURCE_BUILD_ID: ${{ parameters.scope.source_build_id }}
+      SOURCE_DIRECTORY: $(Pipeline.Workspace)/secondary-capacity-source
+      ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
+      REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
+      AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)
+      INPUTS_SHA: $(SECONDARY_CAPACITY_INPUTS_SHA)
+      TFVARS_SHA: $(SECONDARY_CAPACITY_TFVARS_SHA)

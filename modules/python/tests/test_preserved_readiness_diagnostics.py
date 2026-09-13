@@ -139,4 +139,4 @@ def test_diagnostic_route_is_a_readonly_alternative_not_an_additional_maintenanc
     diagnostic = branches[0]["${{ if eq(parameters.scaleDebugPostRetirementPromBuildId, 80017) }}"][0]
     assert diagnostic["template"] == "/jobs/clustermesh-readiness-diagnostics.yml"
     assert diagnostic["parameters"]["source_build_id"] == "${{ parameters.scaleDebugPostRetirementPromBuildId }}"
-    assert branches[1]["${{ else }}"][0]["template"] == "/jobs/clustermesh-post-retirement-prom.yml"
+    assert next(row["${{ else }}"][0] for row in branches if "${{ else }}" in row)["template"] == "/jobs/clustermesh-post-retirement-prom.yml"

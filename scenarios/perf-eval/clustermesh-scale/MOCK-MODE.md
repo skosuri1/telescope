@@ -361,6 +361,14 @@ operations, never restarts or deletes resources, and does not claim healthy
 workloads from collected diagnostics. Other maintenance modes and workloads
 must remain disabled for this diagnostic run.
 
+`scaleDebugPostRetirementPromBuildId=80022` selects capacity-only recovery for
+the four terminally failed hosts diagnosed there. It adds `cniv5` System pools
+of two DSv5 workers to meshes 51, 66, and 79, and one dedicated `promv5` User
+worker to mesh 89. No old worker or production Pod is deleted in this phase.
+Initial Node/NNC/guest readiness is not network-growth or workload-placement
+qualification; that evidence and complete owned-probe cleanup are required
+before later native fencing.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,
