@@ -394,6 +394,16 @@ Successful qualification requires complete owned-probe cleanup and captures
 controller, PDB, KWOK lease, and worker identities for a later native-fencing
 decision. It does not claim a completed global baseline or workload results.
 
+`scaleDebugPostRetirementPromBuildId=80046` selects a read-only CNS comparison
+after the partial qualification. It preserves the completed System-worker proofs
+and all qualification journals, and does not repeat probes. It compares mesh 89's
+new monitoring worker with mesh 2's healthy and IP-blocked workers using NNCs,
+events, logs, metrics, and the reviewed CNS v1.8.12 diagnostic client
+(`--debugcmd get --debugarg all --log-target stdout`). That client exits before
+daemon startup; no restart, configuration update, IP allocation/release, or
+resource deletion is permitted. Authentication material in diagnostics is
+redacted. Diagnostic completion does not claim healthy networking or workloads.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,

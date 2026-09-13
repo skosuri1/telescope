@@ -1,0 +1,93 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: confirm_resume
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: tfvars_path
+    type: string
+  - name: overlay_mode
+    type: string
+  - name: run_workload
+    type: boolean
+  - name: source_build_id
+    type: number
+  - name: exclusive_modes
+    type: boolean
+
+jobs:
+  - job: secondary_cns_diagnostics
+    displayName: "Read CNS IP programming state without resource changes"
+    timeoutInMinutes: 35
+    cancelTimeoutInMinutes: 5
+    variables:
+      SCENARIO_NAME: clustermesh-scale
+      CLUSTER_COUNT: "100"
+      SUITE_TOTAL_BUDGET_SECONDS: "0"
+      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "35"
+      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "5"
+      AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
+    steps:
+      - script: |
+          set -euo pipefail
+          jq -e '
+            .target_run_id == "78751-f36f3d5a" and .confirm_resume == .target_run_id
+            and .expected_subscription_id == "37deca37-c375-4a14-b90a-043849bd2bf1"
+            and .expected_region == "eastus2euap" and .expected_cluster_count == 100
+            and .tfvars_path == "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars"
+            and .overlay_mode == "resume-existing" and .run_workload == false
+            and .source_build_id == 80046 and .exclusive_modes == true' <<< "$SCOPE_JSON" >/dev/null
+        displayName: "Require exact read-only CNS diagnostic source and scope"
+        env:
+          SCOPE_JSON: ${{ convertToJson(parameters) }}
+      - template: /steps/setup-tests.yml
+        parameters:
+          cloud: azure
+          region: ${{ parameters.expected_region }}
+          run_id: ${{ parameters.target_run_id }}
+          credential_type: service_connection
+          ssh_key_enabled: false
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download whole partial qualification and cleanup evidence"
+        inputs:
+          buildType: specific
+          project: $(System.TeamProjectId)
+          definition: 23
+          specificBuildWithTriggering: false
+          buildVersionToDownload: specific
+          pipelineId: ${{ parameters.source_build_id }}
+          allowFailedBuilds: true
+          artifactName: n100-secondary-qualification-${{ parameters.source_build_id }}-1
+          targetPath: $(Pipeline.Workspace)/secondary-cns-source
+      - script: |
+          set -euo pipefail
+          umask 077
+          expected_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
+          timeout 1200 python3 -u \
+            "$REPOSITORY_DIRECTORY/modules/python/clusterloader2/clustermesh-scale/secondary_cns_diagnostics.py" \
+            --source-directory "$SOURCE_DIRECTORY" --source-build-id 80046 \
+            --expected-tfvars-sha "$expected_sha" \
+            --output-directory "$ARTIFACT_DIRECTORY/n100-secondary-cns-diagnostics"
+          jq -e '.read_only == true and .resource_mutations == 0 and .health_claimed == false
+            and .diagnostics_collected == true' \
+            "$ARTIFACT_DIRECTORY/n100-secondary-cns-diagnostics/summary.json" >/dev/null
+        displayName: "Compare NNC allocations with CNS local IP states, logs, and metrics"
+        timeoutInMinutes: 25
+        retryCountOnTaskFailure: 0
+        env:
+          REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
+          TFVARS_PATH: ${{ parameters.tfvars_path }}
+          SOURCE_DIRECTORY: $(Pipeline.Workspace)/secondary-cns-source
+          ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
+          TMPDIR: $(Agent.TempDirectory)
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish CNS diagnosis without claiming recovery"
+        condition: always()
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/n100-secondary-cns-diagnostics
+          artifact: n100-secondary-cns-diagnostics-$(Build.BuildId)-$(System.JobAttempt)
