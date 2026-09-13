@@ -67,7 +67,10 @@ jobs:
           specificBuildWithTriggering: false
           buildVersionToDownload: specific
           pipelineId: ${{ parameters.source_state_build_id }}
-          artifactName: n100-unreachable-worker-recovery-${{ parameters.source_state_build_id }}-1
+          ${{ if eq(parameters.source_state_build_id, 79959) }}:
+            artifactName: n100-capacity-first-79959-1
+          ${{ else }}:
+            artifactName: n100-unreachable-worker-recovery-${{ parameters.source_state_build_id }}-1
           targetPath: $(Pipeline.Workspace)/capacity-first-source
 
       - task: DownloadPipelineArtifact@2
@@ -86,22 +89,62 @@ jobs:
           set -euo pipefail
           umask 077
           directory="$ARTIFACT_DIRECTORY/n100-capacity-first"
-          mkdir -p "$directory"
-          echo "##vso[task.setvariable variable=CAPACITY_FIRST_DIAGNOSTICS_READY]true"
-          cp -R "$SOURCE_DIRECTORY" "$directory/source-state"
-          source="$directory/source-state"
-          if find "$source" -type l -print -quit | grep -q .; then
+          python3 - "$SOURCE_DIRECTORY" "$RESTART_DIRECTORY" "$directory" <<'PY'
+          import sys
+          from pathlib import Path
+          source, restart, output = (Path(value).resolve() for value in sys.argv[1:])
+          for original in (source, restart):
+              if original == output or original in output.parents or output in original.parents:
+                  raise SystemExit("Capacity outputs must be disjoint from all downloaded inputs.")
+          if output.exists():
+              raise SystemExit("Existing capacity output directory cannot be reused.")
+          PY
+          original_source="$SOURCE_DIRECTORY"
+          resume_args=()
+          prior_capacity_sha=""
+          if [ "$SOURCE_STATE_BUILD_ID" = "79959" ]; then
+            original_source="$SOURCE_DIRECTORY/source-state"
+            test -d "$original_source"
+            test ! -L "$original_source"
+            test -f "$SOURCE_DIRECTORY/recovery.json"
+            test ! -L "$SOURCE_DIRECTORY/recovery.json"
+            jq -e '
+              .create.submission_started == false
+              and (.create | has("accepted")) and .create.accepted == null
+              and .journal.uid == "1e3b51d5-83d4-406d-bb38-4ead04e1c425"
+            ' "$SOURCE_DIRECTORY/recovery.json" >/dev/null
+          fi
+          test -d "$original_source"
+          test ! -L "$original_source"
+          test -f "$RESTART_DIRECTORY/recovery.json"
+          test ! -L "$RESTART_DIRECTORY/recovery.json"
+          if find "$original_source" -type l -print -quit | grep -q .; then
             echo "Capacity source evidence must contain regular files, not symlinks." >&2
             exit 1
           fi
-          cp "$RESTART_DIRECTORY/recovery.json" "$directory/accepted-restart.json"
+          mkdir -p "$ARTIFACT_DIRECTORY"
+          mkdir "$directory"
+          echo "##vso[task.setvariable variable=CAPACITY_FIRST_DIAGNOSTICS_READY]true"
+          cp -R -- "$original_source" "$directory/source-state"
+          source="$directory/source-state"
+          if [ "$SOURCE_STATE_BUILD_ID" = "79959" ]; then
+            cp -- "$SOURCE_DIRECTORY/recovery.json" "$directory/prior-capacity.json"
+            prior_capacity_sha=$(sha256sum "$directory/prior-capacity.json" | awk '{print $1}')
+            resume_args=(--resume-capacity-checkpoint "$directory/prior-capacity.json" --resume-build-id 79959)
+          fi
+          cp -- "$RESTART_DIRECTORY/recovery.json" "$directory/accepted-restart.json"
           restart_sha=$(sha256sum "$directory/accepted-restart.json" | awk '{print $1}')
           snapshot_hashes() {
+            if find "$source" -type l -print -quit | grep -q .; then
+              echo "Capacity source evidence acquired a symlink." >&2
+              return 1
+            fi
             (cd "$source" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
           }
           snapshot_hashes > "$directory/source-files.sha256"
           tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
-          private=$(mktemp -d "$AGENT_TEMP_DIRECTORY/capacity-first.XXXXXX")
+          private="$AGENT_TEMP_DIRECTORY/capacity-first.$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          mkdir -m 700 -- "$private"
           cleanup() {
             rm -f -- "$private/cluster.config"
             rmdir -- "$private"
@@ -117,11 +160,23 @@ jobs:
             --expected-tfvars-sha "$tfvars_sha" --source-state-directory "$source"
             --restart-checkpoint "$directory/accepted-restart.json"
             --kubeconfig "$private/cluster.config" --context clustermesh-96 --timeout-seconds 2400
+            "${resume_args[@]}"
           )
           python3 -u "$helper" "${args[@]}" --summary-file "$directory/plan.json"
           jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
             "$directory/plan.json" >/dev/null
           snapshot_hashes > "$directory/source-files-after-plan.sha256"
+          test -f "$directory/accepted-restart.json"
+          test ! -L "$directory/accepted-restart.json"
+          if [ "$SOURCE_STATE_BUILD_ID" = "79959" ]; then
+            test -f "$directory/prior-capacity.json"
+            test ! -L "$directory/prior-capacity.json"
+          fi
+          if [ "$SOURCE_STATE_BUILD_ID" = "79959" ] &&
+            [ "$(sha256sum "$directory/prior-capacity.json" | awk '{print $1}')" != "$prior_capacity_sha" ]; then
+            echo "Prior capacity checkpoint changed during planning; no continuation will be submitted." >&2
+            exit 1
+          fi
           if ! cmp -s "$directory/source-files.sha256" "$directory/source-files-after-plan.sha256" ||
             [ "$(sha256sum "$directory/accepted-restart.json" | awk '{print $1}')" != "$restart_sha" ] ||
             [ "$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')" != "$tfvars_sha" ]; then
@@ -138,6 +193,7 @@ jobs:
           REGION: ${{ parameters.expected_region }}
           TFVARS_PATH: ${{ parameters.tfvars_path }}
           SOURCE_DIRECTORY: $(Pipeline.Workspace)/capacity-first-source
+          SOURCE_STATE_BUILD_ID: ${{ parameters.source_state_build_id }}
           RESTART_DIRECTORY: $(Pipeline.Workspace)/capacity-first-restart
           ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
           REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s

@@ -58,6 +58,7 @@ class CapacityCloud(Cloud):
         self.add_calls = []
         self.add_error = False
         self.journal_create_error = False
+        self.created_journal_uid = None
         self.partial = False
         self.restart_receipt = None
         self.failure_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
@@ -166,9 +167,12 @@ class CapacityCloud(Cloud):
             if network_ready:
                 network["status"] = self.network_status(name)
             self.nncs.append(network)
-            for daemon in ("cilium", "azure-cns"):
+            for controller in self.controllers:
+                if controller["kind"] != "DaemonSet":
+                    continue
+                daemon = controller["metadata"]["name"]
                 self.pods.append(pod(f"{daemon}-{name}", "kube-system", name,
-                                     ref("DaemonSet", daemon, uid(f"kube-system/{daemon}"))))
+                                     ref("DaemonSet", daemon, controller["metadata"]["uid"])))
         self.new_scale["provisioningState"] = "Succeeded"
         self.pools[-1]["provisioningState"] = "Succeeded"
         self.new_aggregate["virtualMachine"]["statusesSummary"] = [{"code": "ProvisioningState/succeeded", "count": 2}]
@@ -219,7 +223,7 @@ class CapacityCloud(Cloud):
             assert self.value(command, "create") == "configmap" and capacity.JOURNAL in command
             assert capacity.JOURNAL not in self.journals
             self.journals[capacity.JOURNAL] = {
-                "metadata": metadata(capacity.JOURNAL, "kube-system"),
+                "metadata": metadata(capacity.JOURNAL, "kube-system", self.created_journal_uid),
                 "data": dict(entry.removeprefix("--from-literal=").split("=", 1)
                              for entry in command if entry.startswith("--from-literal=")),
             }
@@ -597,3 +601,285 @@ def test_owned_partial_vm_guest_metadata_waits_without_guessing_identity(environ
     monkeypatch.setattr(capacity.time, "sleep", advance)
     summary = run(environment, execute=True)
     assert summary["registered_nodes_ready"] and len(cloud.add_calls) == 1
+
+
+@pytest.fixture(name="reserved_environment")
+def setup_reserved_environment(environment):
+    args, cloud = environment
+    security = pod("azuresecuritylinuxagent-rh6nd", "kube-system", stalled.SOURCE,
+                   ref("DaemonSet", capacity.SECURITY_OWNER[1], capacity.SECURITY_OWNER[2]))
+    security["metadata"]["uid"] = capacity.ROLLED_SECURITY_POD_UID
+    security["spec"]["containers"][0]["env"] = [{"name": "TEST_TOKEN", "value": "fixture-only"}]
+    cloud.pods.append(security)
+    cloud.controllers.append({
+        "kind": "DaemonSet",
+        "metadata": metadata(capacity.SECURITY_OWNER[1], "kube-system", capacity.SECURITY_OWNER[2]),
+        "spec": {"template": {"spec": {"containers": [{"name": "container", "image": "pinned"}]}}},
+    })
+    root = Path(args.source_state_directory)
+    for name, rows in (("pods", cloud.pods), ("controllers", cloud.controllers)):
+        (root / f"current-{name}.json").write_text(json.dumps({"items": rows}), encoding="utf-8")
+    cloud.created_journal_uid = capacity.RESERVED_JOURNAL_UID
+
+    def terminate_after_reservation(command):
+        journal = cloud.journals.get(capacity.JOURNAL)
+        if "get" in command and cloud.value(command, "get") == "pods" and journal:
+            if json.loads(journal["data"]["create"])["attempted"]:
+                security["metadata"]["deletionTimestamp"] = now()
+
+    cloud.hook = terminate_after_reservation
+    with pytest.raises(capacity.workers.ReconcileError, match="protected healthy default0 Pod"):
+        run(environment, execute=True)
+    assert not cloud.add_calls
+    prior = cloud.receipt()
+    assert prior["create"]["submission_started"] is False
+    assert prior["journal"]["uid"] == capacity.RESERVED_JOURNAL_UID
+    args.resume_capacity_checkpoint = args.summary_file
+    args.resume_build_id = capacity.RESERVED_BUILD
+    args.summary_file = "continued-plan.json"
+    cloud.hook = None
+    cloud.commands.clear()
+    cloud.writes.clear()
+    return args, cloud
+
+
+def replace_security(cloud):
+    old = next(row for row in cloud.pods if row["metadata"]["uid"] == capacity.ROLLED_SECURITY_POD_UID)
+    replacement = copy.deepcopy(old)
+    replacement["metadata"].update(name="azuresecuritylinuxagent-new", uid=uid("security-replacement"))
+    replacement["metadata"].pop("deletionTimestamp")
+    cloud.pods.remove(old)
+    cloud.pods.append(replacement)
+    return replacement
+
+
+def test_reserved_plan_then_execute_preserves_journal_history_and_submits_once(reserved_environment):
+    args, cloud = reserved_environment
+    prior_bytes = Path(args.resume_capacity_checkpoint).read_bytes()
+    original_journal = copy.deepcopy(cloud.journals[capacity.JOURNAL])
+    restart_journal = copy.deepcopy(cloud.journals[stalled.JOURNAL])
+    plan = run(reserved_environment)
+    assert plan["plan_valid"] and not plan["mutation_started"] and not cloud.writes
+    assert cloud.journals[capacity.JOURNAL] == original_journal
+    args.summary_file = "continued-execute.json"
+    result = run(reserved_environment, execute=True)
+    current = cloud.journals[capacity.JOURNAL]
+    assert current["metadata"]["uid"] == capacity.RESERVED_JOURNAL_UID
+    assert current["data"]["token"] == original_journal["data"]["token"]
+    assert current["data"]["prior_unsubmitted_create"] == original_journal["data"]["create"]
+    assert current["data"]["prior_checkpoint_sha256"] == capacity.checkpoint_hash(args.resume_capacity_checkpoint)
+    assert current["data"]["prior_build_id"] == "79959"
+    assert Path(args.resume_capacity_checkpoint).read_bytes() == prior_bytes
+    assert cloud.journals[stalled.JOURNAL] == restart_journal
+    assert len(cloud.add_calls) == 1 and not any("create" in command for command in cloud.writes)
+    assert result["success"] and result["registered_nodes_ready"]
+    assert not result["workloads_ready"] and not result["capacity_qualified"]
+    assert not result["managed_security_rollout"]["healthy"]
+    args.summary_file = "refused-replay.json"
+    with pytest.raises(capacity.workers.ReconcileError):
+        run(reserved_environment, execute=True)
+    assert len(cloud.add_calls) == 1
+
+
+@pytest.mark.parametrize("transition", ["containers-stopping", "healthy-replacement"])
+def test_only_known_security_termination_or_healthy_controller_replacement_is_classified(reserved_environment, transition):
+    _, cloud = reserved_environment
+    if transition == "healthy-replacement":
+        security = replace_security(cloud)
+    else:
+        security = next(row for row in cloud.pods if row["metadata"]["uid"] == capacity.ROLLED_SECURITY_POD_UID)
+        security["status"]["conditions"][0]["status"] = "False"
+        security["status"]["containerStatuses"][0].update(ready=False, state={"terminated": {"exitCode": 0}})
+    result = run(reserved_environment, execute=True)
+    assert result["registered_nodes_ready"] and len(cloud.add_calls) == 1
+    assert result["managed_security_rollout"]["healthy"] == (transition == "healthy-replacement")
+    assert result["managed_security_rollout"]["caused_by_this_recovery"] is False
+    assert result["current_mock_ready"] == 38
+
+
+@pytest.mark.parametrize("fault", [
+    "submitted", "accepted", "accept-time", "missing-submit-flag", "other-error", "other-journal", "other-source",
+    "other-restart", "other-desired", "other-plan", "continued", "qualified", "prior-unready", "prior-spec",
+    "prior-owner", "prior-other-pod", "prior-controller", "prior-pdb",
+])
+def test_changed_or_delivered_reservation_receipt_is_rejected_before_calls(reserved_environment, fault):
+    args, cloud = reserved_environment
+    path = Path(args.resume_capacity_checkpoint)
+    prior = json.loads(path.read_text(encoding="utf-8"))
+    if fault == "submitted":
+        prior["create"]["submission_started"] = True
+    elif fault == "accepted":
+        prior["create"]["accepted"] = True
+    elif fault == "accept-time":
+        prior["create"]["accepted_at"] = now()
+    elif fault == "missing-submit-flag":
+        prior["create"].pop("submission_started")
+    elif fault == "other-error":
+        prior["error"] = "ReconcileError: unrelated failure"
+    elif fault == "other-journal":
+        prior["journal"]["uid"] = uid("different-journal")
+    elif fault == "other-source":
+        prior["source_state_sha256"] = "f" * 64
+    elif fault == "other-restart":
+        prior["restart_checkpoint_sha256"] = "f" * 64
+    elif fault == "other-desired":
+        prior["desired_pool"]["count"] = 3
+    elif fault == "other-plan":
+        prior["plan_sha256"] = "f" * 64
+    elif fault == "continued":
+        prior["continuation"] = {}
+    elif fault == "qualified":
+        prior["capacity_qualified"] = True
+    elif fault == "prior-controller":
+        prior["kubernetes_diagnostics"]["controllers"]["items"][0]["spec"]["replicas"] = 99
+    elif fault == "prior-pdb":
+        prior["kubernetes_diagnostics"]["pdbs"]["items"][0]["spec"]["minAvailable"] = 0
+    elif fault == "prior-other-pod":
+        prior["kubernetes_diagnostics"]["pods"]["items"][0]["metadata"]["uid"] = uid("different-mock")
+    else:
+        security = next(row for row in prior["kubernetes_diagnostics"]["pods"]["items"]
+                        if row["metadata"]["uid"] == capacity.ROLLED_SECURITY_POD_UID)
+        if fault == "prior-unready":
+            security["status"]["conditions"][0]["status"] = "False"
+        elif fault == "prior-spec":
+            security["spec"]["containers"][0]["image"] = "changed"
+        else:
+            security["metadata"]["ownerReferences"][0]["uid"] = uid("different-owner")
+    path.write_text(json.dumps(prior), encoding="utf-8")
+    with pytest.raises(capacity.workers.ReconcileError):
+        run(reserved_environment, execute=True)
+    assert not cloud.commands and not cloud.writes
+
+
+@pytest.mark.parametrize("fault", ["uid", "spec", "owner", "pvc", "deletion-time", "deletion-removed", "mock", "network"])
+def test_reserved_live_guard_does_not_waive_other_drift(reserved_environment, fault):
+    _, cloud = reserved_environment
+    security = next(row for row in cloud.pods if row["metadata"]["uid"] == capacity.ROLLED_SECURITY_POD_UID)
+    if fault == "uid":
+        security["metadata"]["uid"] = uid("different-old-security")
+    elif fault == "spec":
+        security["spec"]["containers"][0]["image"] = "changed"
+    elif fault == "owner":
+        security["metadata"]["ownerReferences"][0]["uid"] = uid("other-owner")
+    elif fault == "pvc":
+        security["spec"]["volumes"].append({"name": "claim", "persistentVolumeClaim": {"claimName": "data"}})
+    elif fault == "deletion-time":
+        security["metadata"]["deletionTimestamp"] = "2026-09-01T00:00:00Z"
+    elif fault == "deletion-removed":
+        security["metadata"].pop("deletionTimestamp")
+    elif fault == "mock":
+        cloud.pods[39]["spec"]["containers"][0]["image"] = "changed"
+    else:
+        next(row for row in cloud.pods if row["metadata"]["name"] == f"cilium-{stalled.SOURCE}")[
+            "status"]["conditions"][0]["status"] = "False"
+    with pytest.raises(capacity.workers.ReconcileError):
+        run(reserved_environment, execute=True)
+    assert not cloud.writes and not cloud.add_calls
+
+
+@pytest.mark.parametrize("fault", ["missing", "unready", "owner", "multiple-owners", "duplicate", "pvc", "terminating"])
+def test_security_replacement_must_be_single_healthy_and_exactly_owned(reserved_environment, fault):
+    _, cloud = reserved_environment
+    security = replace_security(cloud)
+    if fault == "missing":
+        cloud.pods.remove(security)
+    elif fault == "unready":
+        security["status"]["conditions"][0]["status"] = "False"
+    elif fault == "owner":
+        security["metadata"]["ownerReferences"][0]["uid"] = uid("different-owner")
+    elif fault == "multiple-owners":
+        security["metadata"]["ownerReferences"].append(ref("DaemonSet", "different", uid("different-owner")))
+    elif fault == "duplicate":
+        duplicate = copy.deepcopy(security)
+        duplicate["metadata"].update(name="azuresecuritylinuxagent-second", uid=uid("second-security"))
+        duplicate["status"]["conditions"][0]["status"] = "False"
+        cloud.pods.append(duplicate)
+    elif fault == "pvc":
+        security["spec"]["volumes"].append({"name": "claim", "persistentVolumeClaim": {"claimName": "data"}})
+    else:
+        security["metadata"]["deletionTimestamp"] = now()
+    with pytest.raises(capacity.workers.ReconcileError):
+        run(reserved_environment, execute=True)
+    assert not cloud.writes and not cloud.add_calls
+
+
+@pytest.mark.parametrize("fault", ["missing", "uid", "token", "owner", "create", "continued", "deleting", "owned"])
+def test_continuation_requires_exact_unchanged_existing_journal(reserved_environment, fault):
+    _, cloud = reserved_environment
+    journal = cloud.journals[capacity.JOURNAL]
+    if fault == "missing":
+        del cloud.journals[capacity.JOURNAL]
+    elif fault == "uid":
+        journal["metadata"]["uid"] = uid("different-journal")
+    elif fault in ("token", "owner", "create"):
+        journal["data"][fault] = "changed"
+    elif fault == "continued":
+        journal["data"]["prior_build_id"] = "79959"
+    elif fault == "deleting":
+        journal["metadata"]["deletionTimestamp"] = now()
+    else:
+        journal["metadata"]["ownerReferences"] = [ref("Node", stalled.SOURCE, base.REAL_UIDS[stalled.SOURCE])]
+    with pytest.raises(capacity.workers.ReconcileError):
+        run(reserved_environment, execute=True)
+    assert not cloud.writes and not cloud.add_calls
+
+
+@pytest.mark.parametrize("fault", ["prior-hash", "cas-conflict"])
+def test_continuation_stops_before_add_on_checkpoint_or_cas_change(reserved_environment, fault):
+    args, cloud = reserved_environment
+    original = cloud.kube
+
+    def change(command):
+        if "patch" in command:
+            if fault == "cas-conflict":
+                raise capacity.workers.ReconcileError("JSON patch resourceVersion test failed")
+            path = Path(args.resume_capacity_checkpoint)
+            path.write_bytes(path.read_bytes() + b"\n")
+        return original(command)
+
+    cloud.kube = change
+    with pytest.raises(capacity.workers.ReconcileError):
+        run(reserved_environment, execute=True)
+    assert not cloud.add_calls
+    assert cloud.journals[capacity.JOURNAL]["metadata"]["uid"] == capacity.RESERVED_JOURNAL_UID
+
+
+@pytest.mark.parametrize("fault", ["response-lost", "partial-timeout"])
+def test_accepted_or_ambiguous_continuation_never_repeats_add(reserved_environment, monkeypatch, fault):
+    args, cloud = reserved_environment
+    if fault == "response-lost":
+        cloud.add_error = True
+    else:
+        clock = [capacity.time.monotonic()]
+        monkeypatch.setattr(capacity.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(capacity.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + max(seconds, 1800)))
+        cloud.partial = True
+    with pytest.raises(capacity.workers.ReconcileError):
+        run(reserved_environment, execute=True)
+    assert len(cloud.add_calls) == 1
+    result = cloud.receipt()
+    assert result["create"]["submission_started"] is True
+    assert not result["success"] and not result["registered_nodes_ready"] and not result["workloads_ready"]
+    args.summary_file = "refused-after-submission.json"
+    with pytest.raises(capacity.workers.ReconcileError):
+        run(reserved_environment, execute=True)
+    assert len(cloud.add_calls) == 1
+    assert not any("delete" in command or "restart" in command for command in cloud.writes)
+
+
+@pytest.mark.parametrize("fault", ["wrong-build", "missing-checkpoint", "missing-build", "output-is-input", "output-in-source"])
+def test_continuation_cli_cannot_fall_back_or_overwrite_inputs(reserved_environment, fault):
+    args, cloud = reserved_environment
+    if fault == "wrong-build":
+        args.resume_build_id = 79957
+    elif fault == "missing-checkpoint":
+        args.resume_capacity_checkpoint = None
+    elif fault == "missing-build":
+        args.resume_build_id = 0
+    elif fault == "output-is-input":
+        args.summary_file = args.resume_capacity_checkpoint = "nonexistent-prior.json"
+    else:
+        args.summary_file = str(Path(args.source_state_directory) / "new-output.json")
+    with pytest.raises(capacity.workers.ReconcileError):
+        run(reserved_environment, execute=True)
+    assert not cloud.commands and not cloud.writes and not Path(args.summary_file).exists()

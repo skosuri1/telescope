@@ -275,6 +275,20 @@ moves mock or framework Pods. Registration evidence is not full IP-growth,
 memory, bootstrap, fencing, or workload qualification. Those remain required
 before any later movement or failure-scenario execution.
 
+The specific capacity source build `79959` selects continuation of its **unsent**
+reservation, not a fresh creation attempt. The job downloads
+`n100-capacity-first-79959-1`, uses its nested `source-state/` as the original
+`79955` observation, and copies its `recovery.json` to an independent
+`prior-capacity.json` checkpoint. It still downloads the accepted restart receipt
+from `79950` separately. Both plan and execute receive
+`--resume-capacity-checkpoint PATH --resume-build-id 79959`; source files, restart
+receipt, prior-capacity checkpoint, and tfvars are independently checked for
+changes before execution. The existing journal UID
+`1e3b51d5-83d4-406d-bb38-4ead04e1c425` must be preserved. Missing nested inputs,
+a submitted/accepted Azure add, or changed evidence fails closed—there is no
+fallback to a new journal or original creation. All normal fresh safety gates
+still apply, and the mutation task has zero retries.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,

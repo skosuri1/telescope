@@ -41,6 +41,10 @@ RESTART_OPERATION = "Microsoft.Compute/virtualMachineScaleSets/restart/action"
 RESTART_JOURNAL_UID = "55117c2c-db51-41b2-b8ec-12fc9d357501"
 CREATING = {"Creating", "Updating"}
 EXTRA_FILES = ("default-vmss-activity-log.json", "default-vmss-instance-view.json")
+RESERVED_BUILD = 79959
+RESERVED_JOURNAL_UID = "1e3b51d5-83d4-406d-bb38-4ead04e1c425"
+ROLLED_SECURITY_POD_UID = "b03b9e77-57f1-4bf9-96b4-e43413892bc4"
+SECURITY_OWNER = ("kube-system", "azuresecuritylinuxagent", stalled.SECURITY_DAEMONSET_UID)
 require = prepared.require
 digest = base.digest
 uid = base.object_uid
@@ -56,7 +60,7 @@ def counter(value):
 def checkpoint_hash(path):
     value = Path(path)
     require(value.is_file() and not value.is_symlink() and value.stat().st_size <= 32 * 1024 * 1024,
-            "Restart checkpoint must be a bounded regular file")
+            "Recovery checkpoint must be a bounded regular file")
     return hashlib.sha256(value.read_bytes()).hexdigest()
 
 
@@ -186,10 +190,75 @@ def add_command(patch):
     ]
 
 
+def load_capacity_reservation(args, data, hashes, receipt_hash):
+    path = getattr(args, "resume_capacity_checkpoint", None)
+    if not path:
+        return None, ""
+    checksum = checkpoint_hash(path)
+    prior = stalled.read_json(path)
+    create, journal = prior.get("create") or {}, prior.get("journal") or {}
+    require(getattr(args, "resume_build_id", 0) == RESERVED_BUILD
+            and prior.get("schema_version") == 1 and prior.get("status") == "failed-closed"
+            and prior.get("phase") == "capacity-first-registration-only" and prior.get("execute") is True
+            and prior.get("plan_sha256") == stalled.PLAN_SHA
+            and prior.get("mutation_started") is True and prior.get("plan_valid") is True
+            and prior.get("success") is False and prior.get("pool_created") is False
+            and prior.get("registered_nodes_ready") is False and prior.get("workloads_ready") is False
+            and prior.get("capacity_qualified") is False and prior.get("bootstrap_complete") is False
+            and prior.get("actual_ip_growth_proven") is False and prior.get("actual_memory_headroom_proven") is False
+            and "continuation" not in prior
+            and prior.get("error") == "ReconcileError: A protected healthy default0 Pod UID/spec/readiness changed"
+            and prior.get("source_hashes") == hashes and prior.get("source_state_sha256") == digest(hashes)
+            and prior.get("restart_checkpoint_sha256") == receipt_hash,
+            "Only build 79959's exact unsubmitted capacity reservation may continue")
+    version = (prior.get("desired_pool") or {}).get("orchestratorVersion")
+    require(isinstance(version, str) and re.fullmatch(r"[1-9]\d*\.\d+\.\d+", version)
+            and prior["desired_pool"] == pool_settings(version)
+            and create.get("attempted") is True and create.get("submission_started") is False
+            and create.get("accepted") is None and create.get("ambiguous") is True
+            and create.get("automatic_retry_allowed") is False and not create.get("registration_proven")
+            and "accepted_at" not in create and create.get("command") == add_command(version)
+            and journal.get("uid") == RESERVED_JOURNAL_UID and journal.get("name") == JOURNAL
+            and journal.get("namespace") == "kube-system" and journal.get("attempted") is True
+            and journal.get("accepted") is True and journal.get("ambiguous") is False,
+            "Submitted, accepted, ambiguous-delivery or differently owned pool adds cannot be replayed")
+    snapshot = prior.get("kubernetes_diagnostics") or {}
+    source_pods = {uid(pod): pod for pod in data["current-pods.json"]["items"]}
+    current = {uid(pod): pod for pod in snapshot["pods"]["items"]}
+    old = source_pods.get(ROLLED_SECURITY_POD_UID)
+    observed = current.get(ROLLED_SECURITY_POD_UID)
+    ready_at_stop = copy.deepcopy(observed or {})
+    ready_at_stop.get("metadata", {}).pop("deletionTimestamp", None)
+    require(old is not None and observed is not None and base.pod_ready(old)
+            and observed["metadata"].get("deletionTimestamp")
+            and base.pod_ready(ready_at_stop) and base.pvc_free(observed["spec"])
+            and stalled.pod_pin(observed) == stalled.pod_pin(stalled.safe_diagnostics(old))
+            and observed["metadata"].get("namespace") == SECURITY_OWNER[0]
+            and base.controller_owner(observed, "DaemonSet")["name"] == SECURITY_OWNER[1]
+            and base.controller_owner(observed, "DaemonSet")["uid"] == SECURITY_OWNER[2]
+            and observed["spec"].get("nodeName") == stalled.SOURCE,
+            "Prior stop is not the captured controller-owned security Pod termination")
+    require(stalled.controllers_pin(snapshot["controllers"]) == stalled.controllers_pin(
+                stalled.safe_diagnostics(data["current-controllers.json"]))
+            and base.frozen_pdbs(snapshot) == base.frozen_pdbs({"pdbs": data["current-pdbs.json"]}),
+            "Prior controller or PDB configuration changed")
+    for pod_uid, original in source_pods.items():
+        if original["spec"].get("nodeName") == stalled.SOURCE and base.pod_ready(original) and pod_uid != ROLLED_SECURITY_POD_UID:
+            require(pod_uid in current and base.pod_ready(current[pod_uid])
+                    and stalled.pod_pin(current[pod_uid]) == stalled.pod_pin(stalled.safe_diagnostics(original)),
+                    "The prior failure included an unrelated protected workload change")
+    require(base.timestamp(prior.get("started_at"), "capacity execution start")
+            <= base.timestamp(create.get("requested_at"), "capacity reservation")
+            <= base.timestamp(prior.get("finished_at"), "pre-submit failure") <= datetime.now(timezone.utc),
+            "Prior capacity reservation timestamps are invalid")
+    require(checkpoint_hash(path) == checksum, "Capacity reservation checkpoint changed while validating")
+    return prior, checksum
+
+
 class CapacityFirst(maintenance.ClusterOperator):
     """One journal, one cniv5 add, no existing-node or workload writes."""
 
-    def __init__(self, args, data, hashes, receipt_hash, proof, summary, runner):
+    def __init__(self, args, data, hashes, receipt_hash, proof, summary, runner, *, resume=None, resume_hash=""):
         deadline = time.monotonic() + args.timeout_seconds
         super().__init__(args, base.CLUSTER, runner, deadline - 60, deadline)
         self.data, self.hashes, self.receipt_hash, self.proof, self.summary = data, hashes, receipt_hash, proof, summary
@@ -212,6 +281,11 @@ class CapacityFirst(maintenance.ClusterOperator):
         self.new_vms, self.new_nodes, self.new_nncs = {}, {}, {}
         self.new_boots, self.new_containers = {}, {}
         self.persisted_journal_data = None
+        self.resume, self.resume_hash = resume, resume_hash
+        self.security_deletion = next(
+            pod["metadata"]["deletionTimestamp"] for pod in resume["kubernetes_diagnostics"]["pods"]["items"]
+            if uid(pod) == ROLLED_SECURITY_POD_UID
+        ) if resume else ""
 
     def save(self):
         mocks.write_json_atomic(self.args.summary_file, self.summary)
@@ -220,6 +294,9 @@ class CapacityFirst(maintenance.ClusterOperator):
         require(stalled.file_hashes(self.args.source_state_directory) == self.hashes
                 and checkpoint_hash(self.args.restart_checkpoint) == self.receipt_hash,
                 "Immutable observation/restart checkpoint hashes changed")
+        if self.resume:
+            require(checkpoint_hash(self.args.resume_capacity_checkpoint) == self.resume_hash,
+                    "Immutable prior capacity reservation changed")
 
     def run(self, command, timeout_seconds=45, *, cleanup=False):
         command = list(command)
@@ -553,6 +630,39 @@ class CapacityFirst(maintenance.ClusterOperator):
             if pod["spec"].get("nodeName") == stalled.SOURCE and base.pod_ready(pod):
                 self.protected.setdefault(uid(pod), stalled.pod_pin(pod))
         for pod_uid, pin in self.protected.items():
+            if pod_uid == ROLLED_SECURITY_POD_UID and self.resume:
+                old = by_uid.get(pod_uid)
+                require(old is None or old["metadata"].get("deletionTimestamp"),
+                        "Known terminating security Pod lost its recorded deletion state")
+                if old is not None and old["metadata"].get("deletionTimestamp"):
+                    require(stalled.pod_pin(old) == pin and base.pvc_free(old["spec"])
+                            and old["metadata"]["deletionTimestamp"] == self.security_deletion,
+                            "Known terminating security Pod identity/spec/PVC changed")
+                    # Container shutdown is expected here; this is not a healthy-Pod exemption.
+                    self.summary["managed_security_rollout"] = {
+                        "old_uid": pod_uid, "controller_uid": SECURITY_OWNER[2],
+                        "state": "already-terminating", "deletion_timestamp": self.security_deletion,
+                        "healthy": False, "caused_by_this_recovery": False,
+                    }
+                    continue
+                if old is None:
+                    replacements = [
+                        pod for pod in snapshot["pods"]["items"]
+                        if pod["metadata"].get("namespace") == SECURITY_OWNER[0]
+                        and pod["spec"].get("nodeName") == stalled.SOURCE
+                        and any(ref.get("controller") is True and ref.get("kind") == "DaemonSet"
+                                and ref.get("name") == SECURITY_OWNER[1] and ref.get("uid") == SECURITY_OWNER[2]
+                                for ref in pod["metadata"].get("ownerReferences") or [])
+                    ]
+                    require(len(replacements) == 1 and base.pod_ready(replacements[0])
+                            and base.pvc_free(replacements[0]["spec"]) and quantities.valid_uuid(uid(replacements[0])),
+                            "Known security rollout has no single healthy, controller-owned replacement")
+                    base.controller_owner(replacements[0], "DaemonSet")
+                    self.summary["managed_security_rollout"] = {
+                        "old_uid": pod_uid, "new_uid": uid(replacements[0]), "controller_uid": SECURITY_OWNER[2],
+                        "state": "healthy-controller-replacement", "healthy": True, "caused_by_this_recovery": False,
+                    }
+                    continue
             require(pod_uid in by_uid and base.pod_ready(by_uid[pod_uid]) and stalled.pod_pin(by_uid[pod_uid]) == pin,
                     "A protected healthy default0 Pod UID/spec/readiness changed")
         agents = maintenance._agent_map(snapshot["pods"])
@@ -649,10 +759,38 @@ class CapacityFirst(maintenance.ClusterOperator):
         return rows, conflicts
 
     def journal_data(self):
-        return {"owner": OWNER, "token": self.token, "source_state_sha256": digest(self.hashes),
+        data = {"owner": OWNER, "token": self.token, "source_state_sha256": digest(self.hashes),
                 "restart_checkpoint_sha256": self.receipt_hash, "failure_correlation": CORRELATION,
                 "desired_pool_sha256": digest(pool_settings(self.patch)),
                 "create": json.dumps(self.summary["create"], sort_keys=True)}
+        if self.resume:
+            data.update(prior_unsubmitted_create=json.dumps(self.resume["create"], sort_keys=True),
+                        prior_checkpoint_sha256=self.resume_hash, prior_build_id=str(RESERVED_BUILD))
+        return data
+
+    def attach_capacity_reservation(self):
+        conflicts = self.journals()[1]
+        require(len(conflicts) == 1 and conflicts[0]["metadata"].get("name") == JOURNAL,
+                "The exact original capacity reservation must exist without competing attempts")
+        row = conflicts[0]
+        data = row.get("data") or {}
+        expected = {
+            "owner": OWNER, "source_state_sha256": digest(self.hashes),
+            "restart_checkpoint_sha256": self.receipt_hash, "failure_correlation": CORRELATION,
+            "desired_pool_sha256": digest(pool_settings(self.patch)),
+            "create": json.dumps(self.resume["create"], sort_keys=True),
+        }
+        require(uid(row) == RESERVED_JOURNAL_UID and set(data) == set(expected) | {"token"}
+                and all(data.get(key) == value for key, value in expected.items())
+                and isinstance(data.get("token"), str) and re.fullmatch(r"[0-9a-f]{32}", data["token"]),
+                "Original capacity reservation changed or was already continued")
+        self.token, self.journal_uid = data["token"], uid(row)
+        self.persisted_journal_data = copy.deepcopy(data)
+        self.owned_journal()
+        self.summary["journal"].update(
+            uid=self.journal_uid, accepted=True, ambiguous=False, attempted=False, continued_existing_reservation=True,
+        )
+        self.save()
 
     def write(self, command):
         require(self.args.execute, "Read-only planning must never write")
@@ -712,13 +850,19 @@ class CapacityFirst(maintenance.ClusterOperator):
 
     def execute(self):
         self.observe()
-        require(not self.journals()[1], "Existing capacity journal blocks plan/adoption")
+        if self.resume:
+            self.attach_capacity_reservation()
+        else:
+            require(not self.journals()[1], "Existing capacity journal blocks plan/adoption")
         self.quota()
         self.summary.update(plan_valid=True, desired_pool=pool_settings(self.patch), status="planned-read-only")
         self.save()
         if not self.args.execute:
             return
-        self.acquire()
+        if self.resume:
+            self.persist_journal()
+        else:
+            self.acquire()
         self.observe()
         self.quota()
         self.summary["create"].update(attempted=True, accepted=None, ambiguous=True, requested_at=workers.utc_now(),
@@ -753,9 +897,16 @@ def validate_args(args):
     require(quantities.valid_sha(args.expected_tfvars_sha), "Preserved tfvars SHA256 is invalid")
     require(base.integer(args.timeout_seconds) and 300 <= args.timeout_seconds <= 3600, "Timeout must be 300..3600 seconds")
     require(args.kubeconfig and args.context == base.CLUSTER, "Private selected-cluster credentials/context are required")
+    require((not getattr(args, "resume_capacity_checkpoint", None) and getattr(args, "resume_build_id", 0) == 0)
+            or (getattr(args, "resume_capacity_checkpoint", None)
+                and getattr(args, "resume_build_id", 0) == RESERVED_BUILD),
+            "Capacity continuation requires the exact unsubmitted reservation from build 79959")
     root, checkpoint, config, output = (Path(value).resolve() for value in (
         args.source_state_directory, args.restart_checkpoint, args.kubeconfig, args.summary_file))
-    require(len({root, checkpoint, config, output}) == 4 and root not in output.parents and not output.exists(),
+    paths = [root, checkpoint, config, output]
+    if getattr(args, "resume_capacity_checkpoint", None):
+        paths.append(Path(args.resume_capacity_checkpoint).resolve())
+    require(len(set(paths)) == len(paths) and root not in output.parents and not output.exists(),
             "Summary must be new and separate from immutable inputs/private credentials")
     args.role = base.ROLE
 
@@ -774,6 +925,7 @@ def execute_recovery(args, summary, runner=workers.run_command):
                    journal={"name": JOURNAL, "namespace": "kube-system", "retained": True})
     try:
         data, hashes, receipt_hash, proof = load_inputs(args)
+        resume, resume_hash = load_capacity_reservation(args, data, hashes, receipt_hash)
         summary.update(source_hashes=hashes, source_state_sha256=digest(hashes), restart_checkpoint_sha256=receipt_hash,
                        accepted_restart_terminal_proof=proof, plan_sha256=stalled.PLAN_SHA,
                        preserved_kwok_node_uids={row["metadata"]["name"]: uid(row)
@@ -782,7 +934,14 @@ def execute_recovery(args, summary, runner=workers.run_command):
                        original_mock_pod_uids={name: uid(pod) for name, pod in maintenance._agent_map(data["current-pods.json"]).items()},
                        original_default_node_uids={name: base.REAL_UIDS[name] for name in stalled.BOOTS},
                        original_default_vm_ids=stalled.VM_IDS, original_default_boot_ids=stalled.BOOTS)
-        CapacityFirst(args, data, hashes, receipt_hash, proof, summary, runner).execute()
+        if resume:
+            summary["continuation"] = {
+                "source_build": RESERVED_BUILD, "checkpoint_sha256": resume_hash,
+                "prior_unsubmitted_create": copy.deepcopy(resume["create"]),
+                "proof": "explicit submission_started=false with exact pre-POST guard failure and original journal",
+            }
+        CapacityFirst(args, data, hashes, receipt_hash, proof, summary, runner,
+                      resume=resume, resume_hash=resume_hash).execute()
     except stalled.EXPECTED_ERRORS as error:
         summary.update(success=False, registered_nodes_ready=False, status="failed-closed",
                        error=f"{type(error).__name__}: {error}", rollback_attempted=False)
@@ -800,6 +959,8 @@ def parse_args(argv=None):
     parser.add_argument("--context", default=base.CLUSTER)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--resume-capacity-checkpoint")
+    parser.add_argument("--resume-build-id", type=int, default=0)
     return parser.parse_args(argv)
 
 
