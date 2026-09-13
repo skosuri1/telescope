@@ -294,6 +294,18 @@ also captures the existing `cniv5` operation, VM model and guest views, and
 capacity journal when that pool is present. It does not resubmit the add or
 interpret raw initialization states as workload-readiness proof.
 
+`scaleDebugCapacityQualificationBuildId=79975` selects the next exclusive phase
+against those existing replacements and the accepted creation artifact from
+`79971`. It cannot run alongside capacity creation, worker recovery/retirement,
+quota changes, or normal workloads. Plan and execute are separate bounded tasks;
+the read-only plan is published before any temporary probes run, making failures
+visible without waiting for the mutation task to finish. Both input trees and
+tfvars are frozen across those tasks, and each task uses cleaned-up private
+credentials. Qualification requires real IP-growth/HTTP evidence on both new
+workers, actual CPU/memory/Pod-slot headroom, and empty UID-owned probe cleanup.
+It does not authorize worker retirement, production Pod movement, Prometheus
+creation, or benchmark execution.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,

@@ -209,16 +209,37 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
             config = Path(args[1])
             assert config.read_text() == "private-test-credentials"
             assert config.stat().st_mode & 0o777 == 0o600
-            assert args[2:6] == ["--context", "clustermesh-96", "--request-timeout=20s", "get"]
+            assert args[2:5] == ["--context", "clustermesh-96", "--request-timeout=20s"]
+            if args[5] == "logs":
+                assert args[6] == "kwok-controller-current"
+                assert args[7:] == ["-n", "kube-system", "--timestamps", "--tail=200", "--since=2h"]
+                if os.environ["FAULT"] == "kwok-log-forbidden":
+                    print("Forbidden: controller logs are not readable", file=sys.stderr)
+                    sys.exit(1)
+                print("bounded controller log")
+                sys.exit(0)
+            assert args[5] == "get"
             assert args[6] in ("nodes", "pods", "events", "deployments,replicasets,daemonsets,statefulsets",
-                               "pdb", "nodenetworkconfigs", "configmap")
+                               "pdb", "nodenetworkconfigs", "configmap", "stages", "leases")
             if args[6] == "configmap":
-                assert os.environ["FAULT"].startswith("modern-") and args[7] == "mesh96-capacity-first-cniv5"
+                assert args[7] == "kwok" or (
+                    os.environ["FAULT"].startswith("modern-") and args[7] == "mesh96-capacity-first-cniv5"
+                )
+            if args[6] == "leases":
+                assert args[7:9] in (["-n", "kube-system"], ["-n", "kube-node-lease"])
             assert args[-2:] == ["-o", "json"]
             assert not set(args) & {"apply", "patch", "delete", "cordon", "taint", "exec"}
             if os.environ["FAULT"] == "kube-forbidden":
                 print("Forbidden: node state is not readable", file=sys.stderr)
                 sys.exit(1)
+            if args[6] == "pods":
+                print(json.dumps({"items": [{
+                    "metadata": {"name": "kwok-controller-current", "namespace": "kube-system",
+                                 "ownerReferences": [{"controller": True, "kind": "ReplicaSet",
+                                                     "uid": "831a12f2-434d-4920-ab4c-d5072a2bf2aa"}]},
+                    "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
+                }]}))
+                sys.exit(0)
             print(json.dumps({"kind": "List", "items": [
                 {"metadata": {"name": "original-worker"}, "status": {"conditions": [
                     {"type": "Ready", "status": "Unknown"},
@@ -266,6 +287,10 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
         assert summary["headroom_for_restore"] is (min(family, total) >= 8)
         assert summary["headroom_for_restore_and_cni"] is (min(family, total) >= 24)
         assert summary["prom_instances"] == []
+        assert (directory / "kwok-controller.log").read_text(encoding="utf-8").strip() == "bounded controller log"
+        assert all((directory / name).is_file() for name in (
+            "kwok-config.json", "kwok-stages.json", "kwok-node-leases.json", "kwok-controller-leases.json",
+        ))
         modern = json.loads((directory / "supported-family-quota.json").read_text(encoding="utf-8"))
         assert modern[0]["remaining"] == 900
         sku = json.loads((directory / "supported-vm-sku.json").read_text(encoding="utf-8"))
@@ -312,3 +337,10 @@ def test_quota_observer_has_no_helper_execution_or_retries():
 @pytest.mark.parametrize("fault", ["modern-creating", "modern-succeeded", "modern-forbidden"])
 def test_existing_accepted_capacity_observation_is_read_only(tmp_path, fault):
     test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fault, 32, 100, "number")
+
+
+def test_kwok_log_denial_is_not_treated_as_healthy_or_complete(tmp_path):
+    test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, "kwok-log-forbidden", 32, 100, "number")
+    directory = tmp_path / "artifacts" / "n100-unreachable-worker-recovery"
+    assert (directory / "kwok-node-leases.json").is_file()
+    assert not (directory / "quota-observation.json").exists()

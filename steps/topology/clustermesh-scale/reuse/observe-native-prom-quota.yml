@@ -133,6 +133,26 @@ steps:
         > "$directory/current-controllers.json"
       timeout 45 "${kube[@]}" get pdb -A -o json > "$directory/current-pdbs.json"
       timeout 45 "${kube[@]}" get nodenetworkconfigs -n kube-system -o json > "$directory/current-nnc.json"
+      timeout 45 "${kube[@]}" get configmap kwok -n kube-system -o json > "$directory/kwok-config.json"
+      timeout 45 "${kube[@]}" get stages -o json > "$directory/kwok-stages.json"
+      timeout 45 "${kube[@]}" get leases -n kube-node-lease -o json > "$directory/kwok-node-leases.json"
+      timeout 45 "${kube[@]}" get leases -n kube-system -o json > "$directory/kwok-controller-leases.json"
+      kwok_pod=$(jq -er '
+        [.items[] | select(.metadata.namespace == "kube-system"
+          and .metadata.deletionTimestamp == null and .status.phase == "Running"
+          and any(.status.conditions[]?; .type == "Ready" and .status == "True")
+          and any(.metadata.ownerReferences[]?;
+            .controller == true and .kind == "ReplicaSet"
+            and .uid == "831a12f2-434d-4920-ab4c-d5072a2bf2aa"))] |
+        if length == 1 then .[0].metadata.name
+        else error("No single Ready controller-owned KWOK Pod is available for bounded logs")
+        end' "$directory/current-pods.json")
+      if ! [[ "$kwok_pod" =~ ^kwok-controller-[a-z0-9-]+$ ]]; then
+        echo "Unexpected KWOK Pod name; no log lookup is authorized." >&2
+        exit 1
+      fi
+      timeout 45 "${kube[@]}" logs "$kwok_pod" -n kube-system --timestamps --tail=200 --since=2h \
+        > "$directory/kwok-controller.log"
       if jq -e 'any(.[]; .name == "cniv5")' "$directory/pools.json" >/dev/null; then
         modern_vmss="aks-cniv5-27550670-vmss"
         modern_vmss_seen=false

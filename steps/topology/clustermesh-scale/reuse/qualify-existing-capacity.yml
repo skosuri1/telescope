@@ -1,0 +1,138 @@
+parameters:
+  - name: phase
+    type: string
+    values:
+      - plan
+      - execute
+  - name: scope
+    type: object
+
+steps:
+  - script: |
+      set -euo pipefail
+      umask 077
+      directory="$ARTIFACT_DIRECTORY/n100-capacity-qualification"
+      snapshot_hashes() {
+        for input in observation capacity-input; do
+          test -d "$directory/$input"
+          test ! -L "$directory/$input"
+          if find "$directory/$input" -type l -print -quit | grep -q .; then
+            echo "Qualification evidence contains a symlink." >&2
+            return 1
+          fi
+          (cd "$directory/$input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --) |
+            sed "s|  ./|  $input/|"
+        done
+      }
+      if [ "$PHASE" = "plan" ]; then
+        python3 - "$OBSERVATION_DIRECTORY" "$CAPACITY_DIRECTORY" "$directory" <<'PY'
+      import sys
+      from pathlib import Path
+      inputs = [Path(value) for value in sys.argv[1:3]]
+      output = Path(sys.argv[3]).resolve()
+      for original in inputs:
+          if original.is_symlink() or not original.is_dir():
+              raise SystemExit("Qualification inputs must be real directories.")
+          original = original.resolve()
+          if original == output or original in output.parents or output in original.parents:
+              raise SystemExit("Qualification outputs must be disjoint from downloaded inputs.")
+      if output.exists():
+          raise SystemExit("An existing qualification output directory cannot be reused.")
+      PY
+        for input in "$OBSERVATION_DIRECTORY" "$CAPACITY_DIRECTORY"; do
+          if find "$input" -type l -print -quit | grep -q .; then
+            echo "Qualification inputs must not contain symlinks." >&2
+            exit 1
+          fi
+        done
+        mkdir -p "$ARTIFACT_DIRECTORY"
+        mkdir "$directory"
+        echo "##vso[task.setvariable variable=CAPACITY_QUALIFICATION_DIAGNOSTICS_READY]true"
+        cp -R -- "$OBSERVATION_DIRECTORY" "$directory/observation"
+        cp -R -- "$CAPACITY_DIRECTORY" "$directory/capacity-input"
+        snapshot_hashes > "$directory/inputs.sha256"
+        inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
+        tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
+        echo "##vso[task.setvariable variable=CAPACITY_QUALIFICATION_INPUTS_SHA;isReadOnly=true]$inputs_sha"
+        echo "##vso[task.setvariable variable=CAPACITY_QUALIFICATION_TFVARS_SHA;isReadOnly=true]$tfvars_sha"
+      elif [ "$PHASE" = "execute" ]; then
+        if ! [[ "$INPUTS_SHA" =~ ^[0-9a-f]{64}$ ]] || ! [[ "$TFVARS_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "Qualification execution requires the completed plan's frozen hashes." >&2
+          exit 1
+        fi
+        inputs_sha="$INPUTS_SHA"
+        tfvars_sha="$TFVARS_SHA"
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+          "$directory/plan.json" >/dev/null
+      else
+        echo "Unknown qualification phase; no command is authorized." >&2
+        exit 1
+      fi
+      verify_inputs() {
+        snapshot_hashes > "$directory/inputs-$PHASE.sha256"
+        if [ "$(sha256sum "$directory/inputs-$PHASE.sha256" | awk '{print $1}')" != "$inputs_sha" ] ||
+          [ "$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')" != "$tfvars_sha" ]; then
+          echo "Qualification inputs changed; no further probes are authorized." >&2
+          return 1
+        fi
+      }
+      verify_inputs
+      private="$AGENT_TEMP_DIRECTORY/capacity-qualification.$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+      mkdir -m 700 -- "$private"
+      cleanup() {
+        rm -f -- "$private/cluster.config"
+        rmdir -- "$private"
+      }
+      trap cleanup EXIT
+      timeout 90 az aks get-credentials --subscription "$SUBSCRIPTION" --resource-group "$RUN_ID" \
+        --name clustermesh-96 --file "$private/cluster.config" --context clustermesh-96 --only-show-errors
+      chmod 600 "$private/cluster.config"
+      args=(
+        --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
+        --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
+        --expected-tfvars-sha "$tfvars_sha"
+        --observation-directory "$directory/observation" --observation-build-id "$OBSERVATION_BUILD_ID"
+        --capacity-directory "$directory/capacity-input" --capacity-build-id "$CAPACITY_BUILD_ID"
+        --kubeconfig "$private/cluster.config" --context clustermesh-96 --timeout-seconds 2400
+      )
+      if [ "$PHASE" = "plan" ]; then
+        args+=(--summary-file "$directory/plan.json")
+      else
+        args+=(--summary-file "$directory/qualification.json" --execute)
+      fi
+      echo "Starting capacity qualification $PHASE at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+      python3 -u "$REPOSITORY_DIRECTORY/modules/python/clusterloader2/clustermesh-scale/capacity_first_qualification.py" "${args[@]}"
+      verify_inputs
+      if [ "$PHASE" = "plan" ]; then
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+          "$directory/plan.json" >/dev/null
+      else
+        jq -e '.execute == true and .capacity_qualified == true
+          and .actual_ip_growth_proven == true and .actual_memory_headroom_proven == true
+          and .workloads_ready == false and .bootstrap_complete == false
+          and (.probe_cleanup_pending | type == "array" and length == 0)' \
+          "$directory/qualification.json" >/dev/null
+      fi
+    ${{ if eq(parameters.phase, 'plan') }}:
+      displayName: "Plan replacement networking and capacity without changes"
+      timeoutInMinutes: 15
+    ${{ else }}:
+      displayName: "Qualify both replacements with temporary HTTP probes"
+      timeoutInMinutes: 45
+    retryCountOnTaskFailure: 0
+    env:
+      PHASE: ${{ parameters.phase }}
+      RUN_ID: ${{ parameters.scope.target_run_id }}
+      CONFIRM_RESUME: ${{ parameters.scope.confirm_resume }}
+      SUBSCRIPTION: ${{ parameters.scope.expected_subscription_id }}
+      REGION: ${{ parameters.scope.expected_region }}
+      TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
+      OBSERVATION_BUILD_ID: ${{ parameters.scope.observation_build_id }}
+      CAPACITY_BUILD_ID: ${{ parameters.scope.accepted_capacity_build_id }}
+      OBSERVATION_DIRECTORY: $(Pipeline.Workspace)/capacity-qualification-observation
+      CAPACITY_DIRECTORY: $(Pipeline.Workspace)/capacity-qualification-creation
+      ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
+      REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
+      AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)
+      INPUTS_SHA: $(CAPACITY_QUALIFICATION_INPUTS_SHA)
+      TFVARS_SHA: $(CAPACITY_QUALIFICATION_TFVARS_SHA)

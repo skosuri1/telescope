@@ -49,14 +49,16 @@ def test_capacity_mode_disables_every_other_mutation_and_workload_job():
     parameter = next(row for row in pipeline["parameters"] if row["name"] == "scaleDebugCapacityFirstRecoveryBuildId")
     assert parameter["type"] == "number" and parameter["default"] == 0
     stage = next(row for row in pipeline["stages"] if row["stage"] == "azure_eastus2euap_n100_debug_resume_37deca")
-    key = "${{ if ne(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0) }}"
+    key = "${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), ne(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0)) }}"
     invocation = next(row[key][0] for row in stage["jobs"] if key in row)
     assert invocation["template"] == "/jobs/clustermesh-capacity-first.yml"
     assert invocation["parameters"]["accepted_restart_build_id"] == 79950
     assert invocation["parameters"]["source_state_build_id"] == "${{ parameters.scaleDebugCapacityFirstRecoveryBuildId }}"
     for row in stage["jobs"]:
         condition = next(iter(row))
-        if condition.startswith("${{") and condition != key:
+        if condition.startswith("${{") and condition not in (
+            key, "${{ if ne(parameters.scaleDebugCapacityQualificationBuildId, 0) }}",
+        ):
             assert "eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0)" in condition
     normal = yaml.safe_load((ROOT / "jobs/clustermesh-debug-resume.yml").read_text(encoding="utf-8"))
     assert next(row for row in normal["parameters"] if row["name"] == "capacity_first_build_id")["default"] == 0

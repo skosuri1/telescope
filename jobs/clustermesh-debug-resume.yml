@@ -43,6 +43,9 @@ parameters:
 - name: capacity_first_build_id
   type: number
   default: 0
+- name: capacity_qualification_build_id
+  type: number
+  default: 0
 - name: lease_extension_hours
   type: number
   default: 168
@@ -99,6 +102,7 @@ jobs:
 - job: azure
   condition: >-
     and(succeeded(),
+    eq(${{ parameters.capacity_qualification_build_id }}, 0),
     eq(${{ parameters.capacity_first_build_id }}, 0),
     eq(${{ parameters.retained_worker_restart_build_id }}, 0),
     ne(variables['CLUSTERMESH_PREPARED_RETIREMENT_ONLY'], 'true'),
