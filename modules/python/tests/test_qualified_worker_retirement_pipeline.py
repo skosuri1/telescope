@@ -52,7 +52,7 @@ def test_retirement_mode_excludes_every_other_job_and_keeps_other_stages_unchang
     parameter = next(row for row in pipeline["parameters"] if row["name"] == mode)
     assert parameter["type"] == "number" and parameter["default"] == 0
     stage = next(row for row in pipeline["stages"] if row["stage"] == "azure_eastus2euap_n100_debug_resume_37deca")
-    key = "${{ if and(eq(parameters.scaleDebugPostRetirementPromBuildId, 0), ne(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0)) }}"
+    key = "${{ if and(eq(parameters.scaleDebugPostRetirementPromBuildId, 0), ne(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), ne(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 80046)) }}"
     invocation = next(row[key][0] for row in stage["jobs"] if key in row)
     assert invocation["template"] == "/jobs/clustermesh-qualified-worker-retirement.yml"
     assert invocation["parameters"]["qualification_build_id"] == "${{ parameters.scaleDebugQualifiedWorkerRetirementBuildId }}"
@@ -61,6 +61,7 @@ def test_retirement_mode_excludes_every_other_job_and_keeps_other_stages_unchang
         condition = next(iter(row))
         if condition.startswith("${{") and condition not in (
             key, "${{ if ne(parameters.scaleDebugPostRetirementPromBuildId, 0) }}",
+            "${{ if and(eq(parameters.scaleDebugPostRetirementPromBuildId, 0), eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 80046)) }}",
         ):
             assert f"eq(parameters.{mode}, 0)" in condition
     for other in ("CapacityQualification", "CapacityFirstRecovery", "RetainedWorkerRestart",

@@ -1,0 +1,147 @@
+parameters:
+  - name: phase
+    type: string
+    values:
+      - plan
+      - execute
+  - name: scope
+    type: object
+
+steps:
+  - script: |
+      set -euo pipefail
+      umask 077
+      directory="$ARTIFACT_DIRECTORY/n100-secondary-worker-retirement"
+      snapshot_hashes() {
+        test -d "$directory/qualification-input"
+        test ! -L "$directory/qualification-input"
+        if find "$directory/qualification-input" -type l -print -quit | grep -q .; then
+          echo "Retirement source contains a symlink." >&2
+          return 1
+        fi
+        (cd "$directory/qualification-input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
+      }
+      if [ "$PHASE" = "plan" ]; then
+        python3 - "$QUALIFICATION_DIRECTORY" "$directory" <<'PY'
+      import sys
+      from pathlib import Path
+      source, output = (Path(value) for value in sys.argv[1:])
+      if source.is_symlink() or not source.is_dir() or any(p.is_symlink() for p in source.rglob("*")):
+          raise SystemExit("Retirement requires the complete non-symlinked qualification artifact.")
+      source, output = source.resolve(), output.resolve()
+      if output.exists() or source == output or source in output.parents or output in source.parents:
+          raise SystemExit("Retirement output must be new and disjoint from qualification inputs.")
+      PY
+        jq -e '
+          .execute == true and .success == false and .capacity_source_build_id == 80039
+          and .error == "mesh-89: actual NNC version/IP growth exceeded the bounded wait"
+          and .workloads_ready == false and (.cleanup_errors | length == 0)
+          and .per_role["mesh-89"].capacity_qualified == false
+          and ([.per_role | .["mesh-51"], .["mesh-66"], .["mesh-79"] |
+            .capacity_qualified == true and .actual_ip_growth_proven == true
+            and .actual_headroom_proven == true and (.probe_cleanup_pending | length == 0)] | all)' \
+          "$QUALIFICATION_DIRECTORY/qualification.json" >/dev/null
+        mkdir -p "$ARTIFACT_DIRECTORY"
+        mkdir "$directory"
+        echo "##vso[task.setvariable variable=SECONDARY_RETIREMENT_DIAGNOSTICS_READY]true"
+        cp -R -- "$QUALIFICATION_DIRECTORY" "$directory/qualification-input"
+        snapshot_hashes > "$directory/inputs.sha256"
+        inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
+        tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
+        echo "##vso[task.setvariable variable=SECONDARY_RETIREMENT_INPUTS_SHA;isReadOnly=true]$inputs_sha"
+        echo "##vso[task.setvariable variable=SECONDARY_RETIREMENT_TFVARS_SHA;isReadOnly=true]$tfvars_sha"
+      elif [ "$PHASE" = "execute" ]; then
+        [[ "$INPUTS_SHA" =~ ^[0-9a-f]{64}$ ]] &&
+          [[ "$TFVARS_SHA" =~ ^[0-9a-f]{64}$ ]] &&
+          [[ "$PLAN_SHA" =~ ^[0-9a-f]{64}$ ]]
+        inputs_sha="$INPUTS_SHA"
+        tfvars_sha="$TFVARS_SHA"
+        test "$(sha256sum "$directory/plan.json" | awk '{print $1}')" = "$PLAN_SHA"
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+          "$directory/plan.json" >/dev/null
+      else
+        echo "Unknown retirement phase." >&2
+        exit 1
+      fi
+      verify_inputs() {
+        snapshot_hashes > "$directory/inputs-$PHASE.sha256"
+        if [ "$(sha256sum "$directory/inputs-$PHASE.sha256" | awk '{print $1}')" != "$inputs_sha" ] ||
+          [ "$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')" != "$tfvars_sha" ]; then
+          echo "Retirement inputs changed; no further operation is authorized." >&2
+          return 1
+        fi
+      }
+      verify_inputs
+      private="$AGENT_TEMP_DIRECTORY/secondary-retirement.$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+      mkdir -m 700 -- "$private"
+      cleanup() {
+        rm -f -- "$private/mesh-51.config" "$private/mesh-66.config" "$private/mesh-79.config"
+        rmdir -- "$private"
+      }
+      trap cleanup EXIT
+      for number in 51 66 79; do
+        timeout 120 az aks get-credentials --subscription "$SUBSCRIPTION" --resource-group "$RUN_ID" \
+          --name "clustermesh-$number" --file "$private/mesh-$number.config" \
+          --context "clustermesh-$number" --only-show-errors
+        chmod 600 "$private/mesh-$number.config"
+      done
+      args=(
+        --qualification-directory "$directory/qualification-input" --qualification-build-id 80046
+        --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
+        --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
+        --expected-tfvars-sha "$tfvars_sha" --kubeconfig-directory "$private"
+        --timeout-seconds 7200
+      )
+      if [ "$PHASE" = "plan" ]; then
+        args+=(--summary-file "$directory/plan.json")
+      else
+        args+=(--summary-file "$directory/retirement.json" --execute)
+      fi
+      python3 -u "$REPOSITORY_DIRECTORY/modules/python/clusterloader2/clustermesh-scale/secondary_failed_worker_retirement.py" \
+        "${args[@]}"
+      verify_inputs
+      if [ "$PHASE" = "plan" ]; then
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+          "$directory/plan.json" >/dev/null
+        plan_sha=$(sha256sum "$directory/plan.json" | awk '{print $1}')
+        echo "##vso[task.setvariable variable=SECONDARY_RETIREMENT_PLAN_SHA;isReadOnly=true]$plan_sha"
+      else
+        test "$(sha256sum "$directory/plan.json" | awk '{print $1}')" = "$PLAN_SHA"
+        jq -e '.execute == true and .success == true and .system_roles_recovered == true
+          and .qualification_build_id == 80046 and .mesh89_explicitly_unqualified == true
+          and .workloads_ready == false and .completed_global_baseline == false
+          and (.cleanup_errors | type == "array" and length == 0)
+          and (.per_role | keys == ["mesh-51", "mesh-66", "mesh-79"])
+          and ([.per_role[] | .success == true and .native_fencing_proven == true
+            and .source_retired == true and .replacements_ready == true and .placement_holds_removed == true
+            and .native.attempted == true and .native.submission_started == true
+            and .native.accepted == true and .native.ambiguous == false
+            and (.native.vm_absence_observed_at | type == "string")
+            and .final_headroom.actual_metrics == true
+            and ([.holds[] | .applied == false and .remove.accepted == true
+              and .remove.ambiguous == false] | all)] | all)
+          and (.per_role["mesh-51"].replacements | length == 61)
+          and (.per_role["mesh-66"].replacements | length == 48)
+          and (.per_role["mesh-79"].replacements | length == 40)' "$directory/retirement.json" >/dev/null
+      fi
+    ${{ if eq(parameters.phase, 'plan') }}:
+      displayName: "Plan three qualified System-role retirements without changes"
+      timeoutInMinutes: 25
+    ${{ else }}:
+      displayName: "Fence exact failed hosts and observe natural mock replacements"
+      timeoutInMinutes: 125
+    retryCountOnTaskFailure: 0
+    env:
+      PHASE: ${{ parameters.phase }}
+      RUN_ID: ${{ parameters.scope.target_run_id }}
+      CONFIRM_RESUME: ${{ parameters.scope.confirm_resume }}
+      SUBSCRIPTION: ${{ parameters.scope.expected_subscription_id }}
+      REGION: ${{ parameters.scope.expected_region }}
+      TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
+      QUALIFICATION_DIRECTORY: $(Pipeline.Workspace)/secondary-retirement-source
+      ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
+      REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
+      AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)
+      INPUTS_SHA: $(SECONDARY_RETIREMENT_INPUTS_SHA)
+      TFVARS_SHA: $(SECONDARY_RETIREMENT_TFVARS_SHA)
+      PLAN_SHA: $(SECONDARY_RETIREMENT_PLAN_SHA)

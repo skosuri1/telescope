@@ -404,6 +404,18 @@ daemon startup; no restart, configuration update, IP allocation/release, or
 resource deletion is permitted. Authentication material in diagnostics is
 redacted. Diagnostic completion does not claim healthy networking or workloads.
 
+`scaleDebugQualifiedWorkerRetirementBuildId=80046` selects only the independently
+qualified System-worker roles (meshes 51, 66, and 79) from the partial result.
+The source's failed mesh-89 monitoring qualification is preserved, not relabeled
+as success. Each selected role must have its real HTTP/IP-growth, placement, and
+complete probe-cleanup evidence before any native action. This phase preserves
+all capacity/qualification journals, holds only healthy old default workers
+against new scheduling, and permits one exact failed-machine retirement per
+role. It never force-deletes the 149 old mock Pods; replacement UIDs are accepted
+only after positive VM fencing. The healthy original mock/KWOK identities,
+qualified workers, PDBs, and final headroom remain guarded. Success recovers only
+these three roles, not mesh 89, mesh 2/94, a global baseline, or benchmark results.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,
