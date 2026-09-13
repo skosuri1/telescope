@@ -998,3 +998,48 @@ def test_read_queries_match_the_diagnostic_projection(environment):
             assert command[command.index("--query") + 1] == recovery.VMSS_QUERY
         if command[:3] == ["az", "vmss", "list-instances"]:
             assert command[command.index("--query") + 1] == recovery.VM_QUERY
+
+
+def test_actual_azure_decimal_string_quota_counters_are_normalized(environment):
+    tmp_path, source, cloud = environment
+    original = cloud.azure
+
+    def string_counters(command, role):
+        result = original(command, role)
+        if command[:3] == ["az", "vm", "list-usage"]:
+            rows = json.loads(result)
+            for row in rows:
+                row["currentValue"] = str(row["currentValue"])
+                row["limit"] = str(row["limit"])
+            return json.dumps(rows)
+        return result
+
+    cloud.azure = string_counters
+    args = make_args(tmp_path, source, name="quota-strings.json")
+    summary = {}
+    recovery.execute_recovery(args, summary, cloud)
+    assert summary["plan_valid"] and summary["capacity"]["counters"][recovery.QUOTA_FAMILY]["remaining"] == 892
+    assert summary["capacity_diagnostics"]["usage"][0]["currentValue"] == "100"
+    assert not cloud.adds
+
+
+@pytest.mark.parametrize("invalid", [None, True, -1, 1.5, "1.5", "-1", "unreadable"])
+def test_invalid_quota_counters_fail_with_raw_read_evidence(environment, invalid):
+    tmp_path, source, cloud = environment
+    original = cloud.azure
+
+    def bad_counter(command, role):
+        result = original(command, role)
+        if command[:3] == ["az", "vm", "list-usage"]:
+            rows = json.loads(result)
+            rows[0]["currentValue"] = invalid
+            return json.dumps(rows)
+        return result
+
+    cloud.azure = bad_counter
+    args = make_args(tmp_path, source, name="bad-quota.json")
+    with pytest.raises(recovery.workers.ReconcileError):
+        recovery.execute_recovery(args, {}, cloud)
+    saved = read_receipt(args)
+    assert saved["capacity_diagnostics"]["usage"][0]["currentValue"] == invalid
+    assert saved["mutation_started"] is False and not cloud.adds

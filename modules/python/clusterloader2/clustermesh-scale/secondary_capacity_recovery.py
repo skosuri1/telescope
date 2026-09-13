@@ -1329,7 +1329,7 @@ def source_networks(source):
     return source["networks"]
 
 
-def capacity_read(args, runner, required_cores, *, outer_deadline=None):
+def capacity_read(args, runner, required_cores, *, outer_deadline=None, summary=None):
     deadline = time.monotonic() + min(args.timeout_seconds, 600)
     if outer_deadline is not None:
         deadline = min(deadline, outer_deadline)
@@ -1355,15 +1355,16 @@ def capacity_read(args, runner, required_cores, *, outer_deadline=None):
         "--query", "[].{name:name.value,currentValue:currentValue,limit:limit}",
         "--output", "json", "--only-show-errors",
     ], READ_SECONDS)
+    if summary is not None:
+        summary["capacity_diagnostics"] = {"checked_at": utc_now(), "usage": stalled.safe_diagnostics(usage)}
+        mocks.write_json_atomic(args.summary_file, summary)
     require(isinstance(usage, list), "Regional quota response is malformed")
     counters = {}
     for name in (QUOTA_FAMILY, "cores"):
         rows = [row for row in usage if row.get("name") == name]
         require(len(rows) == 1, f"Regional quota lacks exactly one {name} counter")
-        current, limit = rows[0].get("currentValue"), rows[0].get("limit")
-        require(isinstance(current, int) and not isinstance(current, bool)
-                and isinstance(limit, int) and not isinstance(limit, bool)
-                and 0 <= current <= limit,
+        current, limit = (modern.capacity.quota_counter(rows[0].get(key)) for key in ("currentValue", "limit"))
+        require(0 <= current <= limit,
                 f"Regional quota counter {name} is malformed")
         counters[name] = {
             "currentValue": current, "limit": limit, "remaining": limit - current,
@@ -1377,6 +1378,9 @@ def capacity_read(args, runner, required_cores, *, outer_deadline=None):
         "locations:locations,restrictions:restrictions,capabilities:capabilities}",
         "--output", "json", "--only-show-errors",
     ], SKU_READ_SECONDS)
+    if summary is not None:
+        summary["capacity_diagnostics"]["sku"] = stalled.safe_diagnostics(sku)
+        mocks.write_json_atomic(args.summary_file, summary)
     require(isinstance(sku, list) and len(sku) == 1, "Exact DSv5 SKU discovery is ambiguous")
     row = sku[0]
     capabilities = {
@@ -1464,7 +1468,7 @@ def execute_recovery(args, summary, runner=workers.run_command):
             }
         deadline = time.monotonic() + args.timeout_seconds
         summary["capacity"] = capacity_read(args, runner, TOTAL_CORES,
-                                             outer_deadline=deadline - FINAL_RESERVE_SECONDS)
+                                             outer_deadline=deadline - FINAL_RESERVE_SECONDS, summary=summary)
         recoveries = {
             role: RoleRecovery(
                 args, bundle, bundle["roles"][role], summary, runner, deadline,
@@ -1484,7 +1488,7 @@ def execute_recovery(args, summary, runner=workers.run_command):
         for role in ROLES:
             recovery = recoveries[role]
             summary["capacity"] = capacity_read(args, runner, outstanding,
-                                                 outer_deadline=deadline - FINAL_RESERVE_SECONDS)
+                                                 outer_deadline=deadline - FINAL_RESERVE_SECONDS, summary=summary)
             recovery.acquire()
             recovery.submit(plans[role])
             recovery.wait_ready()
