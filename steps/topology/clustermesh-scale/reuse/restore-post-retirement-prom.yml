@@ -108,6 +108,8 @@ steps:
           "$directory/plan.json" >/dev/null
       else
         jq -e '.execute == true and .success == true and .repaired == true and .workloads_ready == false
+          and .completion_only == true and .mutation_started == false
+          and .journal_unchanged == true and .provider_actions_replayed == false
           and .modern_cni.completed == true and .modern_cni.source_retired == true
           and .baseline_pool_layout.expected_total_pool_count == 202' \
           "$directory/recovery.json" >/dev/null
@@ -116,7 +118,7 @@ steps:
       displayName: "Plan dedicated monitoring restoration without changes"
       timeoutInMinutes: 15
     ${{ else }}:
-      displayName: "Create real User monitoring worker and retire only the empty old pool"
+      displayName: "Finalize completed monitoring recovery without resource changes"
       timeoutInMinutes: 65
     retryCountOnTaskFailure: 0
     env:

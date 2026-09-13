@@ -24,7 +24,7 @@ parameters:
 
 jobs:
   - job: post_retirement_prom_recovery
-    displayName: "Restore real dedicated mesh96 monitoring after native retirement"
+    displayName: "Complete restored mesh96 monitoring proof without resource changes"
     variables:
       SCENARIO_NAME: clustermesh-scale
       CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
@@ -43,7 +43,7 @@ jobs:
             and .expected_region == "eastus2euap" and .expected_cluster_count == 100
             and .tfvars_path == "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars"
             and .overlay_mode == "resume-existing" and .run_workload == false
-            and .retirement_build_id == 80001 and .resume_build_id == 80011
+            and .retirement_build_id == 80001 and .resume_build_id == 80015
             and .exclusive_modes == true' <<< "$PROM_SCOPE_JSON" >/dev/null
         displayName: "Require exclusive monitoring restoration from successful retirement"
         env:
@@ -70,7 +70,7 @@ jobs:
           targetPath: $(Pipeline.Workspace)/post-retirement-prom-source
 
       - task: DownloadPipelineArtifact@2
-        displayName: "Download the exact accepted monitoring creation"
+        displayName: "Download completed monitoring actions for read-only finalization"
         inputs:
           buildType: specific
           project: $(System.TeamProjectId)

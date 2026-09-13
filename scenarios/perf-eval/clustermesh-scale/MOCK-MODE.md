@@ -346,13 +346,13 @@ until the separate workload preflight succeeds. Normal new-worker startup is
 observed without reissuing creation; final readiness includes the campaign's
 16 GiB Prometheus memory budget. Raw semantic guards are bound to the original
 retirement input hashes, rather than compared with redacted diagnostics.
-The current job pins build 80011's accepted creation and the exact journal
-UID, data hash, and resource version. It never submits another pool add. An
-unchanged protected VMSS that is still `Updating` is observed read-only for
-up to ten minutes; it must return to `Succeeded` and pass the full health
-guards before any journal continuation or empty-pool deletion. The earlier
-80007 reservation record remains in the journal history. Identical journal
-data does not require a write or a resource-version change.
+The current job pins build 80015's completed monitoring actions and exact journal
+UID, data hash, and resource version. Both phases are read-only, including when
+the execution flag is supplied: no pool operation or journal update is allowed.
+It rechecks the real worker/operator, all preserved identities, the 16 GiB
+memory budget, and positive old-pool/VMSS absence before emitting the completed
+layout. The original failure on the deleted pool's `NotFound` operation endpoint
+is retained as evidence; neither accepted provider action is repeated.
 
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one

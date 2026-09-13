@@ -1347,7 +1347,10 @@ def test_capacity_read_budget_is_scoped_and_only_transient_reads_retry(monkeypat
     assert 3 * prom.SKU_READ_SECONDS < 15 * 60
 
 
-@pytest.mark.parametrize("error,complete", [("ResourceNotFound (404)", True), ("Forbidden (403)", False)])
+@pytest.mark.parametrize("error,complete", [
+    ("ResourceNotFound (404)", True), ("(NotFound) Could not find the agentpool: prompool", True),
+    ("Forbidden (403)", False),
+])
 def test_deleted_pool_child_endpoint_absence_requires_positive_pool_and_vmss_absence(tmp_path, error, complete):
     class DeletedEndpointCloud(FullCloud):
         def azure(self, command):
@@ -1618,3 +1621,90 @@ def test_accepted_create_rejects_even_a_direct_second_add():
     recovery.bundle = {"resume": {"kind": "accepted-create"}}
     with pytest.raises(prom.workers.ReconcileError, match="never be submitted again"):
         recovery.raw_write(prom.pool_add_command())
+
+
+class LegacyDeletedEndpointFailure(prom.PromRecovery):
+    def wait_old_absent(self):
+        self.phase = "retiring"
+        self.authority()
+        self.journals(allow_own=True)
+        ready, _, _ = self.models()
+        prom.require(ready and self.guard(self.snapshot(), require_new=True), "Final monitoring regressed")
+        self.operation(prom.OLD_POOL, self.summary["old_pool_delete"])
+
+
+def completed_operations_fixture(tmp_path, monkeypatch):
+    root, accepted_checkpoint, _, cloud = accepted_creation_fixture(tmp_path, monkeypatch)
+    next(row for row in cloud.scales if prom.workers.vmss_pool_name(row) == "cniv5")["provisioningState"] = "Succeeded"
+    checkpoint = tmp_path / "completed-checkpoint"
+    checkpoint.mkdir()
+    plan_args = recovery_args(root, checkpoint / "plan.json", False)
+    plan_args.resume_directory, plan_args.resume_build_id = str(accepted_checkpoint), 80011
+    prom.execute_recovery(plan_args, {}, runner=cloud)
+    azure = cloud.azure
+
+    def deleted_endpoint(command):
+        if cloud.delete_count and command[1:4] == ["aks", "operation", "show-latest"]:
+            if "--nodepool-name" in command and cloud.value(command, "--nodepool-name") == prom.OLD_POOL:
+                raise prom.workers.ReconcileError("(NotFound) Could not find the agentpool: prompool")
+        return azure(command)
+
+    cloud.azure = deleted_endpoint
+    args = recovery_args(root, checkpoint / "recovery.json", True)
+    args.resume_directory, args.resume_build_id = str(accepted_checkpoint), 80011
+    with monkeypatch.context() as old_code:
+        old_code.setattr(prom, "PromRecovery", LegacyDeletedEndpointFailure)
+        with pytest.raises(prom.workers.ReconcileError, match="NotFound"):
+            prom.execute_recovery(args, {}, runner=cloud)
+    assert cloud.add_count == cloud.delete_count == 1
+    return root, checkpoint, cloud
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_completed_operations_are_finalized_without_any_resource_or_journal_write(tmp_path, monkeypatch, execute):
+    root, checkpoint, cloud = completed_operations_fixture(tmp_path, monkeypatch)
+    before = copy.deepcopy(cloud.configmaps)
+    writes = len(cloud.writes)
+    args = recovery_args(root, tmp_path / "completed-readonly.json", execute)
+    args.resume_directory, args.resume_build_id = str(checkpoint), 80015
+    summary = {}
+    prom.execute_recovery(args, summary, runner=cloud)
+    assert summary["success"] and summary["repaired"] and summary["plan_valid"]
+    assert summary["completion_only"] and summary["journal_unchanged"]
+    assert not summary["mutation_started"] and not summary["provider_actions_replayed"]
+    assert not summary["workloads_ready"] and summary["baseline_pool_layout"]["expected_total_pool_count"] == 202
+    assert len(cloud.writes) == writes and cloud.configmaps == before
+    assert cloud.add_count == cloud.delete_count == 1
+
+
+@pytest.mark.parametrize("command", [prom.pool_add_command(), prom.pool_delete_command(),
+                                  ["kubectl", "-n", "kube-system", "patch", "configmap", prom.JOURNAL]])
+def test_readonly_completion_forbids_every_write_even_with_execute_flag(command):
+    recovery = object.__new__(prom.PromRecovery)
+    recovery.args = SimpleNamespace(execute=True)
+    recovery.bundle = {"resume": {"kind": "completed-operations"}}
+    with pytest.raises(prom.workers.ReconcileError, match="cannot write"):
+        recovery.raw_write(command)
+
+
+@pytest.mark.parametrize("fault", ["deletion-ambiguous", "old-pool-present", "journal-changed", "worker-boot-changed"])
+def test_readonly_completion_does_not_waive_missing_absence_or_changed_health(tmp_path, monkeypatch, fault):
+    root, checkpoint, cloud = completed_operations_fixture(tmp_path, monkeypatch)
+    if fault == "deletion-ambiguous":
+        path = checkpoint / "recovery.json"
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt["old_pool_delete"]["ambiguous"] = True
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+    elif fault == "old-pool-present":
+        cloud.pools.append(make_pool(prom.OLD_POOL, 0, "User", "Standard_D8_v3", 250))
+    elif fault == "journal-changed":
+        cloud.configmaps[prom.JOURNAL]["metadata"]["resourceVersion"] = "999"
+    else:
+        next(row for row in cloud.snapshot["nodes"]["items"]
+             if row["metadata"]["name"] == cloud.fixture["new_name"])["status"]["nodeInfo"]["bootID"] = identity("unexpected-reboot")
+    args = recovery_args(root, tmp_path / "reject-completion.json", True)
+    args.resume_directory, args.resume_build_id = str(checkpoint), 80015
+    writes = len(cloud.writes)
+    with pytest.raises(prom.workers.ReconcileError):
+        prom.execute_recovery(args, {}, runner=cloud)
+    assert len(cloud.writes) == writes and cloud.add_count == cloud.delete_count == 1
