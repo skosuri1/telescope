@@ -289,6 +289,11 @@ a submitted/accepted Azure add, or changed evidence fails closed—there is no
 fallback to a new journal or original creation. All normal fresh safety gates
 still apply, and the mutation task has zero retries.
 
+After the accepted capacity creation in `79971`, the read-only native observer
+also captures the existing `cniv5` operation, VM model and guest views, and
+capacity journal when that pool is present. It does not resubmit the add or
+interpret raw initialization states as workload-readiness proof.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,

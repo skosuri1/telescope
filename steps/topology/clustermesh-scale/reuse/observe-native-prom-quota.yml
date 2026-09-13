@@ -133,6 +133,48 @@ steps:
         > "$directory/current-controllers.json"
       timeout 45 "${kube[@]}" get pdb -A -o json > "$directory/current-pdbs.json"
       timeout 45 "${kube[@]}" get nodenetworkconfigs -n kube-system -o json > "$directory/current-nnc.json"
+      if jq -e 'any(.[]; .name == "cniv5")' "$directory/pools.json" >/dev/null; then
+        modern_vmss="aks-cniv5-27550670-vmss"
+        modern_vmss_seen=false
+        timeout 60 az group show --subscription "$EXPECTED_SUBSCRIPTION_ID" --name "$node_group" \
+          --query '{id:id,managedBy:managedBy,location:location,tags:tags}' \
+          --output json --only-show-errors > "$directory/cniv5-node-group.json"
+        timeout 60 az aks operation show-latest --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+          --resource-group "$RUN_ID" --name clustermesh-96 --nodepool-name cniv5 \
+          --query '{name:name,status:status,operationType:operationType,startTime:startTime,endTime:endTime,errorCode:error.code}' \
+          --output json --only-show-errors > "$directory/cniv5-operation.json"
+        timeout 45 "${kube[@]}" get configmap mesh96-capacity-first-cniv5 -n kube-system -o json \
+          > "$directory/cniv5-capacity-journal.json"
+        if jq -e --arg name "$modern_vmss" 'any(.[]; .name == $name)' "$directory/vmsses.json" >/dev/null; then
+          modern_vmss_seen=true
+          timeout 60 az vmss show --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+            --resource-group "$node_group" --name "$modern_vmss" \
+            --query '{id:id,name:name,location:location,sku:sku,tags:tags,orchestrationMode:orchestrationMode,provisioningState:provisioningState,osDisk:virtualMachineProfile.storageProfile.osDisk,imageReference:virtualMachineProfile.storageProfile.imageReference}' \
+            --output json --only-show-errors > "$directory/cniv5-vmss-model.json"
+          timeout 60 az vmss list-instances --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+            --resource-group "$node_group" --name "$modern_vmss" \
+            --query '[].{id:id,instanceId:instanceId,vmId:vmId,computerName:osProfile.computerName,latestModelApplied:latestModelApplied,provisioningState:provisioningState}' \
+            --output json --only-show-errors > "$directory/cniv5-instances.json"
+          jq -e 'length <= 2 and all(.[]; .instanceId == "0" or .instanceId == "1")' \
+            "$directory/cniv5-instances.json" >/dev/null
+          timeout 60 az vmss get-instance-view --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+            --resource-group "$node_group" --name "$modern_vmss" \
+            --query '{statuses:statuses,virtualMachines:virtualMachine.statusesSummary}' \
+            --output json --only-show-errors > "$directory/cniv5-vmss-instance-view.json"
+          mapfile -t modern_instances < <(jq -r '.[].instanceId' "$directory/cniv5-instances.json")
+          for instance in "${modern_instances[@]}"; do
+            timeout 60 az vmss get-instance-view --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+              --resource-group "$node_group" --name "$modern_vmss" --instance-id "$instance" \
+              --query '{statuses:statuses,vmAgent:vmAgent,extensions:extensions[].{name:name,statuses:statuses}}' \
+              --output json --only-show-errors > "$directory/cniv5-$instance-instance-view.json"
+          done
+        fi
+        jq -n --argjson vmss_seen "$modern_vmss_seen" \
+          '{observation_only:true,mutation_started:false,pool_seen:true,vmss_seen:$vmss_seen,
+            creation_receipt_reference_build:79971,registered_nodes_ready:false,workloads_ready:false,
+            note:"Raw observation of the existing accepted creation, not a new request or readiness qualification"}' \
+          > "$directory/cniv5-observation.json"
+      fi
       timeout 60 az vmss get-instance-view --subscription "$EXPECTED_SUBSCRIPTION_ID" \
         --resource-group "$node_group" --name aks-default-28928250-vmss \
         --query '{statuses:statuses,virtualMachines:virtualMachine.statusesSummary}' \

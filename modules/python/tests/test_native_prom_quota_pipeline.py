@@ -90,16 +90,24 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                             "timeout": "GatewayTimeout"}[fault]
                     print(f"ERROR: ({code}) explicit fake read error", file=sys.stderr)
                     sys.exit(1)
-                assert name in {"78751-f36f3d5a", "79825-24946a3a"} or name.startswith("mc_79825-24946a3a_")
+                assert name in {"78751-f36f3d5a", "79825-24946a3a", "mc_78751-f36f3d5a_clustermesh-96_eastus2euap"} \
+                    or name.startswith("mc_79825-24946a3a_")
                 value = {"id": prefix + name, "name": name, "location": "eastus2euap",
                          "tags": {"run_id": name}, "properties": {"provisioningState": "Succeeded"}}
             elif args[:3] == ["aks", "operation", "show-latest"]:
                 value = {"name": "operation", "status": "Succeeded", "operationType": "DeleteMachines"}
+                if "--nodepool-name" in args:
+                    assert fault.startswith("modern-") and arg("--nodepool-name") == "cniv5"
+                    value.update(name="owned-cniv5-create", operationType="PutAgentPool",
+                                 status="InProgress" if fault == "modern-creating" else "Succeeded")
             elif args[:3] == ["aks", "nodepool", "list"]:
                 value = [
                     {"name": "default", "count": 2, "mode": "System", "provisioningState": "Succeeded"},
                     {"name": "prompool", "count": 0, "mode": "User", "provisioningState": "Succeeded"},
                 ]
+                if fault.startswith("modern-"):
+                    value.append({"name": "cniv5", "count": 2, "mode": "System", "vmSize": "Standard_D8s_v5",
+                                  "provisioningState": "Creating" if fault == "modern-creating" else "Succeeded"})
             elif args[:2] == ["aks", "show"]:
                 assert arg("--name") == "clustermesh-96" and arg("--resource-group") == "78751-f36f3d5a"
                 value = {"id": prefix + "78751-f36f3d5a/providers/Microsoft.ContainerService/managedClusters/clustermesh-96",
@@ -116,7 +124,11 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                 target.write_text("private-test-credentials", encoding="utf-8")
                 sys.exit(0)
             elif args[:2] == ["vmss", "get-instance-view"]:
-                assert arg("--name") == "aks-default-28928250-vmss"
+                assert arg("--name") in ("aks-default-28928250-vmss", "aks-cniv5-27550670-vmss")
+                modern = arg("--name") == "aks-cniv5-27550670-vmss"
+                if modern and fault == "modern-forbidden":
+                    print("AuthorizationFailed: new VM view denied", file=sys.stderr)
+                    sys.exit(1)
                 if "--instance-id" in args:
                     assert arg("--instance-id") in ("0", "1")
                     value = {"statuses": [{"code": "PowerState/running"}], "extensions": [],
@@ -124,6 +136,18 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                 else:
                     value = {"statuses": [{"code": "ProvisioningState/failed"}],
                              "virtualMachine": {"statusesSummary": [{"code": "ProvisioningState/failed", "count": 1}]}}
+                if modern:
+                    code = ("ProvisioningState/creating/osProvisioningComplete"
+                            if fault == "modern-creating" else "ProvisioningState/succeeded")
+                    value = {"statuses": [{"code": code}, {"code": "PowerState/running"}],
+                             "vmAgent": {"statuses": []}, "extensions": [],
+                             "virtualMachine": {"statusesSummary": [{"code": code, "count": 2}]}}
+            elif args[:2] == ["vmss", "show"]:
+                assert fault.startswith("modern-") and arg("--name") == "aks-cniv5-27550670-vmss"
+                value = {"name": arg("--name"), "sku": {"capacity": 2, "name": "Standard_D8s_v5"},
+                         "virtualMachineProfile": {"storageProfile": {
+                             "osDisk": {"diskSizeGB": 256, "osType": "Linux"},
+                             "imageReference": {"id": "captured-image"}}}}
             elif args[:3] == ["monitor", "activity-log", "list"]:
                 assert arg("--resource-id") == (
                     f"/subscriptions/{sub}/resourceGroups/"
@@ -146,6 +170,10 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                 assert group.startswith(("mc_78751-f36f3d5a_clustermesh-96_", "mc_79825-24946a3a_"))
                 value = [{"name": "allowed-vmss", "sku": {"name": "Standard_D8_v3", "capacity": 0},
                           "provisioningState": "Succeeded"}]
+                if fault.startswith("modern-") and group.startswith("mc_78751-"):
+                    value.append({"name": "aks-cniv5-27550670-vmss",
+                                  "sku": {"name": "Standard_D8s_v5", "capacity": 2},
+                                  "provisioningState": "Creating" if fault == "modern-creating" else "Succeeded"})
             elif args[:2] == ["vm", "list-skus"]:
                 assert arg("--size") == "Standard_D8s_v5" and arg("--location") == "eastus2euap"
                 value = [{"name": "Standard_D8s_v5", "family": "standardDSv5Family",
@@ -153,8 +181,12 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                           "capabilities": [{"name": "vCPUs", "value": "8"}, {"name": "MemoryGB", "value": "32"}]}]
             else:
                 assert args[:2] == ["vmss", "list-instances"]
-                assert arg("--name") in ("aks-prompool-38822163-vmss", "aks-default-28928250-vmss")
+                assert arg("--name") in ("aks-prompool-38822163-vmss", "aks-default-28928250-vmss",
+                                        "aks-cniv5-27550670-vmss")
                 value = []
+                if arg("--name") == "aks-cniv5-27550670-vmss":
+                    value = [{"instanceId": str(index), "vmId": f"new-vm-{index}", "latestModelApplied": True,
+                              "osProfile": {"computerName": f"new-node-{index}"}} for index in (0, 1)]
             if "--query" in args:
                 value = jmespath.search(arg("--query"), value)
             print(json.dumps(value))
@@ -179,7 +211,9 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
             assert config.stat().st_mode & 0o777 == 0o600
             assert args[2:6] == ["--context", "clustermesh-96", "--request-timeout=20s", "get"]
             assert args[6] in ("nodes", "pods", "events", "deployments,replicasets,daemonsets,statefulsets",
-                               "pdb", "nodenetworkconfigs")
+                               "pdb", "nodenetworkconfigs", "configmap")
+            if args[6] == "configmap":
+                assert os.environ["FAULT"].startswith("modern-") and args[7] == "mesh96-capacity-first-cniv5"
             assert args[-2:] == ["-o", "json"]
             assert not set(args) & {"apply", "patch", "delete", "cordon", "taint", "exec"}
             if os.environ["FAULT"] == "kube-forbidden":
@@ -213,7 +247,7 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
     result = subprocess.run(
         ["bash", "-c", script], env=environment, capture_output=True, text=True, check=False, timeout=20,
     )
-    success = fault in ("none", "absent", "managed-absent")
+    success = fault in ("none", "absent", "managed-absent", "modern-creating", "modern-succeeded")
     assert (result.returncode == 0) is success, result.stderr
     directory = tmp_path / "artifacts" / "n100-unreachable-worker-recovery"
     if success:
@@ -236,6 +270,17 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
         assert modern[0]["remaining"] == 900
         sku = json.loads((directory / "supported-vm-sku.json").read_text(encoding="utf-8"))
         assert sku[0]["name"] == "Standard_D8s_v5" and sku[0]["restrictions"] == []
+        if fault.startswith("modern-"):
+            modern = json.loads((directory / "cniv5-observation.json").read_text(encoding="utf-8"))
+            assert modern["pool_seen"] and modern["vmss_seen"] and modern["creation_receipt_reference_build"] == 79971
+            assert modern["observation_only"] and not modern["mutation_started"]
+            assert not modern["registered_nodes_ready"] and not modern["workloads_ready"]
+            for index in (0, 1):
+                view = json.loads((directory / f"cniv5-{index}-instance-view.json").read_text(encoding="utf-8"))
+                expected = ("ProvisioningState/creating/osProvisioningComplete"
+                            if fault == "modern-creating" else "ProvisioningState/succeeded")
+                assert view["statuses"][0]["code"] == expected
+            assert (directory / "cniv5-capacity-journal.json").is_file()
         if fault == "absent":
             assert json.loads((directory / "accidental-group.json").read_text(encoding="utf-8"))["proof"] \
                 == "ResourceGroupNotFound"
@@ -262,3 +307,8 @@ def test_quota_observer_has_no_helper_execution_or_retries():
     assert "--execute" not in operation["script"] and "python3" not in operation["script"]
     assert "az rest" not in operation["script"]
     assert artifact["task"] == "PublishPipelineArtifact@1" and "always()" in artifact["condition"]
+
+
+@pytest.mark.parametrize("fault", ["modern-creating", "modern-succeeded", "modern-forbidden"])
+def test_existing_accepted_capacity_observation_is_read_only(tmp_path, fault):
+    test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fault, 32, 100, "number")
