@@ -53,6 +53,7 @@ SOURCE_BOOT_ID = "fbecbcc6-d934-4c29-adb5-1331497b3706"
 PROM_MEMORY_RESERVE = 16 * 1024**3
 MEMORY_SAFETY_RESERVE = 512 * 1024**2
 PROVIDER_SUBMIT_SECONDS = 180
+SKU_READ_SECONDS = 180
 POLL_SECONDS = 10
 FINAL_RESERVE_SECONDS = 120
 CREATING = {"Creating", "Updating", "Scaling"}
@@ -394,6 +395,9 @@ class PromRecovery(maintenance.ClusterOperator):
 
         for attempt in range(1, 4):
             try:
+                print(f"{workers.utc_now()}: capacity {' '.join(command[:2])} read attempt {attempt}/3", flush=True)
+                if command[:2] == ("vm", "list-skus"):
+                    return self.az_json(*command, timeout_seconds=SKU_READ_SECONDS)
                 return self.az_json(*command)
             except workers.ReconcileError as error:
                 if attempt == 3 or modern.recovery.arm.TRANSIENT_READ_RE.search(str(error)) is None:

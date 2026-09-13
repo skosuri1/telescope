@@ -1312,6 +1312,35 @@ def test_memory_reserve_covers_the_configured_n100_prometheus_limit():
     assert prom.PROM_MEMORY_RESERVE >= int(stage["variables"]["CL2_PROMETHEUS_MEMORY_LIMIT_GI"]) * 1024**3
 
 
+@pytest.mark.parametrize("operation,timeout", [("list-skus", 180), ("list-usage", 45)])
+@pytest.mark.parametrize("failure", ["none", "transient", "authorization"])
+def test_capacity_read_budget_is_scoped_and_only_transient_reads_retry(monkeypatch, operation, timeout, failure):
+    recovery = object.__new__(prom.PromRecovery)
+    calls = []
+    sleeps = []
+
+    def read(*command, timeout_seconds=45):
+        calls.append((command, timeout_seconds))
+        if failure == "authorization":
+            raise prom.workers.ReconcileError("AuthorizationFailed")
+        if failure == "transient" and len(calls) == 1:
+            raise prom.workers.ReconcileError(f"command timed out after {timeout_seconds}s: az vm {operation}")
+        return ["synthetic-read-result"]
+
+    recovery.az_json = read
+    recovery.remaining_seconds = lambda seconds: seconds
+    monkeypatch.setattr(prom.time, "sleep", sleeps.append)
+    if failure == "authorization":
+        with pytest.raises(prom.workers.ReconcileError, match="AuthorizationFailed"):
+            recovery.az_json_retry("vm", operation)
+    else:
+        assert recovery.az_json_retry("vm", operation) == ["synthetic-read-result"]
+    assert all(value == timeout for _, value in calls)
+    assert len(calls) == (2 if failure == "transient" else 1)
+    assert sleeps == ([2] if failure == "transient" else [])
+    assert 3 * prom.SKU_READ_SECONDS < 15 * 60
+
+
 @pytest.mark.parametrize("error,complete", [("ResourceNotFound (404)", True), ("Forbidden (403)", False)])
 def test_deleted_pool_child_endpoint_absence_requires_positive_pool_and_vmss_absence(tmp_path, error, complete):
     class DeletedEndpointCloud(FullCloud):
