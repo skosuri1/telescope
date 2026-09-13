@@ -369,6 +369,15 @@ Initial Node/NNC/guest readiness is not network-growth or workload-placement
 qualification; that evidence and complete owned-probe cleanup are required
 before later native fencing.
 
+The current capacity route continues the exact build 80029 checkpoint: mesh 51's
+already accepted `cniv5` creation and retained journal are observed read-only;
+only the unsubmitted mesh 66, 79, and 89 adds may be sent. The original plan,
+receipt, and complete input tree are immutable inputs in both phases. Azure's
+`CreatingAgentPool: 1/2 nodes completed` is nonterminal progress, not readiness
+or failure; operation identity, VMSS generation, terminal status, and real
+worker readiness still have to agree. A later partial failure is not an
+automatically resumable checkpoint and cannot authorize another accepted add.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,

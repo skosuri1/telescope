@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -425,7 +426,7 @@ def make_args(tmp_path, source, *, execute=False, name="summary.json"):
 
 
 class StatefulCloud:
-    """Serve raw source state, one pending observation, then genuine readiness."""
+    """Serve synthetic source state, one pending observation, then simulated readiness."""
 
     def __init__(self, states):
         self.states = copy.deepcopy(states)
@@ -532,10 +533,12 @@ class StatefulCloud:
         ]
         state["new_operation"] = {
             "name": uid(f"new-operation/{role}"), "status": "InProgress",
+            "id": f"{pool_row['id']}/operations/{uid(f'new-operation/{role}')}",
             "operationType": "PutAgentPool",
             "startTime": recovery.utc_now(), "endTime": None,
             "errorCode": None,
         }
+        vmss_row["tags"]["aks-managed-createOperationID"] = state["new_operation"]["name"]
         self.phase[role] = "pending"
 
     def apply_patch(self, row, operations):
@@ -1062,3 +1065,181 @@ def test_explicit_blocked_node_upgrade_setting_is_not_ignored(environment, value
     with pytest.raises(recovery.workers.ReconcileError, match="pool configuration changed"):
         recovery.execute_recovery(make_args(tmp_path, source, name="changed-upgrade.json"), {}, cloud)
     assert not cloud.adds
+
+
+@pytest.mark.parametrize("status,valid,ready", [
+    ("CreatingAgentPool: 0/2 nodes completed", True, False),
+    ("CreatingAgentPool: 1/2 nodes completed", True, False),
+    ("CreatingAgentPool: 2/2 nodes completed", True, False),
+    ("InProgress", True, False), ("Running", True, False), ("Succeeded", True, True),
+    ("Failed", False, False), ("Canceled", False, False),
+    ("CreatingAgentPool: 3/2 nodes completed", False, False),
+    ("CreatingAgentPool: 1/3 nodes completed", False, False),
+    ("CreatingAgentPool: -1/2 nodes completed", False, False),
+    ("CreatingAgentPool: failed", False, False), ("Unknown", False, False),
+])
+def test_creation_progress_is_pending_not_ready_or_a_provider_failure(status, valid, ready):
+    now = datetime.now(timezone.utc)
+    source = {"role": "mesh-51", "cluster": {"id": "/clusters/51"},
+              "desired": {"name": "cniv5", "count": 2}}
+    action = {"submission_started_at": (now - timedelta(seconds=2)).isoformat()}
+    operation = {
+        "name": uid("operation"), "id": f"/clusters/51/agentPools/cniv5/operations/{uid('operation')}",
+        "operationType": "PutAgentPool", "subOperationType": "Creating", "status": status,
+        "startTime": (now - timedelta(seconds=1)).isoformat(),
+        "endTime": now.isoformat() if ready else None, "percentComplete": 50.0,
+    }
+    vmss_row = {"tags": {"aks-managed-createOperationID": operation["name"]}}
+    if valid:
+        assert recovery.pool_operation_ready(operation, source, action, vmss_row) is ready
+    else:
+        with pytest.raises(recovery.workers.ReconcileError):
+            recovery.pool_operation_ready(operation, source, action, vmss_row)
+
+
+@pytest.mark.parametrize("fault", [
+    "error", "type", "generation", "identity", "previous-operation", "timestamp", "ended", "percent",
+])
+def test_creation_progress_never_waives_operation_ownership_or_terminal_errors(fault):
+    now = datetime.now(timezone.utc)
+    source = {"role": "mesh-51", "cluster": {"id": "/clusters/51"},
+              "desired": {"name": "cniv5", "count": 2}}
+    action = {"submission_started_at": (now - timedelta(seconds=2)).isoformat()}
+    operation = {
+        "name": uid("operation"), "id": f"/clusters/51/agentPools/cniv5/operations/{uid('operation')}",
+        "operationType": "PutAgentPool", "subOperationType": "Creating",
+        "status": "CreatingAgentPool: 1/2 nodes completed",
+        "startTime": (now - timedelta(seconds=1)).isoformat(), "endTime": None,
+    }
+    vmss_row = {"tags": {"aks-managed-createOperationID": operation["name"]}}
+    if fault == "error":
+        operation["error"] = {"code": "QuotaExceeded"}
+    elif fault == "type":
+        operation["operationType"] = "DeleteMachines"
+    elif fault == "generation":
+        vmss_row["tags"]["aks-managed-createOperationID"] = uid("other")
+    elif fault == "identity":
+        operation["id"] = "/clusters/66/agentPools/cniv5/operations/other"
+    elif fault == "previous-operation":
+        action["operation_name"] = uid("other")
+    elif fault == "timestamp":
+        operation["startTime"] = (now - timedelta(days=1)).isoformat()
+    elif fault == "ended":
+        operation["endTime"] = now.isoformat()
+    else:
+        operation["percentComplete"] = True
+    with pytest.raises(recovery.workers.ReconcileError):
+        recovery.pool_operation_ready(operation, source, action, vmss_row)
+
+
+@pytest.fixture(name="accepted_environment")
+def fixture_accepted_environment(environment, monkeypatch):
+    tmp_path, source, cloud = environment
+    plan_args = make_args(tmp_path, source, name="original-plan.json")
+    recovery.execute_recovery(plan_args, {}, cloud)
+    execute_args = make_args(tmp_path, source, execute=True, name="original-recovery.json")
+    original_state = recovery.RoleRecovery.new_pool_state
+    original_azure = cloud.azure
+
+    def historical_observer(worker, _observed, _guarded):
+        assert worker.role == "mesh-51"
+        raise recovery.workers.ReconcileError("mesh-51: new pool operation is failed or unrelated")
+
+    def progress(command, role):
+        result = original_azure(command, role)
+        if command[:4] == ["az", "aks", "operation", "show-latest"] and role == "mesh-51":
+            row = json.loads(result)
+            if row and row.get("status") == "InProgress":
+                row.update(status="CreatingAgentPool: 1/2 nodes completed",
+                           subOperationType="Creating", percentComplete=50.0)
+                return json.dumps(row)
+        return result
+
+    monkeypatch.setattr(recovery.RoleRecovery, "new_pool_state", historical_observer)
+    cloud.azure = progress
+    with pytest.raises(recovery.workers.ReconcileError, match="new pool operation"):
+        recovery.execute_recovery(execute_args, {}, cloud)
+    monkeypatch.setattr(recovery.RoleRecovery, "new_pool_state", original_state)
+    cloud.azure = original_azure
+    checkpoint = tmp_path / "accepted"
+    checkpoint.mkdir()
+    shutil.copyfile(plan_args.summary_file, checkpoint / "plan.json")
+    shutil.copyfile(execute_args.summary_file, checkpoint / "recovery.json")
+    shutil.copytree(source, checkpoint / "source-input")
+    monkeypatch.setattr(recovery, "ACCEPTED_RECEIPT_SHA",
+                        recovery.digest((checkpoint / "recovery.json").read_bytes()))
+    monkeypatch.setattr(recovery, "ACCEPTED_PLAN_SHA",
+                        recovery.digest((checkpoint / "plan.json").read_bytes()))
+    cloud.adds.clear()
+    cloud.patches.clear()
+    cloud.reads.clear()
+    return tmp_path, source, cloud, checkpoint
+
+
+def accepted_args(environment, *, execute=False, name="continued.json"):
+    tmp_path, source, _cloud, checkpoint = environment
+    args = make_args(tmp_path, source, execute=execute, name=name)
+    args.resume_directory = str(checkpoint)
+    args.resume_build_id = recovery.ACCEPTED_BUILD
+    return args
+
+
+def test_accepted_capacity_plan_is_read_only_including_the_original_journal(accepted_environment):
+    _tmp_path, _source, cloud, _checkpoint = accepted_environment
+    original = copy.deepcopy(cloud.configmaps["mesh-51"])
+    summary = {}
+    recovery.execute_recovery(accepted_args(accepted_environment), summary, cloud)
+    assert summary["plan_valid"] and not summary["mutation_started"]
+    assert summary["per_role"]["mesh-51"]["initial_network_ready"]
+    assert summary["per_role"]["mesh-51"]["read_only_continuation"]
+    assert summary["capacity"]["required_cores"] == 40
+    assert cloud.configmaps["mesh-51"] == original
+    assert not cloud.adds and not cloud.patches
+    assert not any(command[0] == "kubectl" and "create" in command for command, _ in cloud.reads)
+
+
+def test_accepted_capacity_continuation_sends_only_three_first_adds(accepted_environment):
+    _tmp_path, _source, cloud, _checkpoint = accepted_environment
+    original = copy.deepcopy(cloud.configmaps["mesh-51"])
+    summary = {}
+    recovery.execute_recovery(accepted_args(accepted_environment, execute=True), summary, cloud)
+    assert summary["success"] and summary["capacity_created"] and summary["initial_network_ready"]
+    assert not summary["capacity_qualified"] and not summary["workloads_ready"]
+    assert not summary["completed_global_baseline"] and not summary["automatic_resume_or_adoption"]
+    assert [role for role, _ in cloud.adds] == ["mesh-66", "mesh-79", "mesh-89"]
+    assert all(role != "mesh-51" for role, _ in cloud.patches)
+    assert cloud.configmaps["mesh-51"] == original
+    assert summary["continuation"]["original_journal_unchanged"]
+    assert not summary["continuation"]["accepted_add_replayed"]
+    assert len(summary["per_role"]["mesh-51"]["new_identities"]) == 2
+    assert summary["per_role"]["mesh-51"]["journal"]["created_in_build"] == 80029
+
+
+@pytest.mark.parametrize("fault", ["journal-data", "journal-rv", "vm-id", "later-pool", "checkpoint"])
+def test_accepted_capacity_drift_stops_before_an_add_or_journal_write(accepted_environment, fault):
+    _tmp_path, _source, cloud, checkpoint = accepted_environment
+    if fault.startswith("journal"):
+        row = cloud.configmaps["mesh-51"][-1]
+        if fault == "journal-data":
+            row["data"]["record"] = "{}"
+        else:
+            row["metadata"]["resourceVersion"] = "999999"
+    elif fault == "vm-id":
+        cloud.states["mesh-51"]["instances"]["cniv5"][0]["vmId"] = uid("unrelated-vm")
+    elif fault == "later-pool":
+        cloud.add_pool("mesh-66")
+    else:
+        with (checkpoint / "recovery.json").open("a", encoding="utf-8") as handle:
+            handle.write(" ")
+    with pytest.raises(recovery.workers.ReconcileError):
+        recovery.execute_recovery(accepted_args(accepted_environment, execute=True), {}, cloud)
+    assert not cloud.adds and not cloud.patches
+    assert not any(command[0] == "kubectl" and "create" in command for command, _ in cloud.reads)
+
+
+def test_only_checkpoint_reader_accepts_bounded_large_receipts(tmp_path):
+    path = tmp_path / "large.json"
+    path.write_text(" " * (32 * 1024 * 1024) + '{"receipt":true}', encoding="utf-8")
+    with pytest.raises(recovery.workers.ReconcileError, match="JSON file size"):
+        recovery.read_json(path)
+    assert recovery.read_json(path, max_bytes=recovery.CHECKPOINT_MAX_BYTES) == {"receipt": True}

@@ -15,22 +15,26 @@ steps:
       snapshot_hashes() {
         test -d "$directory/source-input"
         test ! -L "$directory/source-input"
-        if find "$directory/source-input" -type l -print -quit | grep -q .; then
+        test -d "$directory/accepted-input"
+        test ! -L "$directory/accepted-input"
+        if find "$directory/source-input" "$directory/accepted-input" -type l -print -quit | grep -q .; then
           echo "Capacity source contains a symlink." >&2
           return 1
         fi
-        (cd "$directory/source-input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
+        (cd "$directory" && find source-input accepted-input -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
       }
       if [ "$PHASE" = "plan" ]; then
-        python3 - "$SOURCE_DIRECTORY" "$directory" <<'PY'
+        python3 - "$SOURCE_DIRECTORY" "$ACCEPTED_DIRECTORY" "$directory" <<'PY'
       import sys
       from pathlib import Path
-      source, output = (Path(value) for value in sys.argv[1:])
-      if source.is_symlink() or not source.is_dir() or any(path.is_symlink() for path in source.rglob("*")):
-          raise SystemExit("Capacity source must be a complete non-symlinked directory.")
-      source, output = source.resolve(), output.resolve()
-      if source == output or source in output.parents or output in source.parents or output.exists():
-          raise SystemExit("Capacity output must be new and disjoint from source evidence.")
+      *sources, output = (Path(value) for value in sys.argv[1:])
+      if any(source.is_symlink() or not source.is_dir()
+             or any(path.is_symlink() for path in source.rglob("*")) for source in sources):
+          raise SystemExit("Capacity sources must be complete non-symlinked directories.")
+      paths = [path.resolve() for path in [*sources, output]]
+      if output.exists() or any(left == right or left in right.parents or right in left.parents
+                                for index, left in enumerate(paths) for right in paths[index + 1:]):
+          raise SystemExit("Capacity output must be new and all inputs must be disjoint.")
       PY
         jq -e '.read_only == true and .resource_mutations == 0 and .source_build_id == 80017' \
           "$SOURCE_DIRECTORY/summary.json" >/dev/null
@@ -38,6 +42,7 @@ steps:
         mkdir "$directory"
         echo "##vso[task.setvariable variable=SECONDARY_CAPACITY_DIAGNOSTICS_READY]true"
         cp -R -- "$SOURCE_DIRECTORY" "$directory/source-input"
+        cp -R -- "$ACCEPTED_DIRECTORY" "$directory/accepted-input"
         snapshot_hashes > "$directory/inputs.sha256"
         inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
         tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
@@ -77,6 +82,7 @@ steps:
       done
       args=(
         --source-directory "$directory/source-input" --source-build-id "$SOURCE_BUILD_ID"
+        --resume-directory "$directory/accepted-input" --resume-build-id 80029
         --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
         --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
         --expected-tfvars-sha "$tfvars_sha" --kubeconfig-directory "$private"
@@ -100,7 +106,7 @@ steps:
       displayName: "Plan replacement capacity without touching existing workers"
       timeoutInMinutes: 25
     ${{ else }}:
-      displayName: "Add only supported replacement pools and observe their readiness"
+      displayName: "Keep mesh51 read-only and add only the three unsubmitted replacement pools"
       timeoutInMinutes: 125
     retryCountOnTaskFailure: 0
     env:
@@ -112,6 +118,7 @@ steps:
       TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
       SOURCE_BUILD_ID: ${{ parameters.scope.source_build_id }}
       SOURCE_DIRECTORY: $(Pipeline.Workspace)/secondary-capacity-source
+      ACCEPTED_DIRECTORY: $(Pipeline.Workspace)/secondary-capacity-accepted
       ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
       REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
       AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)

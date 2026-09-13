@@ -22,7 +22,7 @@ parameters:
 
 jobs:
   - job: secondary_capacity_recovery
-    displayName: "Add supported replacement capacity for the four diagnosed failed hosts"
+    displayName: "Observe accepted mesh51 capacity and add the three unsubmitted pools"
     timeoutInMinutes: 160
     cancelTimeoutInMinutes: 30
     variables:
@@ -63,6 +63,18 @@ jobs:
           pipelineId: ${{ parameters.source_build_id }}
           artifactName: n100-readiness-diagnostics-${{ parameters.source_build_id }}-1
           targetPath: $(Pipeline.Workspace)/secondary-capacity-source
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download the exact accepted mesh51 add without replaying it"
+        inputs:
+          buildType: specific
+          project: $(System.TeamProjectId)
+          definition: $(System.DefinitionId)
+          specificBuildWithTriggering: false
+          buildVersionToDownload: specific
+          pipelineId: 80029
+          allowFailedBuilds: true
+          artifactName: n100-secondary-capacity-80029-1
+          targetPath: $(Pipeline.Workspace)/secondary-capacity-accepted
       - template: /steps/topology/clustermesh-scale/reuse/secondary-capacity.yml
         parameters:
           phase: plan

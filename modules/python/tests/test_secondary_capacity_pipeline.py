@@ -50,6 +50,11 @@ def test_capacity_mode_is_exclusive_and_plan_publication_precedes_actions():
     assert "eq(parameters.scaleDebugModernBaselineBuildId, 0)" in invocation["parameters"]["exclusive_modes"]
     job = yaml.safe_load(JOB.read_text(encoding="utf-8"))["jobs"][0]
     assert job["timeoutInMinutes"] == 160 and job["cancelTimeoutInMinutes"] == 30
+    accepted = next(row for row in job["steps"]
+                    if row.get("inputs", {}).get("pipelineId") == 80029)
+    assert accepted["inputs"]["artifactName"] == "n100-secondary-capacity-80029-1"
+    assert accepted["inputs"]["allowFailedBuilds"] is True
+    assert "itemPattern" not in accepted["inputs"]
     phases = [(index, row["parameters"]["phase"]) for index, row in enumerate(job["steps"])
               if row.get("template") == "/steps/topology/clustermesh-scale/reuse/secondary-capacity.yml"]
     publish = next(index for index, row in enumerate(job["steps"])
@@ -66,12 +71,18 @@ def test_capacity_mode_is_exclusive_and_plan_publication_precedes_actions():
     ("credential-failure", 0), ("unsafe-plan", 1), ("mutating-plan", 1),
     ("source-change", 1), ("tfvars-change", 1), ("between-change", 1), ("missing-hash", 1),
     ("execute-error", 2), ("no-capacity", 2), ("false-qualification", 2), ("workload-claim", 2),
+    ("accepted-symlink", 0), ("accepted-source-change", 1), ("accepted-between-change", 1),
 ])
 def test_capacity_wrapper_freezes_source_and_removes_all_four_private_configs(tmp_path, fault, count):
     script = yaml.safe_load(STEP.read_text(encoding="utf-8"))["steps"][0]["script"]
-    source, checkout, private, binaries = (tmp_path / name for name in ("source", "checkout", "private", "bin"))
-    for directory in (source, checkout, private, binaries):
+    source, accepted, checkout, private, binaries = (
+        tmp_path / name for name in ("source", "accepted", "checkout", "private", "bin")
+    )
+    for directory in (source, accepted, checkout, private, binaries):
         directory.mkdir()
+    (accepted / "recovery.json").write_text('{"accepted":true}', encoding="utf-8")
+    if fault == "accepted-symlink":
+        (accepted / "linked").symlink_to(accepted / "recovery.json")
     (source / "summary.json").write_text(json.dumps({
         "read_only": fault != "bad-source", "resource_mutations": 0, "source_build_id": 80017,
     }), encoding="utf-8")
@@ -92,6 +103,9 @@ def test_capacity_wrapper_freezes_source_and_removes_all_four_private_configs(tm
         def value(name): return args[args.index(name)+1]
         execute='--execute' in args
         assert value('--source-build-id')=='80022' and value('--timeout-seconds')=='7200'
+        assert value('--resume-build-id')=='80029'
+        accepted=Path(value('--resume-directory'))
+        assert accepted.name=='accepted-input' and (accepted/'recovery.json').is_file()
         assert value('--resource-group')==value('--confirm-resource-group')=='78751-f36f3d5a'
         configs=Path(value('--kubeconfig-directory'))
         assert {p.name for p in configs.iterdir()}=={f'mesh-{n}.config' for n in (51,66,79,89)}
@@ -100,6 +114,7 @@ def test_capacity_wrapper_freezes_source_and_removes_all_four_private_configs(tm
         with Path(os.environ['CALLS']).open('a') as handle: handle.write(json.dumps(args)+'\\n')
         fault=os.environ['FAULT']
         if not execute and fault=='source-change': (source/'mesh-51/nodes.json').write_text('changed')
+        if not execute and fault=='accepted-source-change': (accepted/'recovery.json').write_text('changed')
         if not execute and fault=='tfvars-change': (Path(os.environ['REPOSITORY_DIRECTORY'])/os.environ['TFVARS_PATH']).write_text('changed')
         Path(value('--summary-file')).write_text(json.dumps({
             'execute':execute,'mutation_started':execute or fault=='mutating-plan',
@@ -133,6 +148,7 @@ def test_capacity_wrapper_freezes_source_and_removes_all_four_private_configs(tm
     env = {
         **os.environ, "PATH": f"{binaries}:{os.environ['PATH']}", "PHASE": "plan",
         "SOURCE_DIRECTORY": str(source), "SOURCE_BUILD_ID": "80022", "RUN_ID": SCOPE["target_run_id"],
+        "ACCEPTED_DIRECTORY": str(accepted),
         "CONFIRM_RESUME": SCOPE["confirm_resume"], "SUBSCRIPTION": SCOPE["expected_subscription_id"],
         "REGION": SCOPE["expected_region"], "TFVARS_PATH": TFVARS,
         "REPOSITORY_DIRECTORY": str(checkout), "AGENT_TEMP_DIRECTORY": str(private),
@@ -147,6 +163,8 @@ def test_capacity_wrapper_freezes_source_and_removes_all_four_private_configs(tm
         assert len(hashes) == 2
         if fault == "between-change":
             (artifacts / "n100-secondary-capacity/source-input/mesh-51/nodes.json").write_text("changed", encoding="utf-8")
+        if fault == "accepted-between-change":
+            (artifacts / "n100-secondary-capacity/accepted-input/recovery.json").write_text("changed", encoding="utf-8")
         env.update(PHASE="execute", INPUTS_SHA="" if fault == "missing-hash" else hashes["SECONDARY_CAPACITY_INPUTS_SHA"],
                    TFVARS_SHA=hashes["SECONDARY_CAPACITY_TFVARS_SHA"])
         result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=15, check=False)

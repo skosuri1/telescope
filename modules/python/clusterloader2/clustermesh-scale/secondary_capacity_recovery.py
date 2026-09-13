@@ -33,6 +33,10 @@ REGION = "eastus2euap"
 TFVARS_SHA = "e99903cc5181367e6e2e08d0cb7d806ddd0ceb81aeacae505c55a5c52bf31160"
 DIAGNOSTIC_BUILD = 80022
 DIAGNOSED_BUILD = 80017
+ACCEPTED_BUILD = 80029
+ACCEPTED_RECEIPT_SHA = "10fa2206fcc9373882d7f19106545d3f49d9140e66daaa76c3588a39944f640f"
+ACCEPTED_PLAN_SHA = "c4206c837ab810d40d0c9d4d523d493e92a75d18c12b6eea2a27e81ab7b81cf7"
+CHECKPOINT_MAX_BYTES = 128 * 1024 * 1024
 PATCH = "1.35.7"
 VM_SIZE = "Standard_D8s_v5"
 QUOTA_FAMILY = "standardDSv5Family"
@@ -119,7 +123,7 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-def read_json(path):
+def read_json(path, *, max_bytes=32 * 1024 * 1024):
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -127,12 +131,13 @@ def read_json(path):
             result[key] = value
         return result
 
+    require(0 < Path(path).stat().st_size <= max_bytes, f"{path}: JSON file size is invalid")
     content = Path(path).read_bytes()
-    require(0 < len(content) <= 32 * 1024 * 1024, f"{path}: JSON file size is invalid")
+    require(0 < len(content) <= max_bytes, f"{path}: JSON file size is invalid")
     return json.loads(content, object_pairs_hook=unique)
 
 
-def hash_tree(directory):
+def hash_tree(directory, *, max_bytes=32 * 1024 * 1024):
     root = Path(directory).resolve()
     require(root.is_dir() and not Path(directory).is_symlink(),
             "Source diagnostics directory is missing or symlinked")
@@ -140,8 +145,8 @@ def hash_tree(directory):
     for path in sorted(root.rglob("*")):
         require(not path.is_symlink(), "Source diagnostics tree contains a symlink")
         if path.is_file():
-            require(path.stat().st_size <= 32 * 1024 * 1024,
-                    "Source diagnostics file exceeds the 32MiB bound")
+            require(path.stat().st_size <= max_bytes,
+                    "Source diagnostics file exceeds the configured size bound")
             result[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
         else:
             require(path.is_dir(), "Source diagnostics tree contains a nonregular entry")
@@ -535,6 +540,148 @@ def empty_action():
     }
 
 
+def pool_operation_ready(operation, source, action, vmss):
+    desired = source["desired"]
+    status = operation.get("status")
+    progress = re.fullmatch(r"CreatingAgentPool: ([0-9]+)/([0-9]+) nodes completed", str(status))
+    pending = status in ("InProgress", "Running")
+    if progress:
+        completed, total = map(int, progress.groups())
+        pending = (operation.get("subOperationType") == "Creating"
+                   and total == desired["count"] and 0 <= completed <= total)
+    percent = operation.get("percentComplete")
+    require(operation.get("name") and not operation.get("errorCode") and not operation.get("error")
+            and (status == "Succeeded" or pending)
+            and (percent is None or isinstance(percent, (int, float))
+                 and not isinstance(percent, bool) and 0 <= percent <= 100)
+            and operation.get("operationType") in {
+                "PutAgentPool", "CreateAgentPool", "CreateOrUpdateAgentPool",
+                "AgentPoolCreate", "AgentPoolCreateOrUpdate",
+            },
+            f"{source['role']}: new pool operation is failed or unrelated")
+    require(resource_equal(operation.get("id"),
+                           f"{source['cluster']['id']}/agentPools/{desired['name']}"
+                           f"/operations/{operation['name']}")
+            and (vmss.get("tags") or {}).get("aks-managed-createOperationID") == operation["name"]
+            and (not action.get("operation_name") or action["operation_name"] == operation["name"]),
+            f"{source['role']}: new pool operation is not the accepted VMSS generation")
+    started = datetime.fromisoformat(str(operation.get("startTime")).replace("Z", "+00:00"))
+    requested = datetime.fromisoformat(str(action["submission_started_at"]).replace("Z", "+00:00"))
+    require(requested <= started <= datetime.now(timezone.utc),
+            f"{source['role']}: new pool operation time is not causally owned")
+    if status == "Succeeded":
+        ended = datetime.fromisoformat(str(operation.get("endTime")).replace("Z", "+00:00"))
+        require(started <= ended <= datetime.now(timezone.utc),
+                f"{source['role']}: new pool operation completion time is invalid")
+    else:
+        require(operation.get("endTime") is None,
+                f"{source['role']}: pending pool operation already has a terminal timestamp")
+    action["operation_name"] = operation["name"]
+    return status == "Succeeded"
+
+
+def load_accepted_checkpoint(args, bundle):
+    root = Path(args.resume_directory)
+    hashes = hash_tree(root, max_bytes=CHECKPOINT_MAX_BYTES)
+    require(hashes.get("recovery.json") == ACCEPTED_RECEIPT_SHA
+            and hashes.get("plan.json") == ACCEPTED_PLAN_SHA,
+            "Only the exact build 80029 accepted-capacity checkpoint may continue")
+    source_hashes = {
+        name.removeprefix("source-input/"): value for name, value in hashes.items()
+        if name.startswith("source-input/")
+    }
+    require(source_hashes == bundle["hashes"], "Accepted checkpoint changed its original build 80022 inputs")
+    receipt = read_json(root / "recovery.json", max_bytes=CHECKPOINT_MAX_BYTES)
+    plan = read_json(root / "plan.json", max_bytes=CHECKPOINT_MAX_BYTES)
+    require(receipt.get("execute") is True and receipt.get("mutation_started") is True
+            and receipt.get("success") is False and receipt.get("status") == "failed-closed"
+            and receipt.get("error") == "mesh-51: new pool operation is failed or unrelated"
+            and plan.get("execute") is False and plan.get("mutation_started") is False
+            and plan.get("success") is True,
+            "Accepted continuation requires the original failed observer, not a provider retry")
+    for checkpoint in (plan, receipt):
+        require(checkpoint.get("schema_version") == 1 and checkpoint.get("plan_valid") is True
+                and checkpoint.get("source_build_id") == DIAGNOSTIC_BUILD
+                and checkpoint.get("diagnosed_build_id") == DIAGNOSED_BUILD
+                and checkpoint.get("source_tree_hashes") == bundle["hashes"]
+                and checkpoint.get("source_tree_sha256") == bundle["tree_sha256"]
+                and checkpoint.get("capacity_qualified") is False
+                and checkpoint.get("workloads_ready") is False
+                and checkpoint.get("completed_global_baseline") is False
+                and checkpoint.get("automatic_resume_or_adoption") is False
+                and set(checkpoint.get("per_role") or {}) == set(ROLES),
+                "Accepted checkpoint source lineage or capacity-only contract changed")
+        for role in ROLES:
+            row = checkpoint["per_role"][role]
+            require(row.get("source_pin_sha256") == bundle["roles"][role]["pin_sha256"]
+                    and row.get("desired_configuration") == bundle["roles"][role]["desired"],
+                    f"{role}: accepted checkpoint source pin or planned configuration changed")
+            if checkpoint is plan or role != "mesh-51":
+                require(row.get("action") == empty_action()
+                        and (row.get("journal") or {}).get("attempted") is False
+                        and (row.get("journal") or {}).get("accepted") is None
+                        and (row.get("journal") or {}).get("ambiguous") is False,
+                        f"{role}: an additional journal/add was attempted; automatic continuation is forbidden")
+    row = receipt["per_role"]["mesh-51"]
+    source = bundle["roles"]["mesh-51"]
+    action, journal = row["action"], row["journal"]
+    require(row.get("status") == "add-accepted"
+            and all(action.get(key) is True for key in ("attempted", "submission_started", "accepted"))
+            and action.get("ambiguous") is False and action.get("automatic_retry_allowed") is False
+            and action.get("command") == pool_add_command(source)
+            and journal.get("attempted") is True and journal.get("accepted") is True
+            and journal.get("ambiguous") is False and journal.get("retained") is True,
+            "Build 80029 lacks its sole nonambiguous, already accepted mesh-51 add")
+    observed = row["diagnostics"]
+    journal_name = f"{JOURNAL_PREFIX}-mesh-51"
+    matches = [item for item in mocks._items(observed["kubernetes"]["configmaps"], "accepted journals")
+               if item.get("metadata", {}).get("name") == journal_name]
+    require(len(matches) == 1, "Accepted checkpoint lacks the exact original journal")
+    original = matches[0]
+    metadata, data = original["metadata"], original["data"]
+    require(object_uid(original) == journal.get("uid")
+            and metadata.get("namespace") == journal.get("namespace") == "kube-system"
+            and metadata.get("name") == journal.get("name") == journal_name
+            and metadata.get("resourceVersion") == journal.get("resource_version")
+            and not metadata.get("deletionTimestamp") and not metadata.get("ownerReferences")
+            and digest(data) == journal.get("data_sha256")
+            and data.get("owner") == OWNER and re.fullmatch(r"[0-9a-f]{32}", str(data.get("token")))
+            and data.get("role") == "mesh-51" and data.get("source_build_id") == str(DIAGNOSTIC_BUILD)
+            and data.get("source_tree_sha256") == bundle["tree_sha256"]
+            and data.get("source_pin_sha256") == source["pin_sha256"]
+            and data.get("desired_sha256") == digest(source["desired"]),
+            "Accepted journal UID/version/data/ownership differs from its original receipt")
+    record = json.loads(data["record"])
+    require(record == {
+        "status": "add-accepted", "action": action, "capacity_created": False,
+        "initial_network_ready": False, "capacity_qualified": False, "new_identities": {},
+    }, "Accepted journal does not preserve the exact original unqualified action")
+    vmsses = [item for item in observed["vmsses"] if workers.vmss_pool_name(item) == source["desired"]["name"]]
+    require(len(vmsses) == 1, "Accepted checkpoint new VMSS identity is ambiguous")
+    vmss = vmsses[0]
+    operation = observed["operations"][source["desired"]["name"]]
+    require(operation.get("status") == "CreatingAgentPool: 1/2 nodes completed"
+            and not pool_operation_ready(operation, source, copy.deepcopy(action), vmss),
+            "Build 80029 does not contain the diagnosed nonterminal creation progress")
+    identities = {}
+    for instance in observed["instances"][vmss["name"]]:
+        name = instance["computerName"]
+        require(name not in identities and maintenance.UUID_RE.fullmatch(instance["vmId"])
+                and resource_equal(instance["id"], f"{vmss['id']}/virtualMachines/{instance['instanceId']}"),
+                "Accepted checkpoint new VM identities are malformed")
+        identities[name] = {
+            "instance_id": str(instance["instanceId"]), "node_name": name,
+            "vm_id": instance["vmId"], "provider_id": ("azure://" + instance["id"]).lower(),
+        }
+    require(len(identities) == source["desired"]["count"]
+            and hash_tree(root, max_bytes=CHECKPOINT_MAX_BYTES) == hashes,
+            "Accepted checkpoint is incomplete or changed while loading")
+    return {
+        "hashes": hashes, "row": row, "journal": original, "vmss": vmss,
+        "new_identities": identities, "operation_name": operation["name"],
+    }
+
+
 class RoleRecovery(maintenance.ClusterOperator):
     """One role's journaled add and read-only convergence observation."""
 
@@ -559,6 +706,28 @@ class RoleRecovery(maintenance.ClusterOperator):
         self.new_identities = {}
         self.new_networks = {}
         self.protected_networks = copy.deepcopy(source["networks"])
+        self.read_only_accepted = role == "mesh-51" and bool(source_bundle.get("accepted"))
+        if self.read_only_accepted:
+            accepted = source_bundle["accepted"]
+            original = accepted["journal"]
+            self.token = original["data"]["token"]
+            self.journal_uid = object_uid(original)
+            self.journal_rv = original["metadata"]["resourceVersion"]
+            self.journal_pin = copy.deepcopy(original["data"])
+            self.new_vmss = accepted["vmss"]["name"]
+            self.new_identities = copy.deepcopy(accepted["new_identities"])
+            self.existing_journals = self.journal_inventory(
+                accepted["row"]["diagnostics"]["kubernetes"]["configmaps"],
+            )
+            self.existing_journals.pop(self.journal_name)
+            self.summary["per_role"][role].update(
+                action=copy.deepcopy(accepted["row"]["action"]),
+                journal={**copy.deepcopy(accepted["row"]["journal"]),
+                         "attached_existing": True, "created_in_build": ACCEPTED_BUILD,
+                         "read_only_continuation": True},
+                read_only_continuation=True, provider_add_allowed=False,
+            )
+            self.summary["per_role"][role]["action"]["operation_name"] = accepted["operation_name"]
 
     def save(self):
         mocks.write_json_atomic(self.args.summary_file, self.summary)
@@ -566,6 +735,10 @@ class RoleRecovery(maintenance.ClusterOperator):
     def unchanged_source(self):
         require(hash_tree(self.args.source_directory) == self.source_bundle["hashes"],
                 "Immutable build 80022 source tree changed")
+        if self.source_bundle.get("accepted"):
+            require(hash_tree(self.args.resume_directory, max_bytes=CHECKPOINT_MAX_BYTES)
+                    == self.source_bundle["accepted"]["hashes"],
+                    "Immutable build 80029 accepted checkpoint changed")
 
     def run_read(self, command, timeout_seconds=READ_SECONDS):
         for attempt in range(1, 4):
@@ -919,6 +1092,8 @@ class RoleRecovery(maintenance.ClusterOperator):
 
     def write(self, command, timeout_seconds):
         require(self.args.execute, "Plan mode cannot mutate")
+        require(not self.read_only_accepted,
+                f"{self.role}: accepted continuation forbids all provider and journal writes")
         require(command == pool_add_command(self.source) or command[:4] in (
             ["kubectl", "create", "configmap", self.journal_name],
             ["kubectl", "patch", "configmap", self.journal_name],
@@ -931,6 +1106,7 @@ class RoleRecovery(maintenance.ClusterOperator):
         return self.run(command, timeout_seconds)
 
     def acquire(self):
+        require(not self.read_only_accepted, f"{self.role}: accepted journal cannot be recreated")
         role_summary = self.summary["per_role"][self.role]
         journal = role_summary["journal"]
         require(not journal["attempted"] and not self.journal_uid,
@@ -958,6 +1134,9 @@ class RoleRecovery(maintenance.ClusterOperator):
     def persist(self):
         self.unchanged_source()
         self.owned_journal()
+        if self.read_only_accepted:
+            self.save()
+            return
         desired = self.journal_data()
         if desired == self.journal_pin:
             self.summary["per_role"][self.role]["journal"].update(
@@ -991,6 +1170,7 @@ class RoleRecovery(maintenance.ClusterOperator):
         self.save()
 
     def submit(self, observed):
+        require(not self.read_only_accepted, f"{self.role}: accepted pool add cannot be resubmitted")
         role_summary = self.summary["per_role"][self.role]
         action = role_summary["action"]
         require(self.journal_uid and not action["attempted"],
@@ -1043,6 +1223,8 @@ class RoleRecovery(maintenance.ClusterOperator):
         vmss_by_pool = {workers.vmss_pool_name(row): row for row in observed["vmsses"]}
         pool = pools.get(desired["name"])
         vmss = vmss_by_pool.get(desired["name"])
+        require(not self.read_only_accepted or pool is not None and vmss is not None,
+                f"{self.role}: already accepted pool or VMSS disappeared")
         if pool is None or vmss is None:
             return False, "waiting for owned pool/VMSS materialization"
         allowed = {"Creating", "Updating", "Scaling", "Succeeded"}
@@ -1245,32 +1427,8 @@ class RoleRecovery(maintenance.ClusterOperator):
         if operation is None:
             initial_network_ready = False
         else:
-            require(operation.get("name") and not operation.get("errorCode") and not operation.get("error")
-                    and operation.get("status") in ("InProgress", "Running", "Succeeded")
-                    and operation.get("operationType") in {
-                        "PutAgentPool", "CreateAgentPool", "CreateOrUpdateAgentPool",
-                        "AgentPoolCreate", "AgentPoolCreateOrUpdate",
-                    },
-                    f"{self.role}: new pool operation is failed or unrelated")
             action = self.summary["per_role"][self.role]["action"]
-            require(not action.get("operation_name") or action["operation_name"] == operation["name"],
-                    f"{self.role}: a different operation followed the accepted pool add")
-            action["operation_name"] = operation["name"]
-            started = datetime.fromisoformat(
-                str(operation.get("startTime")).replace("Z", "+00:00")
-            )
-            requested = datetime.fromisoformat(
-                str(action["submission_started_at"]).replace("Z", "+00:00")
-            )
-            require(requested <= started <= datetime.now(timezone.utc),
-                    f"{self.role}: new pool operation time is not causally owned")
-            if operation.get("status") == "Succeeded":
-                ended = datetime.fromisoformat(
-                    str(operation.get("endTime")).replace("Z", "+00:00")
-                )
-                require(started <= ended <= datetime.now(timezone.utc),
-                        f"{self.role}: new pool operation completion time is invalid")
-            initial_network_ready &= operation.get("status") == "Succeeded"
+            initial_network_ready &= pool_operation_ready(operation, self.source, action, vmss)
         provider_ready = (
             complete_instances and pool.get("provisioningState") == "Succeeded"
             and vmss.get("provisioningState") == "Succeeded"
@@ -1306,23 +1464,24 @@ class RoleRecovery(maintenance.ClusterOperator):
                 self.save()
             print(f"{utc_now()}: {self.role} initial_network_ready={ready}; {reason}", flush=True)
             if ready:
-                return
+                return observed
             require(time.monotonic() < self.work_deadline,
                     f"{self.role}: secondary capacity readiness exceeded the bounded wait")
             time.sleep(min(POLL_SECONDS, self.remaining_seconds(POLL_SECONDS)))
 
     def plan(self):
         self.unchanged_source()
-        observed = self.capture()
-        guarded = self.guard_source(observed)
+        observed = self.wait_ready() if self.read_only_accepted else self.capture()
+        guarded = self.guard_source(observed, allow_new=self.read_only_accepted)
         require(not guarded["pending_protected"],
                 f"{self.role}: protected provider resources must be quiescent before planning")
         role_summary = self.summary["per_role"][self.role]
         role_summary.update(
-            status="plan-valid", plan_valid=True,
+            status="initial-network-ready" if self.read_only_accepted else "plan-valid", plan_valid=True,
             source_pin_sha256=self.source["pin_sha256"],
             desired_configuration=copy.deepcopy(self.source["desired"]),
             command=pool_add_command(self.source),
+            provider_add_allowed=not self.read_only_accepted,
         )
         self.unchanged_source()
         self.save()
@@ -1433,6 +1592,17 @@ def validate_args(args):
     require(files == {f"{role}.config" for role in ROLES}
             and all(not path.is_symlink() for path in kube.iterdir()),
             "Kubeconfig directory must contain exactly the four private role.config files")
+    resume_build = getattr(args, "resume_build_id", 0)
+    resume_directory = getattr(args, "resume_directory", None)
+    require(bool(resume_build) == bool(resume_directory),
+            "Accepted continuation requires both its build ID and checkpoint directory")
+    if resume_build:
+        resume = Path(resume_directory).resolve()
+        require(resume_build == ACCEPTED_BUILD and resume.is_dir()
+                and not Path(resume_directory).is_symlink()
+                and all(resume != path and resume not in path.parents and path not in resume.parents
+                        for path in (source, kube, output)),
+                "Only the separate, exact build 80029 accepted checkpoint may continue")
 
 
 def execute_recovery(args, summary, runner=workers.run_command):
@@ -1447,6 +1617,16 @@ def execute_recovery(args, summary, runner=workers.run_command):
     )
     try:
         bundle = load_source(args)
+        if getattr(args, "resume_build_id", 0):
+            bundle["accepted"] = load_accepted_checkpoint(args, bundle)
+            summary["continuation"] = {
+                "source_build_id": ACCEPTED_BUILD,
+                "checkpoint_hashes": bundle["accepted"]["hashes"],
+                "accepted_role_observed_read_only": "mesh-51",
+                "accepted_add_replayed": False, "original_journal_unchanged": False,
+                "original_journal_writes_allowed": False,
+                "unsubmitted_roles": list(ROLES[1:]),
+            }
         summary.update(
             source_tree_hashes=bundle["hashes"], source_tree_sha256=bundle["tree_sha256"],
             roles=list(ROLES),
@@ -1471,7 +1651,8 @@ def execute_recovery(args, summary, runner=workers.run_command):
                 ],
             }
         deadline = time.monotonic() + args.timeout_seconds
-        summary["capacity"] = capacity_read(args, runner, TOTAL_CORES,
+        outstanding = TOTAL_CORES - (16 if bundle.get("accepted") else 0)
+        summary["capacity"] = capacity_read(args, runner, outstanding,
                                              outer_deadline=deadline - FINAL_RESERVE_SECONDS, summary=summary)
         recoveries = {
             role: RoleRecovery(
@@ -1488,15 +1669,21 @@ def execute_recovery(args, summary, runner=workers.run_command):
         mocks.write_json_atomic(args.summary_file, summary)
         if not args.execute:
             return
-        outstanding = TOTAL_CORES
         for role in ROLES:
             recovery = recoveries[role]
+            if recovery.read_only_accepted:
+                recovery.wait_ready()
+                continue
             summary["capacity"] = capacity_read(args, runner, outstanding,
                                                  outer_deadline=deadline - FINAL_RESERVE_SECONDS, summary=summary)
             recovery.acquire()
             recovery.submit(plans[role])
             recovery.wait_ready()
             outstanding -= 8 * bundle["roles"][role]["desired"]["count"]
+        for recovery in recoveries.values():
+            recovery.wait_ready()
+        if bundle.get("accepted"):
+            summary["continuation"]["original_journal_unchanged"] = True
         summary.update(
             success=True, status="secondary-capacity-initial-network-ready",
             capacity_created=True, initial_network_ready=True,
@@ -1527,6 +1714,8 @@ def parse_args(argv=None):
     ):
         parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--source-build-id", required=True, type=int)
+    parser.add_argument("--resume-directory")
+    parser.add_argument("--resume-build-id", type=int, default=0)
     parser.add_argument("--timeout-seconds", type=int, default=3600)
     parser.add_argument("--request-timeout-seconds", type=int, default=60)
     parser.add_argument("--execute", action="store_true")
