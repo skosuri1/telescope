@@ -22,6 +22,7 @@ SCOPE = {
     "expected_subscription_id": "37deca37-c375-4a14-b90a-043849bd2bf1",
     "expected_region": "eastus2euap", "expected_cluster_count": 100, "tfvars_path": TFVARS,
     "overlay_mode": "resume-existing", "run_workload": False, "retirement_build_id": 80001,
+    "resume_build_id": 80007,
     "exclusive_modes": True,
 }
 
@@ -36,6 +37,7 @@ def job():
     {"tfvars_path": "other"}, {"overlay_mode": "resume"}, {"run_workload": True},
     {"retirement_build_id": 79992}, {"retirement_build_id": "80001"}, {"exclusive_modes": False},
     {"run_workload": "false"}, {"exclusive_modes": "true"},
+    {"resume_build_id": 80006}, {"resume_build_id": "80007"},
 ])
 def test_monitoring_requires_exact_typed_completed_retirement_scope(changes):
     result = subprocess.run(
@@ -56,6 +58,7 @@ def test_monitoring_route_is_exclusive_and_only_in_approved_stage():
     invocation = next(row[route][0] for row in stage["jobs"] if route in row)
     assert invocation["template"] == "/jobs/clustermesh-post-retirement-prom.yml"
     assert invocation["parameters"]["retirement_build_id"] == "${{ parameters.scaleDebugPostRetirementPromBuildId }}"
+    assert invocation["parameters"]["resume_build_id"] == 80007
     assert invocation["parameters"]["run_workload"] == "${{ parameters.scaleDebugRunWorkload }}"
     for row in stage["jobs"]:
         condition = next(iter(row))
@@ -94,6 +97,10 @@ def test_monitoring_publishes_readonly_plan_before_bounded_nonretrying_execution
     assert download["artifactName"] == "n100-qualified-worker-retirement-${{ parameters.retirement_build_id }}-1"
     assert download["pipelineId"] == "${{ parameters.retirement_build_id }}"
     assert download["buildType"] == "specific" and download["specificBuildWithTriggering"] is False
+    checkpoint = next(row["inputs"] for row in steps
+                      if row.get("displayName") == "Download the exact unsubmitted monitoring reservation")
+    assert checkpoint["artifactName"] == "n100-post-retirement-prom-${{ parameters.resume_build_id }}-1"
+    assert checkpoint["itemPattern"].splitlines() == ["plan.json", "recovery.json"]
     operation = yaml.safe_load(STEP.read_text(encoding="utf-8"))["steps"][0]
     assert operation["retryCountOnTaskFailure"] == 0
     assert operation["${{ if eq(parameters.phase, 'plan') }}"]["timeoutInMinutes"] == 15
@@ -222,12 +229,19 @@ def test_workload_wrapper_preserves_the_complete_retirement_lineage(tmp_path, fa
     ("between-symlink", 1), ("missing-freeze", 1), ("credentials-execute", 1),
     ("execute-error", 2), ("not-repaired", 2), ("workload-claim", 2), ("wrong-layout", 2),
     ("incomplete-cni", 2), ("cni-source-not-retired", 2),
+    ("resume-change", 1), ("resume-between-change", 1), ("resume-symlink", 0),
 ])
 def test_monitoring_freezes_full_retirement_tree_and_cleans_private_credentials(tmp_path, fault, count):
     script = yaml.safe_load(STEP.read_text(encoding="utf-8"))["steps"][0]["script"]
-    source, checkout, private, binaries = (tmp_path / name for name in ("input", "checkout", "private", "bin"))
-    for path in (source, checkout, private, binaries):
+    source, checkpoint, checkout, private, binaries = (
+        tmp_path / name for name in ("input", "checkpoint", "checkout", "private", "bin")
+    )
+    for path in (source, checkpoint, checkout, private, binaries):
         path.mkdir()
+    (checkpoint / "recovery.json").write_text('{"source_build":80007}', encoding="utf-8")
+    (checkpoint / "plan.json").write_text('{"plan_valid":true}', encoding="utf-8")
+    if fault == "resume-symlink":
+        (checkpoint / "link.json").symlink_to(checkpoint / "recovery.json")
     retirement = {
         "source_build": 80001, "success": True, "native_fencing_proven": fault != "not-fenced",
         "source_retired": fault != "not-retired", "replacements_ready": fault != "not-ready",
@@ -259,6 +273,9 @@ def test_monitoring_freezes_full_retirement_tree_and_cleans_private_credentials(
         execute = "--execute" in args
         assert execute == (os.environ["PHASE"] == "execute")
         assert value("--retirement-build-id") == "80001" and value("--timeout-seconds") == "3600"
+        assert value("--resume-build-id") == "80007"
+        checkpoint = Path(value("--resume-directory"))
+        assert json.loads((checkpoint / "recovery.json").read_text())["source_build"] == 80007
         assert value("--resource-group") == value("--confirm-resource-group") == "78751-f36f3d5a"
         assert value("--expected-subscription") == "37deca37-c375-4a14-b90a-043849bd2bf1"
         assert value("--expected-region") == "eastus2euap" and value("--context") == "clustermesh-96"
@@ -274,6 +291,8 @@ def test_monitoring_freezes_full_retirement_tree_and_cleans_private_credentials(
             (source / "qualification-input/nested/evidence.json").write_text("changed")
         if not execute and fault == "tfvars-change":
             (Path(os.environ["REPOSITORY_DIRECTORY"]) / os.environ["TFVARS_PATH"]).write_text("changed")
+        if not execute and fault == "resume-change":
+            (checkpoint / "recovery.json").write_text("changed")
         output.write_text(json.dumps({
             "execute": execute, "mutation_started": execute or fault == "mutating-plan",
             "plan_valid": fault != "unsafe-plan", "success": execute,
@@ -308,6 +327,7 @@ def test_monitoring_freezes_full_retirement_tree_and_cleans_private_credentials(
         "RUN_ID": SCOPE["target_run_id"], "CONFIRM_RESUME": SCOPE["confirm_resume"],
         "SUBSCRIPTION": SCOPE["expected_subscription_id"], "REGION": SCOPE["expected_region"],
         "RETIREMENT_BUILD_ID": "80001", "RETIREMENT_DIRECTORY": str(source),
+        "RESUME_BUILD_ID": "80007", "RESUME_DIRECTORY": str(checkpoint),
         "TFVARS_PATH": TFVARS, "REPOSITORY_DIRECTORY": str(checkout), "AGENT_TEMP_DIRECTORY": str(private),
         "ARTIFACT_DIRECTORY": str(artifacts), "INPUTS_SHA": "", "TFVARS_SHA": "",
         "FAULT": fault, "CALLS": str(calls_file),
@@ -327,6 +347,10 @@ def test_monitoring_freezes_full_retirement_tree_and_cleans_private_credentials(
         if fault == "between-symlink":
             evidence.unlink()
             evidence.symlink_to(source / "qualification-input/nested/evidence.json")
+        if fault == "resume-between-change":
+            (artifacts / "n100-post-retirement-prom/resume-input/recovery.json").write_text(
+                "changed-between-phases", encoding="utf-8",
+            )
         environment.update(
             PHASE="execute", INPUTS_SHA="" if fault == "missing-freeze" else hashes["POST_RETIREMENT_PROM_INPUTS_SHA"],
             TFVARS_SHA=hashes["POST_RETIREMENT_PROM_TFVARS_SHA"],

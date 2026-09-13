@@ -17,6 +17,8 @@ parameters:
     type: boolean
   - name: retirement_build_id
     type: number
+  - name: resume_build_id
+    type: number
   - name: exclusive_modes
     type: boolean
 
@@ -41,7 +43,8 @@ jobs:
             and .expected_region == "eastus2euap" and .expected_cluster_count == 100
             and .tfvars_path == "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars"
             and .overlay_mode == "resume-existing" and .run_workload == false
-            and .retirement_build_id == 80001 and .exclusive_modes == true' <<< "$PROM_SCOPE_JSON" >/dev/null
+            and .retirement_build_id == 80001 and .resume_build_id == 80007
+            and .exclusive_modes == true' <<< "$PROM_SCOPE_JSON" >/dev/null
         displayName: "Require exclusive monitoring restoration from successful retirement"
         env:
           PROM_SCOPE_JSON: ${{ convertToJson(parameters) }}
@@ -65,6 +68,21 @@ jobs:
           pipelineId: ${{ parameters.retirement_build_id }}
           artifactName: n100-qualified-worker-retirement-${{ parameters.retirement_build_id }}-1
           targetPath: $(Pipeline.Workspace)/post-retirement-prom-source
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download the exact unsubmitted monitoring reservation"
+        inputs:
+          buildType: specific
+          project: $(System.TeamProjectId)
+          definition: $(System.DefinitionId)
+          specificBuildWithTriggering: false
+          buildVersionToDownload: specific
+          pipelineId: ${{ parameters.resume_build_id }}
+          artifactName: n100-post-retirement-prom-${{ parameters.resume_build_id }}-1
+          itemPattern: |
+            plan.json
+            recovery.json
+          targetPath: $(Pipeline.Workspace)/post-retirement-prom-checkpoint
 
       - template: /steps/topology/clustermesh-scale/reuse/restore-post-retirement-prom.yml
         parameters:

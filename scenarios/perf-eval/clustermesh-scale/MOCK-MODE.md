@@ -346,6 +346,11 @@ until the separate workload preflight succeeds. Normal new-worker startup is
 observed without reissuing creation; final readiness includes the campaign's
 16 GiB Prometheus memory budget. Raw semantic guards are bound to the original
 retirement input hashes, rather than compared with redacted diagnostics.
+The current job also pins build 80007's unsubmitted reservation. It continues
+that exact ConfigMap UID and ownership token without recreating it, appends the
+original record to its continuation history, and refuses any attempted,
+accepted, or ambiguous prior pool operation. Identical journal data does not
+require a write or a resource-version change.
 
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one

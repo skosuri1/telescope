@@ -13,28 +13,30 @@ steps:
       umask 077
       directory="$ARTIFACT_DIRECTORY/n100-post-retirement-prom"
       snapshot_hashes() {
-        input="$directory/retirement-input"
-        test -d "$input"
-        test ! -L "$input"
-        if find "$input" -type l -print -quit | grep -q .; then
-          echo "Retirement evidence contains a symlink." >&2
-          return 1
-        fi
-        (cd "$input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
+        for input in "$directory/retirement-input" "$directory/resume-input"; do
+          test -d "$input"
+          test ! -L "$input"
+          if find "$input" -type l -print -quit | grep -q .; then
+            echo "Monitoring input evidence contains a symlink." >&2
+            return 1
+          fi
+        done
+        (cd "$directory" && find retirement-input resume-input -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
       }
       if [ "$PHASE" = "plan" ]; then
-        python3 - "$RETIREMENT_DIRECTORY" "$directory" <<'PY'
+        python3 - "$RETIREMENT_DIRECTORY" "$RESUME_DIRECTORY" "$directory" <<'PY'
       import sys
       from pathlib import Path
-      original, output = (Path(value) for value in sys.argv[1:])
-      if original.is_symlink() or not original.is_dir():
-          raise SystemExit("Completed retirement input must be a real directory.")
-      original, output = original.resolve(), output.resolve()
-      if original == output or original in output.parents or output in original.parents or output.exists():
-          raise SystemExit("Monitoring output must be new and disjoint from retirement evidence.")
+      original, resume, output = (Path(value) for value in sys.argv[1:])
+      for source in (original, resume):
+          if source.is_symlink() or not source.is_dir():
+              raise SystemExit("Completed monitoring inputs must be real directories.")
+          source, destination = source.resolve(), output.resolve()
+          if source == destination or source in destination.parents or destination in source.parents or destination.exists():
+              raise SystemExit("Monitoring output must be new and disjoint from both input sources.")
       PY
-        if find "$RETIREMENT_DIRECTORY" -type l -print -quit | grep -q .; then
-          echo "Retirement evidence contains a symlink." >&2
+        if find "$RETIREMENT_DIRECTORY" "$RESUME_DIRECTORY" -type l -print -quit | grep -q .; then
+          echo "Monitoring input evidence contains a symlink." >&2
           exit 1
         fi
         jq -e '.success == true and .native_fencing_proven == true and .source_retired == true
@@ -46,6 +48,8 @@ steps:
         mkdir "$directory"
         echo "##vso[task.setvariable variable=POST_RETIREMENT_PROM_DIAGNOSTICS_READY]true"
         cp -R -- "$RETIREMENT_DIRECTORY" "$directory/retirement-input"
+        mkdir "$directory/resume-input"
+        cp -- "$RESUME_DIRECTORY/plan.json" "$RESUME_DIRECTORY/recovery.json" "$directory/resume-input/"
         snapshot_hashes > "$directory/inputs.sha256"
         inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
         tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
@@ -88,6 +92,7 @@ steps:
         --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
         --expected-tfvars-sha "$tfvars_sha"
         --retirement-directory "$directory/retirement-input" --retirement-build-id "$RETIREMENT_BUILD_ID"
+        --resume-directory "$directory/resume-input" --resume-build-id "$RESUME_BUILD_ID"
         --kubeconfig "$private/cluster.config" --context clustermesh-96 --timeout-seconds 3600
       )
       if [ "$PHASE" = "plan" ]; then
@@ -122,7 +127,9 @@ steps:
       REGION: ${{ parameters.scope.expected_region }}
       TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
       RETIREMENT_BUILD_ID: ${{ parameters.scope.retirement_build_id }}
+      RESUME_BUILD_ID: ${{ parameters.scope.resume_build_id }}
       RETIREMENT_DIRECTORY: $(Pipeline.Workspace)/post-retirement-prom-source
+      RESUME_DIRECTORY: $(Pipeline.Workspace)/post-retirement-prom-checkpoint
       ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
       REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
       AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)

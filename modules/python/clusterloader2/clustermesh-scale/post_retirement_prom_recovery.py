@@ -33,6 +33,8 @@ uid = base.object_uid
 
 RETIREMENT_BUILD = 80001
 RETIREMENT_JOURNAL_UID = "cabb75e5-7260-4202-bbc7-d3863f5388c3"
+RESUME_BUILD = 80007
+RESERVED_JOURNAL_UID = "ceed29d1-7f56-492a-b515-b682d0cd646b"
 JOURNAL = "mesh96-post-retirement-prom-recovery"
 JOURNAL_OWNER = "post-retirement-prom-recovery"
 OLD_POOL = "prompool"
@@ -360,6 +362,54 @@ def load_retirement(args) -> dict:
     }
 
 
+def load_reserved_checkpoint(args, bundle):
+    if not getattr(args, "resume_build_id", 0):
+        return None
+    hashes = qualification.hash_tree(args.resume_directory)
+    require(set(hashes) == {"plan.json", "recovery.json"},
+            "Reserved monitoring continuation requires exactly the original plan and failure receipt")
+    root = Path(args.resume_directory)
+    plan = stalled.read_json(root / "plan.json")
+    receipt = stalled.read_json(root / "recovery.json")
+    require(
+        plan.get("execute") is False and plan.get("mutation_started") is False
+        and plan.get("plan_valid") is True and receipt.get("execute") is True
+        and receipt.get("mutation_started") is True and receipt.get("plan_valid") is True
+        and receipt.get("success") is False and receipt.get("repaired") is False
+        and receipt.get("status") == "failed-closed"
+        and receipt.get("error") == "Monitoring journal CAS result is ambiguous"
+        and receipt.get("cleanup_errors") == [],
+        "Only the exact build 80007 initial journal no-op failure may continue",
+    )
+    for source in (plan, receipt):
+        require(
+            source.get("retirement_build_id") == RETIREMENT_BUILD
+            and source.get("plan_sha256") == baseline.PLAN_SHA
+            and source.get("retirement_input_hashes") == bundle["hashes"]
+            and source.get("retirement_sha256") == bundle["hashes"]["retirement.json"]
+            and source.get("current_mock_ready") == source.get("kwok_ready") == 100
+            and source.get("current_mock_uids") == bundle["receipt"]["current_mock_uids"]
+            and source.get("preserved_kwok_uids") == bundle["receipt"]["preserved_kwok_uids"]
+            and source.get("workloads_ready") is False
+            and source.get("pool_add") == empty_action()
+            and source.get("old_pool_delete") == empty_action(),
+            "Reserved checkpoint changed identity, or a provider request was attempted/accepted/ambiguous",
+        )
+    journal = receipt.get("journal") or {}
+    require(journal.get("name") == JOURNAL and journal.get("namespace") == "kube-system"
+            and journal.get("uid") == RESERVED_JOURNAL_UID and journal.get("retained") is True
+            and journal.get("attempted") is True and journal.get("accepted") is True
+            and journal.get("ambiguous") is False
+            and (plan.get("journal") or {}).get("attempted") is False,
+            "Build 80007 does not prove the exact existing reserved journal")
+    require(base.timestamp(receipt["started_at"], "reserved execution start")
+            <= base.timestamp(journal["requested_at"], "journal request")
+            <= base.timestamp(journal["accepted_at"], "journal acceptance")
+            <= base.timestamp(receipt["finished_at"], "reserved execution end"),
+            "Reserved journal timing does not match the failed execution")
+    return {"hashes": hashes, "receipt": receipt}
+
+
 class PromRecovery(maintenance.ClusterOperator):
     """Bounded post-retirement add/readiness/empty-delete protocol."""
 
@@ -382,6 +432,7 @@ class PromRecovery(maintenance.ClusterOperator):
         self.new_identity = None
         self.new_vmss = ""
         self.phase = "plan"
+        self.journal_history = []
 
     def save(self):
         mocks.write_json_atomic(self.args.summary_file, self.summary)
@@ -389,6 +440,9 @@ class PromRecovery(maintenance.ClusterOperator):
     def unchanged_inputs(self):
         require(qualification.hash_tree(self.args.retirement_directory) == self.bundle["hashes"],
                 "Immutable build 80001 inputs changed")
+        if self.bundle.get("resume"):
+            require(qualification.hash_tree(self.args.resume_directory) == self.bundle["resume"]["hashes"],
+                    "Immutable reserved monitoring checkpoint changed")
 
     def az_json_retry(self, *command):
         """Retry only transient failures from the two bounded capacity reads."""
@@ -512,7 +566,7 @@ class PromRecovery(maintenance.ClusterOperator):
             self.owned_journal()
 
     def journal_data(self):
-        return {
+        data = {
             "owner": JOURNAL_OWNER, "token": self.token,
             "retirement_build_id": str(RETIREMENT_BUILD),
             "retirement_tree_sha256": base.digest(self.bundle["hashes"]),
@@ -524,6 +578,50 @@ class PromRecovery(maintenance.ClusterOperator):
                 "new_identity": self.summary.get("new_prom_identity"),
             }, sort_keys=True, separators=(",", ":")),
         }
+        if self.journal_history:
+            data["continuation_history"] = json.dumps(self.journal_history, sort_keys=True, separators=(",", ":"))
+        return data
+
+    def attach_reserved_journal(self):
+        source = self.bundle["resume"]
+        row = self.kube("-n", "kube-system", "get", "configmap", JOURNAL, "-o", "json")
+        metadata, data = row.get("metadata") or {}, row.get("data") or {}
+        token = data.get("token")
+        require(uid(row) == RESERVED_JOURNAL_UID
+                and metadata.get("name") == JOURNAL and metadata.get("namespace") == "kube-system"
+                and metadata.get("resourceVersion") and not metadata.get("deletionTimestamp")
+                and not metadata.get("ownerReferences")
+                and isinstance(token, str) and re.fullmatch(r"[0-9a-f]{32}", token),
+                "Existing reserved journal identity, token, or lifecycle changed")
+        created = base.timestamp(metadata.get("creationTimestamp"), "reserved journal creation")
+        require(base.timestamp(source["receipt"]["started_at"], "reserved execution start")
+                <= created <= base.timestamp(source["receipt"]["finished_at"], "reserved execution end"),
+                "Reserved journal was not created during the proven build 80007 execution")
+        self.token = token
+        self.summary["status"] = "planned-read-only"
+        require(data == self.journal_data(),
+                "Reserved journal data is no longer the original unsubmitted reservation")
+        self.journal_uid = uid(row)
+        self.journal_resource_version = metadata["resourceVersion"]
+        self.journal_data_pin = copy.deepcopy(data)
+        self.summary["journal"].update(
+            uid=self.journal_uid, attached_existing=True, created_in_build=RESUME_BUILD,
+            resource_version=self.journal_resource_version, data_sha256=base.digest(data),
+        )
+        self.summary["continuation"] = {
+            "source_build_id": RESUME_BUILD, "source_checkpoint_sha256": source["hashes"]["recovery.json"],
+            "journal_uid": self.journal_uid, "source_resource_version": self.journal_resource_version,
+            "source_data_sha256": base.digest(data), "source_record": data["record"],
+            "provider_request_previously_submitted": False,
+        }
+        self.owned_journal()
+        self.save()
+
+    def record_continuation(self):
+        require(self.args.execute and not self.journal_history,
+                "A reserved-journal continuation may be recorded only once")
+        self.journal_history = [{**self.summary["continuation"], "continued_at": workers.utc_now()}]
+        self.persist_journal()
 
     def owned_journal(self):
         row = self.kube("-n", "kube-system", "get", "configmap", JOURNAL, "-o", "json")
@@ -579,6 +677,12 @@ class PromRecovery(maintenance.ClusterOperator):
         self.unchanged_inputs()
         current = self.owned_journal()
         desired = self.journal_data()
+        if desired == self.journal_data_pin:
+            self.summary["journal"].update(
+                resource_version=self.journal_resource_version, data_sha256=base.digest(desired),
+            )
+            self.save()
+            return
         output = self.raw_write([
             "kubectl", "-n", "kube-system", "patch", "configmap", JOURNAL,
             "--type=json", "-p", json.dumps([
@@ -599,6 +703,9 @@ class PromRecovery(maintenance.ClusterOperator):
         )
         self.journal_data_pin = copy.deepcopy(desired)
         self.journal_resource_version = metadata["resourceVersion"]
+        self.summary["journal"].update(
+            resource_version=self.journal_resource_version, data_sha256=base.digest(desired),
+        )
         self.owned_journal()
         self.save()
 
@@ -1440,10 +1547,15 @@ class PromRecovery(maintenance.ClusterOperator):
         self.persist_journal()
 
     def execute(self):
+        if self.bundle.get("resume"):
+            self.attach_reserved_journal()
         self.preflight()
         if not self.args.execute:
             return
-        self.acquire()
+        if self.bundle.get("resume"):
+            self.record_continuation()
+        else:
+            self.acquire()
         self.preflight()
         self.submit("pool_add", pool_add_command())
         self.wait_new_ready()
@@ -1473,6 +1585,17 @@ def validate_args(args):
             and len({root, output, config}) == 3
             and root not in output.parents and not output.exists(),
             "Output must be new and separate from immutable inputs/private credentials")
+    resume_build = getattr(args, "resume_build_id", 0)
+    resume_directory = getattr(args, "resume_directory", None)
+    require(bool(resume_build) == bool(resume_directory),
+            "Reserved monitoring continuation requires both its build ID and checkpoint directory")
+    if resume_build:
+        resume_root = Path(resume_directory).resolve()
+        require(resume_build == RESUME_BUILD and resume_root.is_dir()
+                and not Path(resume_directory).is_symlink()
+                and resume_root not in output.parents and resume_root not in config.parents
+                and resume_root != root and root not in resume_root.parents and resume_root not in root.parents,
+                "Only the separate build 80007 unsubmitted reservation checkpoint is supported")
     args.role = base.ROLE
 
 
@@ -1494,6 +1617,7 @@ def execute_recovery(args, summary, runner=workers.run_command):
     )
     try:
         bundle = load_retirement(args)
+        bundle["resume"] = load_reserved_checkpoint(args, bundle)
         summary.update(
             retirement_input_hashes=bundle["hashes"],
             retirement_sha256=bundle["hashes"]["retirement.json"],
@@ -1531,6 +1655,8 @@ def parse_args(argv=None):
     parser.add_argument("--timeout-seconds", type=int, default=3600)
     parser.add_argument("--request-timeout-seconds", type=int, default=45)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--resume-directory")
+    parser.add_argument("--resume-build-id", type=int, default=0)
     return parser.parse_args(argv)
 
 

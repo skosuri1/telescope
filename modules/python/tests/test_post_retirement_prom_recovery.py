@@ -1121,7 +1121,10 @@ class FullCloud:
                     data[key] = value
             row = {
                 "apiVersion": "v1", "kind": "ConfigMap",
-                "metadata": {**meta(name, "kube-system"), "resourceVersion": "1"},
+                "metadata": {
+                    **meta(name, "kube-system", getattr(self, "reserved_journal_uid", None)),
+                    "resourceVersion": "1", "creationTimestamp": prom.workers.utc_now(),
+                },
                 "data": data,
             }
             self.configmaps[name] = row
@@ -1134,8 +1137,9 @@ class FullCloud:
             assert patch[0]["value"] == row["metadata"]["uid"]
             assert patch[1]["value"] == row["metadata"]["resourceVersion"]
             assert patch[2]["value"] == row["data"]
-            row["data"] = patch[3]["value"]
-            row["metadata"]["resourceVersion"] = str(int(row["metadata"]["resourceVersion"]) + 1)
+            if row["data"] != patch[3]["value"]:
+                row["data"] = patch[3]["value"]
+                row["metadata"]["resourceVersion"] = str(int(row["metadata"]["resourceVersion"]) + 1)
             self.writes.append(command)
             return row
         if "configmaps" in args:
@@ -1179,6 +1183,8 @@ def recovery_args(root, summary, execute):
         request_timeout_seconds=45,
         summary_file=str(summary),
         execute=execute,
+        resume_directory=None,
+        resume_build_id=0,
     )
 
 
@@ -1395,3 +1401,128 @@ def test_raw_controller_contracts_are_hash_bound_not_compared_with_masked_values
     )
     with pytest.raises(prom.workers.ReconcileError, match="input hashes changed"):
         prom.load_retirement(args)
+
+
+class LegacyNoopJournalBug(prom.PromRecovery):
+    """Reproduce the old no-op resource-version assumption, never a production path."""
+
+    def persist_journal(self):
+        current = self.owned_journal()
+        desired = self.journal_data()
+        output = self.raw_write([
+            "kubectl", "-n", "kube-system", "patch", "configmap", prom.JOURNAL,
+            "--type=json", "-p", json.dumps([
+                {"op": "test", "path": "/metadata/uid", "value": self.journal_uid},
+                {"op": "test", "path": "/metadata/resourceVersion", "value": current["metadata"]["resourceVersion"]},
+                {"op": "test", "path": "/data", "value": self.journal_data_pin},
+                {"op": "add", "path": "/data", "value": desired},
+            ]), "-o", "json",
+        ])
+        updated = json.loads(output)
+        prom.require(updated["metadata"]["resourceVersion"] != self.journal_resource_version,
+                     "Monitoring journal CAS result is ambiguous")
+
+
+def reserved_failure_fixture(tmp_path, monkeypatch):
+    root = tmp_path / "retirement-input"
+    checkpoint = tmp_path / "reserved-checkpoint"
+    checkpoint.mkdir()
+    fixture = synthetic_raw_fixture()
+    write_raw_artifact(root, fixture)
+    plan_args = recovery_args(root, checkpoint / "plan.json", False)
+    prom.execute_recovery(plan_args, {}, runner=FullCloud(fixture, plan_args))
+    args = recovery_args(root, checkpoint / "recovery.json", True)
+    cloud = FullCloud(fixture, args)
+    cloud.reserved_journal_uid = prom.RESERVED_JOURNAL_UID
+    summary = {}
+    with monkeypatch.context() as old_code:
+        old_code.setattr(prom, "PromRecovery", LegacyNoopJournalBug)
+        with pytest.raises(prom.workers.ReconcileError, match="CAS result is ambiguous"):
+            prom.execute_recovery(args, summary, runner=cloud)
+    assert cloud.add_count == cloud.delete_count == 0
+    assert cloud.configmaps[prom.JOURNAL]["metadata"]["resourceVersion"] == "1"
+    assert summary["journal"]["accepted"] is True and summary["pool_add"] == prom.empty_action()
+    return root, checkpoint, fixture, cloud
+
+
+def test_noop_journal_update_requires_no_write_and_preserves_resource_version(tmp_path):
+    root = tmp_path / "retirement-input"
+    fixture = synthetic_raw_fixture()
+    write_raw_artifact(root, fixture)
+    args = recovery_args(root, tmp_path / "summary.json", True)
+    cloud = FullCloud(fixture, args)
+    summary = {"status": "planned-read-only", "pool_add": prom.empty_action(),
+               "old_pool_delete": prom.empty_action(), "journal": prom.empty_action()}
+    bundle = prom.load_retirement(args)
+    recovery = prom.PromRecovery(args, bundle, summary, cloud)
+    recovery.acquire()
+    assert len(cloud.writes) == 1
+    before = copy.deepcopy(cloud.configmaps[prom.JOURNAL])
+    recovery.persist_journal()
+    assert len(cloud.writes) == 1 and cloud.configmaps[prom.JOURNAL] == before
+    assert summary["journal"]["resource_version"] == "1"
+
+
+def test_reserved_journal_continuation_retains_identity_history_and_submits_once(tmp_path, monkeypatch):
+    root, checkpoint, _, cloud = reserved_failure_fixture(tmp_path, monkeypatch)
+    historical = copy.deepcopy(cloud.configmaps)
+    original = copy.deepcopy(cloud.configmaps[prom.JOURNAL])
+    plan_args = recovery_args(root, tmp_path / "resume-plan.json", False)
+    plan_args.resume_directory, plan_args.resume_build_id = str(checkpoint), 80007
+    calls = len(cloud.writes)
+    plan = {}
+    prom.execute_recovery(plan_args, plan, runner=cloud)
+    assert plan["plan_valid"] and not plan["mutation_started"]
+    assert len(cloud.writes) == calls and cloud.configmaps == historical
+    args = recovery_args(root, tmp_path / "resume-execute.json", True)
+    args.resume_directory, args.resume_build_id = str(checkpoint), 80007
+    summary = {}
+    prom.execute_recovery(args, summary, runner=cloud)
+    current = cloud.configmaps[prom.JOURNAL]
+    assert summary["success"] and cloud.add_count == cloud.delete_count == 1
+    assert current["metadata"]["uid"] == original["metadata"]["uid"] == prom.RESERVED_JOURNAL_UID
+    assert current["data"]["token"] == original["data"]["token"]
+    history = json.loads(current["data"]["continuation_history"])
+    assert len(history) == 1 and history[0]["source_build_id"] == 80007
+    assert history[0]["source_record"] == original["data"]["record"]
+    assert all(cloud.configmaps[name] == value for name, value in historical.items() if name != prom.JOURNAL)
+    assert not summary["workloads_ready"]
+    assert len([row for row in cloud.writes if "create" in row and "configmap" in row]) == 1
+    replay_args = recovery_args(root, tmp_path / "forbidden-replay.json", True)
+    replay_args.resume_directory, replay_args.resume_build_id = str(checkpoint), 80007
+    writes = len(cloud.writes)
+    with pytest.raises(prom.workers.ReconcileError, match="original unsubmitted reservation"):
+        prom.execute_recovery(replay_args, {}, runner=cloud)
+    assert len(cloud.writes) == writes
+
+
+@pytest.mark.parametrize("fault", [
+    "attempted", "submitted", "accepted", "ambiguous", "wrong-uid", "wrong-token", "changed-data",
+    "already-continued", "wrong-creation-time", "different-error", "changed-inputs",
+])
+def test_reservation_continuation_cannot_adopt_other_or_attempted_operations(tmp_path, monkeypatch, fault):
+    root, checkpoint, _, cloud = reserved_failure_fixture(tmp_path, monkeypatch)
+    receipt = json.loads((checkpoint / "recovery.json").read_text(encoding="utf-8"))
+    if fault in ("attempted", "submitted", "accepted", "ambiguous"):
+        receipt["pool_add"][{"submitted": "submission_started"}.get(fault, fault)] = True
+    elif fault == "different-error":
+        receipt["error"] = "unrelated error"
+    elif fault == "changed-inputs":
+        receipt["retirement_input_hashes"]["retirement.json"] = "0" * 64
+    elif fault == "wrong-uid":
+        cloud.configmaps[prom.JOURNAL]["metadata"]["uid"] = identity("another-journal")
+    elif fault == "wrong-token":
+        cloud.configmaps[prom.JOURNAL]["data"]["token"] = "invalid"
+    elif fault == "changed-data":
+        cloud.configmaps[prom.JOURNAL]["data"]["retirement_tree_sha256"] = "0" * 64
+    elif fault == "already-continued":
+        cloud.configmaps[prom.JOURNAL]["data"]["continuation_history"] = "[]"
+    else:
+        cloud.configmaps[prom.JOURNAL]["metadata"]["creationTimestamp"] = "2026-01-01T00:00:00Z"
+    (checkpoint / "recovery.json").write_text(json.dumps(receipt), encoding="utf-8")
+    args = recovery_args(root, tmp_path / "rejected.json", True)
+    args.resume_directory, args.resume_build_id = str(checkpoint), 80007
+    writes = len(cloud.writes)
+    with pytest.raises(prom.workers.ReconcileError):
+        prom.execute_recovery(args, {}, runner=cloud)
+    assert len(cloud.writes) == writes and cloud.add_count == cloud.delete_count == 0
