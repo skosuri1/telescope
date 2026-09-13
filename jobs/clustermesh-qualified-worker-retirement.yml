@@ -1,0 +1,92 @@
+parameters:
+  - name: target_run_id
+    type: string
+  - name: confirm_resume
+    type: string
+  - name: expected_subscription_id
+    type: string
+  - name: expected_region
+    type: string
+  - name: expected_cluster_count
+    type: number
+  - name: tfvars_path
+    type: string
+  - name: overlay_mode
+    type: string
+  - name: run_workload
+    type: boolean
+  - name: qualification_build_id
+    type: number
+  - name: exclusive_modes
+    type: boolean
+
+jobs:
+  - job: qualified_worker_retirement
+    displayName: "Retire only the failed mesh96 worker after replacement qualification"
+    variables:
+      SCENARIO_NAME: clustermesh-scale
+      CLUSTER_COUNT: "${{ parameters.expected_cluster_count }}"
+      CLUSTERMESH_JOB_TIMEOUT_MINUTES: "90"
+      CLUSTERMESH_JOB_CANCEL_TIMEOUT_MINUTES: "30"
+      SUITE_TOTAL_BUDGET_SECONDS: "0"
+      AKS_CONTROL_PLANE_METRICS_ENABLED: "false"
+    timeoutInMinutes: 90
+    cancelTimeoutInMinutes: 30
+    steps:
+      - script: |
+          set -euo pipefail
+          jq -e '
+            .target_run_id == "78751-f36f3d5a" and .confirm_resume == .target_run_id
+            and .expected_subscription_id == "37deca37-c375-4a14-b90a-043849bd2bf1"
+            and .expected_region == "eastus2euap" and .expected_cluster_count == 100
+            and .tfvars_path == "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars"
+            and .overlay_mode == "resume-existing" and .run_workload == false
+            and .qualification_build_id == 79986 and .exclusive_modes == true' \
+            <<< "$RETIREMENT_SCOPE_JSON" >/dev/null
+        displayName: "Require exact qualified failed-worker retirement scope"
+        env:
+          RETIREMENT_SCOPE_JSON: ${{ convertToJson(parameters) }}
+
+      - template: /steps/setup-tests.yml
+        parameters:
+          cloud: azure
+          region: ${{ parameters.expected_region }}
+          run_id: ${{ parameters.target_run_id }}
+          credential_type: service_connection
+          ssh_key_enabled: false
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download successful replacement qualification and original lineage"
+        inputs:
+          buildType: specific
+          project: $(System.TeamProjectId)
+          definition: $(System.DefinitionId)
+          specificBuildWithTriggering: false
+          buildVersionToDownload: specific
+          pipelineId: ${{ parameters.qualification_build_id }}
+          artifactName: n100-capacity-qualification-${{ parameters.qualification_build_id }}-1
+          targetPath: $(Pipeline.Workspace)/qualified-retirement-source
+
+      - template: /steps/topology/clustermesh-scale/reuse/retire-qualified-worker.yml
+        parameters:
+          phase: plan
+          scope: ${{ parameters }}
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish retirement plan before any worker changes"
+        inputs:
+          targetPath: "$(Build.ArtifactStagingDirectory)/n100-qualified-worker-retirement/plan.json"
+          artifact: "n100-qualified-worker-retirement-plan-$(Build.BuildId)-$(System.JobAttempt)"
+
+      - template: /steps/topology/clustermesh-scale/reuse/retire-qualified-worker.yml
+        parameters:
+          phase: execute
+          scope: ${{ parameters }}
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish native fencing and controller replacement evidence"
+        condition: >-
+          and(always(), eq(variables['QUALIFIED_RETIREMENT_DIAGNOSTICS_READY'], 'true'))
+        inputs:
+          targetPath: "$(Build.ArtifactStagingDirectory)/n100-qualified-worker-retirement"
+          artifact: "n100-qualified-worker-retirement-$(Build.BuildId)-$(System.JobAttempt)"

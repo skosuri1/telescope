@@ -1,0 +1,132 @@
+parameters:
+  - name: phase
+    type: string
+    values:
+      - plan
+      - execute
+  - name: scope
+    type: object
+
+steps:
+  - script: |
+      set -euo pipefail
+      umask 077
+      directory="$ARTIFACT_DIRECTORY/n100-qualified-worker-retirement"
+      snapshot_hashes() {
+        input="$directory/qualification-input"
+        test -d "$input"
+        test ! -L "$input"
+        if find "$input" -type l -print -quit | grep -q .; then
+          echo "Retirement evidence contains a symlink." >&2
+          return 1
+        fi
+        (cd "$input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
+      }
+      if [ "$PHASE" = "plan" ]; then
+        python3 - "$QUALIFICATION_DIRECTORY" "$directory" <<'PY'
+      import sys
+      from pathlib import Path
+      original, output = (Path(value) for value in sys.argv[1:])
+      if original.is_symlink() or not original.is_dir():
+          raise SystemExit("Qualification input must be a real directory.")
+      original, output = original.resolve(), output.resolve()
+      if original == output or original in output.parents or output in original.parents or output.exists():
+          raise SystemExit("Retirement output must be new and disjoint from the input.")
+      PY
+        if find "$QUALIFICATION_DIRECTORY" -type l -print -quit | grep -q .; then
+          echo "Qualification input contains a symlink." >&2
+          exit 1
+        fi
+        jq -e '.success == true and .capacity_qualified == true
+          and .actual_ip_growth_proven == true and .actual_memory_headroom_proven == true
+          and .completion_only == true and .execute == false and .mutation_started == false
+          and (.probe_cleanup_pending | type == "array" and length == 0)
+          and (.cleanup_errors | type == "array" and length == 0)' \
+          "$QUALIFICATION_DIRECTORY/qualification.json" >/dev/null
+        mkdir -p "$ARTIFACT_DIRECTORY"
+        mkdir "$directory"
+        echo "##vso[task.setvariable variable=QUALIFIED_RETIREMENT_DIAGNOSTICS_READY]true"
+        cp -R -- "$QUALIFICATION_DIRECTORY" "$directory/qualification-input"
+        snapshot_hashes > "$directory/inputs.sha256"
+        inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
+        tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
+        echo "##vso[task.setvariable variable=QUALIFIED_RETIREMENT_INPUTS_SHA;isReadOnly=true]$inputs_sha"
+        echo "##vso[task.setvariable variable=QUALIFIED_RETIREMENT_TFVARS_SHA;isReadOnly=true]$tfvars_sha"
+      elif [ "$PHASE" = "execute" ]; then
+        if ! [[ "$INPUTS_SHA" =~ ^[0-9a-f]{64}$ ]] || ! [[ "$TFVARS_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "Retirement requires the completed plan's frozen hashes." >&2
+          exit 1
+        fi
+        inputs_sha="$INPUTS_SHA"
+        tfvars_sha="$TFVARS_SHA"
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+          "$directory/plan.json" >/dev/null
+      else
+        echo "Unknown retirement phase; no action is authorized." >&2
+        exit 1
+      fi
+      verify_inputs() {
+        snapshot_hashes > "$directory/inputs-$PHASE.sha256"
+        if [ "$(sha256sum "$directory/inputs-$PHASE.sha256" | awk '{print $1}')" != "$inputs_sha" ] ||
+          [ "$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')" != "$tfvars_sha" ]; then
+          echo "Retirement inputs changed; no further action is authorized." >&2
+          return 1
+        fi
+      }
+      verify_inputs
+      private="$AGENT_TEMP_DIRECTORY/qualified-retirement.$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+      mkdir -m 700 -- "$private"
+      cleanup() {
+        rm -f -- "$private/cluster.config"
+        rmdir -- "$private"
+      }
+      trap cleanup EXIT
+      timeout 90 az aks get-credentials --subscription "$SUBSCRIPTION" --resource-group "$RUN_ID" \
+        --name clustermesh-96 --file "$private/cluster.config" --context clustermesh-96 --only-show-errors
+      chmod 600 "$private/cluster.config"
+      args=(
+        --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
+        --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
+        --expected-tfvars-sha "$tfvars_sha"
+        --qualification-directory "$directory/qualification-input" --qualification-build-id "$QUALIFICATION_BUILD_ID"
+        --kubeconfig "$private/cluster.config" --context clustermesh-96 --timeout-seconds 3600
+      )
+      if [ "$PHASE" = "plan" ]; then
+        args+=(--summary-file "$directory/plan.json")
+      else
+        args+=(--summary-file "$directory/retirement.json" --execute)
+      fi
+      echo "Starting qualified worker retirement $PHASE at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+      python3 -u "$REPOSITORY_DIRECTORY/modules/python/clusterloader2/clustermesh-scale/qualified_failed_worker_retirement.py" "${args[@]}"
+      verify_inputs
+      if [ "$PHASE" = "plan" ]; then
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+          "$directory/plan.json" >/dev/null
+      else
+        jq -e '.execute == true and .success == true and .native_fencing_proven == true
+          and .source_retired == true and .replacements_ready == true and .placement_hold_removed == true
+          and .workloads_ready == false and .bootstrap_complete == false
+          and (.cleanup_errors | type == "array" and length == 0)' \
+          "$directory/retirement.json" >/dev/null
+      fi
+    ${{ if eq(parameters.phase, 'plan') }}:
+      displayName: "Plan exact failed-worker retirement without changes"
+      timeoutInMinutes: 15
+    ${{ else }}:
+      displayName: "Natively retire only failed worker 1 and recover its controllers"
+      timeoutInMinutes: 65
+    retryCountOnTaskFailure: 0
+    env:
+      PHASE: ${{ parameters.phase }}
+      RUN_ID: ${{ parameters.scope.target_run_id }}
+      CONFIRM_RESUME: ${{ parameters.scope.confirm_resume }}
+      SUBSCRIPTION: ${{ parameters.scope.expected_subscription_id }}
+      REGION: ${{ parameters.scope.expected_region }}
+      TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
+      QUALIFICATION_BUILD_ID: ${{ parameters.scope.qualification_build_id }}
+      QUALIFICATION_DIRECTORY: $(Pipeline.Workspace)/qualified-retirement-source
+      ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
+      REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
+      AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)
+      INPUTS_SHA: $(QUALIFIED_RETIREMENT_INPUTS_SHA)
+      TFVARS_SHA: $(QUALIFIED_RETIREMENT_TFVARS_SHA)

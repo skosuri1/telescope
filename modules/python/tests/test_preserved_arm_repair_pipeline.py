@@ -88,7 +88,7 @@ def test_only_selected_resume_stage_exposes_arm_only_job():
         "${{ parameters.scaleDebugArmRepairOnly }}"
     )
     condition = (
-        "${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugArmRepairOnly, "
+        "${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugArmRepairOnly, "
         "not(parameters.scaleDebugPreparedRetirementObserveOnly), "
         "not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), "
         "eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "

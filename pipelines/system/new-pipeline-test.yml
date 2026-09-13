@@ -106,6 +106,9 @@ parameters:
   - name: scaleDebugCapacityQualificationBuildId
     type: number
     default: 0
+  - name: scaleDebugQualifiedWorkerRetirementBuildId
+    type: number
+    default: 0
   - name: scaleDebugModernBaselineBuildId
     type: number
     default: 0
@@ -3139,7 +3142,7 @@ stages:
       CL2_PROBE_WINDOW_DURATION: "60m"
       CL2_PROBE_PREWAIT_S: "600"
     jobs:
-      - ${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)))) }}:
+      - ${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), or(parameters.scaleDebugPreparedRetirementObserveOnly, and(parameters.scaleDebugPreparedRetirementOnly, not(parameters.scaleDebugUnreachableWorkerRecoveryOnly)))) }}:
           - template: /jobs/clustermesh-prepared-worker-retirement.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3152,7 +3155,7 @@ stages:
               retirement_uid: ${{ parameters.scaleDebugPreparedRetirementUid }}
               observe_only: ${{ parameters.scaleDebugPreparedRetirementObserveOnly }}
               run_workload: ${{ parameters.scaleDebugRunWorkload }}
-      - ${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}:
+      - ${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugArmRepairOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}:
           - template: /jobs/clustermesh-arm-repair.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3161,7 +3164,7 @@ stages:
               expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
               tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
               overlay_mode: ${{ parameters.debugMode }}
-      - ${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}:
+      - ${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly)) }}:
           - template: /jobs/clustermesh-cni-worker-maintenance.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3181,7 +3184,7 @@ stages:
               recover_empty_fresh_node: ${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshNode }}
               recover_empty_fresh_uid: ${{ parameters.scaleDebugCniWorkerRecoverEmptyFreshUid }}
               replace_empty_fresh: ${{ parameters.scaleDebugCniWorkerReplaceEmptyFresh }}
-      - ${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), or(parameters.scaleDebugModernPromRecovery, ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), ne(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), parameters.scaleDebugUnreachableWorkerQuotaObserveOnly, and(parameters.scaleDebugUnreachableWorkerRecoveryOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)))) }}:
+      - ${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), or(parameters.scaleDebugModernPromRecovery, ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), ne(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), parameters.scaleDebugUnreachableWorkerQuotaObserveOnly, and(parameters.scaleDebugUnreachableWorkerRecoveryOnly, not(parameters.scaleDebugPreparedRetirementObserveOnly)))) }}:
           - template: /jobs/clustermesh-unreachable-worker-recovery.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3198,7 +3201,7 @@ stages:
               resume_replacement_build_id: ${{ parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId }}
               quota_observe_only: ${{ parameters.scaleDebugUnreachableWorkerQuotaObserveOnly }}
               modern_prom_recovery: ${{ parameters.scaleDebugModernPromRecovery }}
-      - ${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), ne(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0)) }}:
+      - ${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), ne(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0)) }}:
           - template: /jobs/clustermesh-modern-cni.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3212,7 +3215,7 @@ stages:
               original_plan_build_id: ${{ parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId }}
               modern_prom_build_id: ${{ parameters.scaleDebugModernCniPromBuildId }}
               exclusive_modes: ${{ and(parameters.scaleDebugCniWorkerMaintenanceOnly, not(parameters.scaleDebugModernPromRecovery), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), not(parameters.scaleDebugArmRepairOnly), not(parameters.scaleDebugPreparedRetirementOnly), not(parameters.scaleDebugPreparedRetirementObserveOnly)) }}
-      - ${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), or(eq(parameters.scaleDebugDv3QuotaRequestLimit, 5500), ne(parameters.scaleDebugQuotaRequestReceiptBuildId, 0))) }}:
+      - ${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), or(eq(parameters.scaleDebugDv3QuotaRequestLimit, 5500), ne(parameters.scaleDebugQuotaRequestReceiptBuildId, 0))) }}:
           - template: /jobs/clustermesh-quota-request.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3226,7 +3229,7 @@ stages:
               quota_limit: ${{ parameters.scaleDebugDv3QuotaRequestLimit }}
               receipt_build_id: ${{ parameters.scaleDebugQuotaRequestReceiptBuildId }}
               exclusive_modes: ${{ and(eq(parameters.scaleDebugModernCniPromBuildId, 0), not(parameters.scaleDebugModernPromRecovery), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), not(parameters.scaleDebugArmRepairOnly), not(parameters.scaleDebugPreparedRetirementOnly), not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugCniWorkerMaintenanceOnly)) }}
-      - ${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), ne(parameters.scaleDebugRetainedWorkerRestartBuildId, 0)) }}:
+      - ${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), ne(parameters.scaleDebugRetainedWorkerRestartBuildId, 0)) }}:
           - template: /jobs/clustermesh-retained-worker-restart.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3239,7 +3242,7 @@ stages:
               run_workload: ${{ parameters.scaleDebugRunWorkload }}
               source_state_build_id: ${{ parameters.scaleDebugRetainedWorkerRestartBuildId }}
               exclusive_modes: ${{ and(not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugModernBaselineBuildId, 0), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerReimageFailedOs), eq(parameters.scaleDebugUnreachableWorkerObserveBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), not(parameters.scaleDebugArmRepairOnly), not(parameters.scaleDebugPreparedRetirementOnly), not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugCniWorkerMaintenanceOnly), eq(parameters.scaleDebugKwokPreservationMode, 'none')) }}
-      - ${{ if and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), ne(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0)) }}:
+      - ${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), ne(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0)) }}:
           - template: /jobs/clustermesh-capacity-first.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3253,7 +3256,7 @@ stages:
               source_state_build_id: ${{ parameters.scaleDebugCapacityFirstRecoveryBuildId }}
               accepted_restart_build_id: 79950
               exclusive_modes: ${{ and(eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugModernBaselineBuildId, 0), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerReimageFailedOs), eq(parameters.scaleDebugUnreachableWorkerObserveBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), not(parameters.scaleDebugArmRepairOnly), not(parameters.scaleDebugPreparedRetirementOnly), not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugCniWorkerMaintenanceOnly), eq(parameters.scaleDebugKwokPreservationMode, 'none')) }}
-      - ${{ if ne(parameters.scaleDebugCapacityQualificationBuildId, 0) }}:
+      - ${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), ne(parameters.scaleDebugCapacityQualificationBuildId, 0)) }}:
           - template: /jobs/clustermesh-capacity-qualification.yml
             parameters:
               target_run_id: ${{ parameters.debugTargetRunId }}
@@ -3267,6 +3270,19 @@ stages:
               observation_build_id: ${{ parameters.scaleDebugCapacityQualificationBuildId }}
               accepted_capacity_build_id: 79971
               exclusive_modes: ${{ and(eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugModernBaselineBuildId, 0), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerReimageFailedOs), eq(parameters.scaleDebugUnreachableWorkerObserveBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), not(parameters.scaleDebugArmRepairOnly), not(parameters.scaleDebugPreparedRetirementOnly), not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugCniWorkerMaintenanceOnly), not(parameters.scaleDebugCniWorkerReplaceEmptyFresh), eq(parameters.scaleDebugCniWorkerResumeBuildId, 0), eq(parameters.scaleDebugKwokPreservationMode, 'none')) }}
+      - ${{ if ne(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0) }}:
+          - template: /jobs/clustermesh-qualified-worker-retirement.yml
+            parameters:
+              target_run_id: ${{ parameters.debugTargetRunId }}
+              confirm_resume: ${{ parameters.debugConfirmResume }}
+              expected_subscription_id: ${{ parameters.lifecycleSubscriptionId }}
+              expected_region: ${{ parameters.scaleDebugRegion }}
+              expected_cluster_count: ${{ parameters.scaleDebugClusterCount }}
+              tfvars_path: ${{ parameters.scaleDebugTfvarsPath }}
+              overlay_mode: ${{ parameters.debugMode }}
+              run_workload: ${{ parameters.scaleDebugRunWorkload }}
+              qualification_build_id: ${{ parameters.scaleDebugQualifiedWorkerRetirementBuildId }}
+              exclusive_modes: ${{ and(eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), not(parameters.scaleDebugModernPromRecovery), eq(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugModernBaselineBuildId, 0), not(parameters.scaleDebugUnreachableWorkerRecoveryOnly), not(parameters.scaleDebugUnreachableWorkerQuotaObserveOnly), eq(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), eq(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), not(parameters.scaleDebugUnreachableWorkerReimageFailedOs), eq(parameters.scaleDebugUnreachableWorkerObserveBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), not(parameters.scaleDebugArmRepairOnly), not(parameters.scaleDebugPreparedRetirementOnly), not(parameters.scaleDebugPreparedRetirementObserveOnly), not(parameters.scaleDebugCniWorkerMaintenanceOnly), not(parameters.scaleDebugCniWorkerReplaceEmptyFresh), eq(parameters.scaleDebugCniWorkerResumeBuildId, 0), eq(parameters.scaleDebugKwokPreservationMode, 'none')) }}
       - template: /jobs/clustermesh-debug-resume.yml
         parameters:
           region: ${{ parameters.scaleDebugRegion }}
@@ -3333,6 +3349,7 @@ stages:
           retained_worker_restart_build_id: ${{ parameters.scaleDebugRetainedWorkerRestartBuildId }}
           capacity_first_build_id: ${{ parameters.scaleDebugCapacityFirstRecoveryBuildId }}
           capacity_qualification_build_id: ${{ parameters.scaleDebugCapacityQualificationBuildId }}
+          qualified_retirement_build_id: ${{ parameters.scaleDebugQualifiedWorkerRetirementBuildId }}
           modern_baseline_build_id: ${{ parameters.scaleDebugModernBaselineBuildId }}
           ${{ if gt(parameters.scaleDebugModernBaselineBuildId, 0) }}:
             expected_pool_count: 202

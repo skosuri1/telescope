@@ -316,6 +316,17 @@ It uses the demonstrated dynamic allocation capacity, not a claim that all futur
 IPs are already reserved. Neither phase passes `--execute` in completion mode;
 the old receipt and journal are never rewritten and no probes are replayed.
 
+`scaleDebugQualifiedWorkerRetirementBuildId=79986` selects a separate, exclusive
+retirement of only failed default worker 1. It consumes the complete successful
+qualification artifact, publishes a read-only plan first, and permits one native
+AKS DeleteMachines request with durable no-replay evidence. A UID-bound temporary
+NoSchedule hold protects the healthy default worker from new placements without
+evicting its 44 agents. Replacement agents are not certified until positive
+fencing; the original worker, KWOK identities, and qualified destinations remain
+protected. There are no direct production Pod deletions, new pools, or workloads
+in this phase. The hold is removed only on safe completion, or retained with
+explicit recovery evidence if an accepted retirement remains uncertain.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,
