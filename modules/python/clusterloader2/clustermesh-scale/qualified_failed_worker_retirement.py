@@ -34,6 +34,12 @@ SOURCE = stalled.SOURCE
 JOURNAL = "mesh96-qualified-default1-retirement"
 HOLD_KEY = "mock-clustermesh/qualified-default1-retirement"
 QUALIFICATION_BUILD = 79986
+WORKER_STATE_BUILD = 79993
+CURRENT_OS_FAILURE = "ProvisioningState/failed/OSProvisioningInternalError"
+EXTERNAL_REIMAGES = {
+    "ffa159a7-b3a2-4759-adba-05682953ced9", "09729c15-a658-41e4-b556-d654c4711cd7",
+    "23580baf-d457-4fe6-8a25-0eb3297fa6c9", "81ed87fa-3825-47bd-a193-82afcf4a213c",
+}
 RESERVE_SECONDS = 180
 EXPECTED_ERRORS = qualification.EXPECTED_ERRORS
 
@@ -42,6 +48,81 @@ def delete_command():
     return ["az", "aks", "nodepool", "delete-machines", "--resource-group", base.RESOURCE_GROUP,
             "--cluster-name", base.CLUSTER, "--name", "default", "--machine-names", TARGET,
             "--no-wait", "--only-show-errors"]
+
+
+def load_current_failure(args, receipt):
+    directory = getattr(args, "worker_state_directory", None)
+    if not directory:
+        return None, {}
+    hashes = qualification.hash_tree(directory)
+    root = Path(directory)
+    required = ("default-vmss-activity-log.json", "default-vmss-instance-view.json",
+                "default-1-instance-view.json", "default-instances.json", "current-nodes.json", "quota-observation.json")
+    require(set(required) <= set(hashes), "Current terminal worker evidence is incomplete")
+    data = {name: stalled.read_json(root / name) for name in required}
+    require(data["quota-observation.json"].get("observation_only") is True
+            and data["quota-observation.json"].get("mutation_started") is False,
+            "Current worker evidence must be read-only")
+    target_id = (f"/subscriptions/{base.SUBSCRIPTION}/resourceGroups/{base.NODE_GROUP}"
+                 f"/providers/Microsoft.Compute/virtualMachineScaleSets/{base.DEFAULT_VMSS}/virtualMachines/1")
+    events = data["default-vmss-activity-log.json"]
+    actions = [row for row in events if row.get("operation")
+               == "Microsoft.Compute/virtualMachineScaleSets/virtualMachines/reimage/action"]
+    require({row.get("correlationId") for row in actions} == EXTERNAL_REIMAGES,
+            "The captured external reimage set changed")
+    finished = []
+    worker_actions = [row for row in events if row.get("operation") in {
+        "Microsoft.Compute/virtualMachineScaleSets/virtualMachines/reimage/action",
+        "Microsoft.Compute/virtualMachineScaleSets/virtualMachines/restart/action",
+    }]
+    for correlation in {row.get("correlationId") for row in worker_actions}:
+        rows = [row for row in worker_actions if row.get("correlationId") == correlation]
+        require(len(rows) == 3 and {row.get("status") for row in rows} == {"Started", "Accepted", "Failed"}
+                and all(capacity.prepared.resource_equal(row.get("resourceId"), target_id) for row in rows),
+                "An observed external worker action is unresolved or out of scope")
+    for correlation in EXTERNAL_REIMAGES:
+        rows = [row for row in actions if row["correlationId"] == correlation]
+        by_status = {row["status"]: row for row in rows}
+        require(len(rows) == 3 and set(by_status) == {"Started", "Accepted", "Failed"}
+                and all(capacity.prepared.resource_equal(row.get("resourceId"), target_id) for row in rows),
+                "An external reimage is not the exact terminal target1 action")
+        stamps = {name: base.timestamp(row["eventTimestamp"], "external reimage") for name, row in by_status.items()}
+        require(base.timestamp(receipt["finished_at"], "qualified capacity")
+                <= stamps["Started"] <= stamps["Accepted"] <= stamps["Failed"] <= datetime.now(timezone.utc),
+                "External reimage timestamps are invalid")
+        message = by_status["Failed"]["properties"]["statusMessage"]
+        failure = json.loads(message) if isinstance(message, str) else message
+        details = (failure.get("error") or {}).get("details") or []
+        require(failure.get("status") == "Failed" and failure.get("error", {}).get("code") == "ResourceOperationFailure"
+                and len(details) == 1 and details[0].get("code") == "OSProvisioningInternalError"
+                and "failure to obtain DHCP lease" in str(details[0].get("message"))
+                and stalled.VM_IDS[TARGET] in str(details[0].get("message")),
+                "External failure does not prove the same target VM's terminal DHCP provisioning failure")
+        finished.append(stamps["Failed"])
+    aggregate = capacity.replacement.status_rows(data["default-vmss-instance-view.json"], "current default VMSS")
+    require(len(aggregate) == 1 and aggregate[0]["code"] == CURRENT_OS_FAILURE,
+            "Current VMSS is not the captured terminal OS failure")
+    aggregate_time = base.timestamp(aggregate[0]["time"], "current aggregate failure")
+    require(0 <= (max(finished) - aggregate_time).total_seconds() <= 10,
+            "Aggregate OS failure does not correlate with the terminal reimages")
+    instances = {str(row["instanceId"]): row for row in data["default-instances.json"]}
+    require(set(instances) == {"0", "1"} and instances["1"].get("vmId") == stalled.VM_IDS[TARGET]
+            and instances["1"].get("computerName") == TARGET and instances["1"].get("provisioningState") == "Failed"
+            and capacity.prepared.resource_equal(instances["1"].get("id"), target_id)
+            and instances["0"].get("vmId") == stalled.VM_IDS[SOURCE]
+            and instances["0"].get("provisioningState") == "Succeeded", "Current default VM identities changed")
+    nodes = {row["metadata"]["name"]: row for row in data["current-nodes.json"]["items"]}
+    require(uid(nodes[TARGET]) == base.REAL_UIDS[TARGET] and base.node_boot(nodes[TARGET]) == stalled.BOOTS[TARGET]
+            and not workers.node_is_ready(nodes[TARGET]), "The currently failed Node identity/recovery changed")
+    view = data["default-1-instance-view.json"]
+    statuses = {row["code"]: row for row in view["statuses"]}
+    require(set(statuses) == {CURRENT_OS_FAILURE, "PowerState/running"}, "Current target view is not terminal failed OS")
+    vm_time = base.timestamp(statuses[CURRENT_OS_FAILURE]["time"], "target OS failure")
+    require(abs((vm_time - aggregate_time).total_seconds()) <= 10, "VM and aggregate failure times disagree")
+    require(qualification.hash_tree(directory) == hashes, "Current failure input changed while loading")
+    return {"source_build": WORKER_STATE_BUILD, "code": CURRENT_OS_FAILURE,
+            "aggregate_time": aggregate_time.isoformat(), "vm_time": vm_time.isoformat(),
+            "terminal_correlations": sorted(EXTERNAL_REIMAGES), "caller_attribution_proven": False}, hashes
 
 
 def load_inputs(args):
@@ -91,8 +172,10 @@ def load_inputs(args):
             and base.frozen_pdbs(current) == base.frozen_pdbs({"pdbs": inputs["data"]["current-pdbs.json"]}),
             "Completed qualification controller/PDB contracts changed")
     require(qualification.hash_tree(args.qualification_directory) == hashes, "Qualification bundle changed while loading")
+    current_failure, state_hashes = load_current_failure(args, receipt)
     return {"qual_args": internal, "inputs": inputs, "prior": prior, "prior_hash": prior_hash,
-            "receipt": receipt, "hashes": hashes, "current": current}
+            "receipt": receipt, "hashes": hashes, "current": current,
+            "current_failure": current_failure, "worker_state_hashes": state_hashes}
 
 
 def semantic_pod_spec(spec):
@@ -120,6 +203,43 @@ def semantic_pod_spec(spec):
     return result
 
 
+class CurrentFailureCapacityGuard(qualification.ReadOnlyCapacityGuard):
+    """A separately proved terminal target failure, never an Updating-state waiver."""
+
+    def __init__(self, inputs, outer, runner):
+        self.current_failure = outer.outer.bundle["current_failure"]
+        super().__init__(inputs, outer, runner)
+
+    def validate_original_instance_state(self, row, node_name):
+        if node_name != TARGET or not self.current_failure:
+            return super().validate_original_instance_state(row, node_name)
+        require(row.get("provisioningState") == "Failed" and isinstance(row.get("latestModelApplied"), bool),
+                "The current target is not the proved terminal failed VM model")
+        return None
+
+    def validate_original_instance_view(self, view, node_name):
+        if node_name != TARGET or not self.current_failure:
+            return super().validate_original_instance_view(view, node_name)
+        statuses = {row["code"]: row for row in view.get("statuses") or []}
+        require(set(statuses) == {CURRENT_OS_FAILURE, "PowerState/running"}
+                and base.timestamp(statuses[CURRENT_OS_FAILURE].get("time"), "live target OS failure").isoformat()
+                == self.current_failure["vm_time"], "The current target OS failure or power state changed")
+        guest = (view.get("vmAgent") or {}).get("statuses") or []
+        require(len(guest) == 1 and guest[0].get("code") == "ProvisioningState/Unavailable"
+                and 0 <= (datetime.now(timezone.utc) - base.timestamp(guest[0].get("time"), "failed guest observation")).total_seconds() <= 300,
+                "Current failed-OS guest evidence is missing, changed or stale")
+        return None
+
+    def validate_default_aggregate(self, aggregate):
+        if not self.current_failure:
+            return super().validate_default_aggregate(aggregate)
+        rows = capacity.replacement.status_rows(aggregate, "current terminal default failure")
+        require(len(rows) == 1 and rows[0]["code"] == CURRENT_OS_FAILURE
+                and base.timestamp(rows[0].get("time"), "live current aggregate").isoformat()
+                == self.current_failure["aggregate_time"], "Current terminal default-VMSS failure changed")
+        return None
+
+
 class QualificationChecks(qualification.Qualification):
     """Read-only reuse of proven scope, capacity, identity and memory checks."""
 
@@ -127,7 +247,8 @@ class QualificationChecks(qualification.Qualification):
         self.outer = outer
         scratch = copy.deepcopy(bundle["receipt"])
         super().__init__(args, bundle["inputs"], scratch, runner, self.forbidden_delete,
-                         completed=bundle["prior"], completed_hash=bundle["prior_hash"])
+                         completed=bundle["prior"], completed_hash=bundle["prior_hash"],
+                         reader_type=CurrentFailureCapacityGuard)
         self.rss_high = max(self.rss_high, bundle["receipt"]["memory_projection"]["healthy_agent_rss_high_water_bytes"])
         self.node_high = copy.deepcopy(bundle["receipt"]["memory_projection"]["node_high_water"])
 
@@ -208,6 +329,9 @@ class Retirement(maintenance.ClusterOperator):
     def unchanged_inputs(self):
         require(qualification.hash_tree(self.args.qualification_directory) == self.bundle["hashes"],
                 "Immutable completed-qualification inputs changed")
+        if self.bundle["current_failure"]:
+            require(qualification.hash_tree(self.args.worker_state_directory) == self.bundle["worker_state_hashes"],
+                    "Immutable current terminal failure evidence changed")
 
     def read_command(self, command, timeout_seconds):
         command = list(command)
@@ -577,11 +701,16 @@ class Retirement(maintenance.ClusterOperator):
         return {"key": HOLD_KEY, "value": self.token, "effect": "NoSchedule"}
 
     def journal_payload(self):
-        return {"owner": JOURNAL, "token": self.token, "qualification_build": str(QUALIFICATION_BUILD),
+        data = {"owner": JOURNAL, "token": self.token, "qualification_build": str(QUALIFICATION_BUILD),
                 "qualification_bundle_sha256": digest(self.bundle["hashes"]),
                 "target_node_uid": base.REAL_UIDS[TARGET], "target_vm_id": stalled.VM_IDS[TARGET],
                 "hold": json.dumps(self.summary["hold"], sort_keys=True),
                 "native": json.dumps(self.summary["native"], sort_keys=True)}
+        if self.bundle["current_failure"]:
+            data.update(worker_state_build=str(WORKER_STATE_BUILD),
+                        worker_state_sha256=digest(self.bundle["worker_state_hashes"]),
+                        current_target_failure=json.dumps(self.bundle["current_failure"], sort_keys=True))
+        return data
 
     def raw_write(self, command):
         require(self.args.execute, "Plan mode cannot mutate")
@@ -737,10 +866,18 @@ def validate_args(args):
             and base.integer(args.timeout_seconds) and 600 <= args.timeout_seconds <= 3600,
             "Only completed qualification 79986 and a bounded 600..3600-second retirement are supported")
     require(args.kubeconfig and args.context == base.CLUSTER, "Private mesh96 credentials/context required")
+    state_path = getattr(args, "worker_state_directory", None)
+    state_build = getattr(args, "worker_state_build_id", 0)
+    require((not state_path and state_build == 0) or (state_path and state_build == WORKER_STATE_BUILD),
+            "Current terminal failure requires exact read-only build 79993")
     root, output, config = (Path(value).resolve() for value in (
         args.qualification_directory, args.summary_file, args.kubeconfig))
     require(len({root, output, config}) == 3 and root not in output.parents and not output.exists(),
             "Output must be new and cannot overwrite immutable inputs/private credentials")
+    if state_path:
+        state = Path(state_path).resolve()
+        require(state not in (root, output, config) and state not in output.parents,
+                "Current worker evidence must be separate from output/private credentials")
     args.role = base.ROLE
 
 
@@ -763,6 +900,8 @@ def execute_retirement(args, summary, runner=workers.run_command):
                        preserved_kwok_uids=bundle["receipt"]["preserved_kwok_uids"],
                        target={"node_name": TARGET, "node_uid": base.REAL_UIDS[TARGET], "vm_id": stalled.VM_IDS[TARGET]},
                        plan_sha256=stalled.PLAN_SHA)
+        if bundle["current_failure"]:
+            summary.update(current_target_failure=bundle["current_failure"], worker_state_input_hashes=bundle["worker_state_hashes"])
         Retirement(args, bundle, summary, runner).execute()
     except EXPECTED_ERRORS as error:
         summary.update(success=False, status="failed-closed", error=str(error), rollback_attempted=False,
@@ -786,6 +925,8 @@ def parse_args(argv=None):
     parser.add_argument("--context", default=base.CLUSTER)
     parser.add_argument("--timeout-seconds", type=int, default=3600)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--worker-state-directory")
+    parser.add_argument("--worker-state-build-id", type=int, default=0)
     return parser.parse_args(argv)
 
 

@@ -17,6 +17,8 @@ parameters:
     type: boolean
   - name: qualification_build_id
     type: number
+  - name: worker_state_build_id
+    type: number
   - name: exclusive_modes
     type: boolean
 
@@ -41,7 +43,8 @@ jobs:
             and .expected_region == "eastus2euap" and .expected_cluster_count == 100
             and .tfvars_path == "scenarios/perf-eval/clustermesh-scale/terraform-inputs/azure-100-mock-shared.tfvars"
             and .overlay_mode == "resume-existing" and .run_workload == false
-            and .qualification_build_id == 79986 and .exclusive_modes == true' \
+            and .qualification_build_id == 79986 and .worker_state_build_id == 79993
+            and .exclusive_modes == true' \
             <<< "$RETIREMENT_SCOPE_JSON" >/dev/null
         displayName: "Require exact qualified failed-worker retirement scope"
         env:
@@ -66,6 +69,18 @@ jobs:
           pipelineId: ${{ parameters.qualification_build_id }}
           artifactName: n100-capacity-qualification-${{ parameters.qualification_build_id }}-1
           targetPath: $(Pipeline.Workspace)/qualified-retirement-source
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download the current terminal failed-worker outcome"
+        inputs:
+          buildType: specific
+          project: $(System.TeamProjectId)
+          definition: $(System.DefinitionId)
+          specificBuildWithTriggering: false
+          buildVersionToDownload: specific
+          pipelineId: ${{ parameters.worker_state_build_id }}
+          artifactName: n100-unreachable-worker-recovery-${{ parameters.worker_state_build_id }}-1
+          targetPath: $(Pipeline.Workspace)/qualified-retirement-worker-state
 
       - template: /steps/topology/clustermesh-scale/reuse/retire-qualified-worker.yml
         parameters:

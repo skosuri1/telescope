@@ -21,6 +21,7 @@ SCOPE = {
     "expected_subscription_id": "37deca37-c375-4a14-b90a-043849bd2bf1",
     "expected_region": "eastus2euap", "expected_cluster_count": 100, "tfvars_path": TFVARS,
     "overlay_mode": "resume-existing", "run_workload": False, "qualification_build_id": 79986,
+    "worker_state_build_id": 79993,
     "exclusive_modes": True,
 }
 
@@ -34,6 +35,7 @@ def job():
     {"expected_region": "westus"}, {"expected_cluster_count": 2}, {"expected_cluster_count": "100"},
     {"tfvars_path": "other"}, {"overlay_mode": "resume"}, {"run_workload": True},
     {"qualification_build_id": 79979}, {"qualification_build_id": "79986"}, {"exclusive_modes": False},
+    {"worker_state_build_id": 79992}, {"worker_state_build_id": "79993"},
 ])
 def test_only_exact_successful_qualification_scope_is_admitted(changes):
     result = subprocess.run(
@@ -54,6 +56,7 @@ def test_retirement_mode_excludes_every_other_job_and_keeps_other_stages_unchang
     invocation = next(row[key][0] for row in stage["jobs"] if key in row)
     assert invocation["template"] == "/jobs/clustermesh-qualified-worker-retirement.yml"
     assert invocation["parameters"]["qualification_build_id"] == "${{ parameters.scaleDebugQualifiedWorkerRetirementBuildId }}"
+    assert invocation["parameters"]["worker_state_build_id"] == 79993
     for row in stage["jobs"]:
         condition = next(iter(row))
         if condition.startswith("${{") and condition != key:
@@ -78,6 +81,8 @@ def test_retirement_publishes_plan_before_mutation_and_has_no_task_retries():
     assert phase_steps[0][0] < publication < phase_steps[1][0]
     download = next(row["inputs"] for row in steps if row.get("task") == "DownloadPipelineArtifact@2")
     assert download["artifactName"] == "n100-capacity-qualification-${{ parameters.qualification_build_id }}-1"
+    assert any(row.get("inputs", {}).get("artifactName")
+               == "n100-unreachable-worker-recovery-${{ parameters.worker_state_build_id }}-1" for row in steps)
     operation = yaml.safe_load(STEP.read_text(encoding="utf-8"))["steps"][0]
     assert operation["retryCountOnTaskFailure"] == 0
     assert operation["${{ if eq(parameters.phase, 'plan') }}"]["timeoutInMinutes"] == 15
@@ -88,7 +93,7 @@ def test_retirement_publishes_plan_before_mutation_and_has_no_task_retries():
 @pytest.mark.parametrize("fault,count", [
     ("none", 2), ("unqualified", 0), ("unclean", 0), ("initial-symlink", 0), ("existing-output", 0),
     ("output-alias", 0), ("credentials-plan", 0), ("plan-error", 1), ("unsafe-plan", 1),
-    ("input-change", 1), ("tfvars-change", 1), ("between-change", 1), ("missing-freeze", 1),
+    ("input-change", 1), ("worker-state-change", 1), ("tfvars-change", 1), ("between-change", 1), ("missing-freeze", 1),
     ("credentials-execute", 1), ("execute-error", 2), ("not-fenced", 2), ("hold-remains", 2),
 ])
 def test_retirement_freezes_entire_qualification_and_never_publishes_credentials(tmp_path, fault, count):
@@ -96,6 +101,9 @@ def test_retirement_freezes_entire_qualification_and_never_publishes_credentials
     source, checkout, private, binaries = (tmp_path / name for name in ("input", "checkout", "private", "bin"))
     for path in (source, checkout, private, binaries):
         path.mkdir()
+    worker_state = tmp_path / "worker-state"
+    worker_state.mkdir()
+    (worker_state / "failure.json").write_text('{"source":79993}', encoding="utf-8")
     qualification = {
         "source_build": 79986, "success": True, "capacity_qualified": fault != "unqualified",
         "actual_ip_growth_proven": True, "actual_memory_headroom_proven": True,
@@ -126,6 +134,8 @@ def test_retirement_freezes_entire_qualification_and_never_publishes_credentials
         execute = "--execute" in args
         assert execute == (os.environ["PHASE"] == "execute")
         assert value("--qualification-build-id") == "79986" and value("--timeout-seconds") == "3600"
+        assert value("--worker-state-build-id") == "79993"
+        assert json.loads((Path(value("--worker-state-directory")) / "failure.json").read_text())["source"] == 79993
         assert value("--context") == "clustermesh-96"
         source = Path(value("--qualification-directory"))
         assert json.loads((source / "qualification.json").read_text())["source_build"] == 79986
@@ -136,6 +146,8 @@ def test_retirement_freezes_entire_qualification_and_never_publishes_credentials
         fault = os.environ["FAULT"]
         if not execute and fault == "input-change":
             (source / "nested/evidence.json").write_text("changed")
+        if not execute and fault == "worker-state-change":
+            (Path(value("--worker-state-directory")) / "failure.json").write_text("changed")
         if not execute and fault == "tfvars-change":
             (Path(os.environ["REPOSITORY_DIRECTORY"]) / os.environ["TFVARS_PATH"]).write_text("changed")
         output.write_text(json.dumps({
@@ -172,6 +184,7 @@ def test_retirement_freezes_entire_qualification_and_never_publishes_credentials
         "RUN_ID": SCOPE["target_run_id"], "CONFIRM_RESUME": SCOPE["confirm_resume"],
         "SUBSCRIPTION": SCOPE["expected_subscription_id"], "REGION": SCOPE["expected_region"],
         "QUALIFICATION_BUILD_ID": "79986", "QUALIFICATION_DIRECTORY": str(source),
+        "WORKER_STATE_BUILD_ID": "79993", "WORKER_STATE_DIRECTORY": str(worker_state),
         "TFVARS_PATH": TFVARS, "REPOSITORY_DIRECTORY": str(checkout), "AGENT_TEMP_DIRECTORY": str(private),
         "ARTIFACT_DIRECTORY": str(artifacts), "INPUTS_SHA": "", "TFVARS_SHA": "",
         "FAULT": fault, "CALLS": str(calls_file),

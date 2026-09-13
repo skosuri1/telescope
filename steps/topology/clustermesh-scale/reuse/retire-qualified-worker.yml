@@ -13,30 +13,36 @@ steps:
       umask 077
       directory="$ARTIFACT_DIRECTORY/n100-qualified-worker-retirement"
       snapshot_hashes() {
-        input="$directory/qualification-input"
-        test -d "$input"
-        test ! -L "$input"
-        if find "$input" -type l -print -quit | grep -q .; then
-          echo "Retirement evidence contains a symlink." >&2
-          return 1
-        fi
-        (cd "$input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
+        for name in qualification-input worker-state; do
+          input="$directory/$name"
+          test -d "$input"
+          test ! -L "$input"
+          if find "$input" -type l -print -quit | grep -q .; then
+            echo "Retirement evidence contains a symlink." >&2
+            return 1
+          fi
+          (cd "$input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --) |
+            sed "s|  ./|  $name/|"
+        done
       }
       if [ "$PHASE" = "plan" ]; then
-        python3 - "$QUALIFICATION_DIRECTORY" "$directory" <<'PY'
+        python3 - "$QUALIFICATION_DIRECTORY" "$WORKER_STATE_DIRECTORY" "$directory" <<'PY'
       import sys
       from pathlib import Path
-      original, output = (Path(value) for value in sys.argv[1:])
-      if original.is_symlink() or not original.is_dir():
-          raise SystemExit("Qualification input must be a real directory.")
-      original, output = original.resolve(), output.resolve()
-      if original == output or original in output.parents or output in original.parents or output.exists():
-          raise SystemExit("Retirement output must be new and disjoint from the input.")
+      output = Path(sys.argv[3]).resolve()
+      for original in (Path(value) for value in sys.argv[1:3]):
+          if original.is_symlink() or not original.is_dir():
+              raise SystemExit("Retirement inputs must be real directories.")
+          original = original.resolve()
+          if original == output or original in output.parents or output in original.parents or output.exists():
+              raise SystemExit("Retirement output must be new and disjoint from both inputs.")
       PY
-        if find "$QUALIFICATION_DIRECTORY" -type l -print -quit | grep -q .; then
-          echo "Qualification input contains a symlink." >&2
-          exit 1
-        fi
+        for input in "$QUALIFICATION_DIRECTORY" "$WORKER_STATE_DIRECTORY"; do
+          if find "$input" -type l -print -quit | grep -q .; then
+            echo "Retirement input contains a symlink." >&2
+            exit 1
+          fi
+        done
         jq -e '.success == true and .capacity_qualified == true
           and .actual_ip_growth_proven == true and .actual_memory_headroom_proven == true
           and .completion_only == true and .execute == false and .mutation_started == false
@@ -47,6 +53,7 @@ steps:
         mkdir "$directory"
         echo "##vso[task.setvariable variable=QUALIFIED_RETIREMENT_DIAGNOSTICS_READY]true"
         cp -R -- "$QUALIFICATION_DIRECTORY" "$directory/qualification-input"
+        cp -R -- "$WORKER_STATE_DIRECTORY" "$directory/worker-state"
         snapshot_hashes > "$directory/inputs.sha256"
         inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
         tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
@@ -89,6 +96,7 @@ steps:
         --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
         --expected-tfvars-sha "$tfvars_sha"
         --qualification-directory "$directory/qualification-input" --qualification-build-id "$QUALIFICATION_BUILD_ID"
+        --worker-state-directory "$directory/worker-state" --worker-state-build-id "$WORKER_STATE_BUILD_ID"
         --kubeconfig "$private/cluster.config" --context clustermesh-96 --timeout-seconds 3600
       )
       if [ "$PHASE" = "plan" ]; then
@@ -125,6 +133,8 @@ steps:
       TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
       QUALIFICATION_BUILD_ID: ${{ parameters.scope.qualification_build_id }}
       QUALIFICATION_DIRECTORY: $(Pipeline.Workspace)/qualified-retirement-source
+      WORKER_STATE_BUILD_ID: ${{ parameters.scope.worker_state_build_id }}
+      WORKER_STATE_DIRECTORY: $(Pipeline.Workspace)/qualified-retirement-worker-state
       ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
       REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
       AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)

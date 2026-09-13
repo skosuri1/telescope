@@ -463,26 +463,16 @@ class CapacityFirst(maintenance.ClusterOperator):
                     node_name = stalled.SOURCE if str(row["instanceId"]) == "0" else stalled.TARGET
                     require(row.get("computerName") == node_name and row.get("vmId") == stalled.VM_IDS[node_name]
                             and prepared.resource_equal("azure://" + str(row.get("id")),
-                                                        self.old_nodes[node_name]["spec"]["providerID"])
-                            and row.get("provisioningState") == "Succeeded" and row.get("latestModelApplied") is True,
-                            "Protected/default VM identity or applied model changed")
+                                                        self.old_nodes[node_name]["spec"]["providerID"]),
+                            "Protected/default VM identity changed")
+                    self.validate_original_instance_state(row, node_name)
                     view = self.az_json("vmss", "get-instance-view", "--resource-group", base.NODE_GROUP,
                                         "--name", vmss, "--instance-id", str(row["instanceId"]), "--query", stalled.VIEW_QUERY)
                     evidence["views"][node_name] = view
-                    codes = {entry.get("code") for entry in view.get("statuses") or []}
-                    require(codes == {"ProvisioningState/succeeded", "PowerState/running"}, "An old VM changed power/state")
-                    if node_name == stalled.SOURCE:
-                        require(stalled.guest_state(view, max_age_seconds=300) == "ready" and stalled.extensions_ready(view),
-                                "Healthy default0 guest/system health changed")
-                    else:
-                        require(stalled.guest_state(view, max_age_seconds=300) == "unresponsive",
-                                "Failed VM1 is no longer the freshly observed unresponsive host")
+                    self.validate_original_instance_view(view, node_name)
                 aggregate = self.az_json("vmss", "get-instance-view", "--resource-group", base.NODE_GROUP,
                                          "--name", vmss, "--query", base.SCALE_VIEW_QUERY)
-                rows = replacement.status_rows(aggregate, "live default aggregate")
-                require(len(rows) == 1 and rows[0]["code"] == FAILURE
-                        and base.timestamp(rows[0].get("time"), "live default failure").isoformat() == self.proof["aggregate_time"],
-                        "Only the exact correlated terminal default-VMSS failure may remain degraded")
+                self.validate_default_aggregate(aggregate)
                 evidence["default_aggregate"] = aggregate
             old_pin["pools"][name] = prepared.pool_configuration(pool)
             old_pin["vmsses"][name] = scale
@@ -492,6 +482,26 @@ class CapacityFirst(maintenance.ClusterOperator):
         if POOL not in pool_map or POOL not in scale_map:
             return None
         return self.new_models(pool_map[POOL], scale_map[POOL], evidence)
+
+    def validate_original_instance_state(self, row, node_name):
+        require(row.get("provisioningState") == "Succeeded" and row.get("latestModelApplied") is True,
+                f"{node_name}: protected/default VM provisioning or applied model changed")
+
+    def validate_original_instance_view(self, view, node_name):
+        codes = {entry.get("code") for entry in view.get("statuses") or []}
+        require(codes == {"ProvisioningState/succeeded", "PowerState/running"}, "An old VM changed power/state")
+        if node_name == stalled.SOURCE:
+            require(stalled.guest_state(view, max_age_seconds=300) == "ready" and stalled.extensions_ready(view),
+                    "Healthy default0 guest/system health changed")
+        else:
+            require(stalled.guest_state(view, max_age_seconds=300) == "unresponsive",
+                    "Failed VM1 is no longer the freshly observed unresponsive host")
+
+    def validate_default_aggregate(self, aggregate):
+        rows = replacement.status_rows(aggregate, "live default aggregate")
+        require(len(rows) == 1 and rows[0]["code"] == FAILURE
+                and base.timestamp(rows[0].get("time"), "live default failure").isoformat() == self.proof["aggregate_time"],
+                "Only the exact correlated terminal default-VMSS failure may remain degraded")
 
     @staticmethod
     def validate_scale(scale, vmss, pool, count, size, states):

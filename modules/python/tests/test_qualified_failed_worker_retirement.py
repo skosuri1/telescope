@@ -9,6 +9,7 @@ import importlib.util
 import json
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -576,4 +577,82 @@ def test_external_vmss_update_blocks_mutation_but_preserves_kubernetes_snapshot(
     diagnostics = cloud.receipt()["qualification_recheck"]["read_only_capacity_guard"]
     assert diagnostics["kubernetes_diagnostics"]["nodes"]["items"]
     assert diagnostics["kubernetes_diagnostics"]["pods"]["items"]
+    assert not cloud.writes and not cloud.native_calls
+
+
+@pytest.fixture(name="current_failure_environment")
+def build_current_failure_environment(environment):
+    args, cloud = environment
+    directory = Path("current-worker-state")
+    directory.mkdir()
+    args.worker_state_directory = str(directory)
+    args.worker_state_build_id = 79993
+    receipt = json.loads((Path(args.qualification_directory) / "qualification.json").read_text(encoding="utf-8"))
+    stamp = datetime.now(timezone.utc).isoformat()
+    target_id = next(row["id"] for row in cloud.instances if str(row["instanceId"]) == "1")
+    events = [{
+        "correlationId": correlation,
+        "operation": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines/reimage/action",
+        "resourceId": target_id, "status": phase,
+        "eventTimestamp": stamp if phase == "Failed" else receipt["finished_at"],
+        "properties": {"statusMessage": json.dumps({
+            "status": "Failed", "error": {"code": "ResourceOperationFailure", "details": [{
+                "code": "OSProvisioningInternalError",
+                "message": f"failure to obtain DHCP lease vm_id={stalled.VM_IDS[stalled.TARGET]}",
+            }]},
+        })} if phase == "Failed" else {},
+    } for correlation in retirement.EXTERNAL_REIMAGES for phase in ("Started", "Accepted", "Failed")]
+    target = next(row for row in cloud.instances if str(row["instanceId"]) == "1")
+    target["provisioningState"] = "Failed"
+    cloud.views["1"]["statuses"] = [
+        {"code": retirement.CURRENT_OS_FAILURE, "time": stamp}, {"code": "PowerState/running"},
+    ]
+    cloud.views["1"]["vmAgent"]["statuses"][0].update(
+        code="ProvisioningState/Unavailable", message="VM status blob is found but not yet populated.", time=now())
+    cloud.aggregate["statuses"] = [{"code": retirement.CURRENT_OS_FAILURE, "time": stamp}]
+    files = {
+        "quota-observation.json": {"observation_only": True, "mutation_started": False},
+        "default-vmss-activity-log.json": events,
+        "default-vmss-instance-view.json": {"statuses": cloud.aggregate["statuses"]},
+        "default-1-instance-view.json": cloud.views["1"],
+        "default-instances.json": [{**row, "computerName": row["osProfile"]["computerName"]} for row in cloud.instances],
+        "current-nodes.json": {"items": list(cloud.nodes.values())},
+    }
+    for name, value in files.items():
+        (directory / name).write_text(json.dumps(value), encoding="utf-8")
+    return args, cloud
+
+
+@pytest.mark.parametrize("applied", [True, False])
+def test_exact_current_terminal_os_failure_can_be_retired_without_reimage(current_failure_environment, applied):
+    _, cloud = current_failure_environment
+    next(row for row in cloud.instances if str(row["instanceId"]) == "1")["latestModelApplied"] = applied
+    result = run(current_failure_environment, True)
+    assert result["success"] and result["current_target_failure"]["source_build"] == 79993
+    journal = cloud.journals[retirement.JOURNAL]["data"]
+    assert journal["worker_state_build"] == "79993"
+    assert journal["worker_state_sha256"] == q.digest(result["worker_state_input_hashes"])
+    assert len(cloud.native_calls) == 1 and not cloud.deleted
+    assert not any("reimage" in command or "restart" in command for command in cloud.writes)
+
+
+@pytest.mark.parametrize("fault", ["updating", "different-error", "fresh-guest-ready", "unresolved-action", "different-vm"])
+def test_current_failure_adapter_does_not_waive_live_or_historical_guards(current_failure_environment, fault):
+    args, cloud = current_failure_environment
+    if fault == "updating":
+        cloud.scales[0]["provisioningState"] = "Updating"
+    elif fault == "different-error":
+        cloud.views["1"]["statuses"][0]["code"] = "ProvisioningState/failed/Other"
+    elif fault == "fresh-guest-ready":
+        cloud.views["1"]["vmAgent"]["statuses"][0]["code"] = "ProvisioningState/succeeded"
+    else:
+        path = Path(args.worker_state_directory) / "default-vmss-activity-log.json"
+        rows = json.loads(path.read_text(encoding="utf-8"))
+        if fault == "unresolved-action":
+            rows = rows[:-1]
+        else:
+            rows[0]["resourceId"] = rows[0]["resourceId"].rsplit("/", 1)[0] + "/0"
+        path.write_text(json.dumps(rows), encoding="utf-8")
+    with pytest.raises(retirement.EXPECTED_ERRORS):
+        run(current_failure_environment, True)
     assert not cloud.writes and not cloud.native_calls

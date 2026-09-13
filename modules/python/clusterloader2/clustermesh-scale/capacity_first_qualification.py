@@ -371,14 +371,15 @@ class ReadOnlyCapacityGuard(capacity.CapacityFirst):
 class Qualification(maintenance.ClusterOperator):
     """Only journal/probe writes; all production and provider mutation paths are absent."""
 
-    def __init__(self, args, inputs, summary, runner, delete_pod, *, completed=None, completed_hash=""):
+    def __init__(self, args, inputs, summary, runner, delete_pod, *, completed=None, completed_hash="",
+                 reader_type=ReadOnlyCapacityGuard):
         deadline = time.monotonic() + args.timeout_seconds
         super().__init__(args, base.CLUSTER, runner, deadline - RESERVE_SECONDS, deadline)
         self.inputs, self.summary, self.delete_pod = inputs, summary, delete_pod
         self.identities = inputs["identities"]
         self.token, self.journal_uid = uuid.uuid4().hex, ""
         self.cluster = mocks.Cluster(base.ROLE, args.kubeconfig, args.context, base.CLUSTER, base.RESOURCE_GROUP)
-        self.reader = ReadOnlyCapacityGuard(inputs, self, self.read_command)
+        self.reader = reader_type(inputs, self, self.read_command)
         self.reader.work_deadline, self.reader.cleanup_deadline = self.work_deadline, self.cleanup_deadline
         self.rss_high = 0
         self.node_high = {}

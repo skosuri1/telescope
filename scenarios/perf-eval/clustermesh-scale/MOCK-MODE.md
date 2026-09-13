@@ -327,6 +327,13 @@ protected. There are no direct production Pod deletions, new pools, or workloads
 in this phase. The hold is removed only on safe completion, or retained with
 explicit recovery evidence if an accepted retirement remains uncertain.
 
+The retirement also binds the current read-only worker outcome from `79993`.
+Separate restart/reimage activity changed the same failed VM's terminal error to
+OS provisioning failure. The current failure adapter requires every captured
+action to be terminal, the exact VM/Node identity and failed-OS timestamps, and
+fresh unavailable-guest evidence; an `Updating` VMSS still blocks retirement.
+The original restart and capacity qualification receipts remain unchanged.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,
