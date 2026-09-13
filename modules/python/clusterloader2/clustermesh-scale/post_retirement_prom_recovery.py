@@ -34,6 +34,7 @@ uid = base.object_uid
 RETIREMENT_BUILD = 80001
 RETIREMENT_JOURNAL_UID = "cabb75e5-7260-4202-bbc7-d3863f5388c3"
 RESUME_BUILD = 80007
+ACCEPTED_RESUME_BUILD = 80011
 RESERVED_JOURNAL_UID = "ceed29d1-7f56-492a-b515-b682d0cd646b"
 JOURNAL = "mesh96-post-retirement-prom-recovery"
 JOURNAL_OWNER = "post-retirement-prom-recovery"
@@ -87,6 +88,10 @@ VMSS_MODEL_QUERY = (
     "diffDiskOption:diffDiskSettings.option},"
     "imageReference:virtualMachineProfile.storageProfile.imageReference}"
 )
+
+
+class ProtectedVmssBusy(workers.ReconcileError):
+    """An unchanged protected VMSS is Updating; no mutation is authorized."""
 
 
 def empty_action() -> dict:
@@ -371,15 +376,18 @@ def load_reserved_checkpoint(args, bundle):
     root = Path(args.resume_directory)
     plan = stalled.read_json(root / "plan.json")
     receipt = stalled.read_json(root / "recovery.json")
+    accepted_create = args.resume_build_id == ACCEPTED_RESUME_BUILD
+    expected_error = ("cniv5: protected VMSS identity/model/capacity changed" if accepted_create
+                      else "Monitoring journal CAS result is ambiguous")
     require(
         plan.get("execute") is False and plan.get("mutation_started") is False
         and plan.get("plan_valid") is True and receipt.get("execute") is True
         and receipt.get("mutation_started") is True and receipt.get("plan_valid") is True
         and receipt.get("success") is False and receipt.get("repaired") is False
         and receipt.get("status") == "failed-closed"
-        and receipt.get("error") == "Monitoring journal CAS result is ambiguous"
+        and receipt.get("error") == expected_error
         and receipt.get("cleanup_errors") == [],
-        "Only the exact build 80007 initial journal no-op failure may continue",
+        "Only the exact source-bound monitoring failure may continue",
     )
     for source in (plan, receipt):
         require(
@@ -391,11 +399,35 @@ def load_reserved_checkpoint(args, bundle):
             and source.get("current_mock_uids") == bundle["receipt"]["current_mock_uids"]
             and source.get("preserved_kwok_uids") == bundle["receipt"]["preserved_kwok_uids"]
             and source.get("workloads_ready") is False
-            and source.get("pool_add") == empty_action()
+            and (accepted_create and source is receipt or source.get("pool_add") == empty_action())
             and source.get("old_pool_delete") == empty_action(),
             "Reserved checkpoint changed identity, or a provider request was attempted/accepted/ambiguous",
         )
     journal = receipt.get("journal") or {}
+    if accepted_create:
+        action = receipt.get("pool_add") or {}
+        require(_action_complete(action) and action.get("automatic_retry_allowed") is False
+                and action.get("command") == pool_add_command()
+                and base.timestamp(action["requested_at"], "create intent")
+                <= base.timestamp(action["submission_started_at"], "create submission")
+                <= base.timestamp(action["accepted_at"], "create acceptance"),
+                "Accepted-create observation requires the sole exact nonambiguous promv5 add")
+        require(journal.get("uid") == RESERVED_JOURNAL_UID and journal.get("attached_existing") is True
+                and journal.get("created_in_build") == RESUME_BUILD and journal.get("retained") is True
+                and journal.get("resource_version") and retirement.capacity.quantities.valid_sha(journal.get("data_sha256")),
+                "Accepted creation lacks its exact retained journal data/version")
+        vmsses = (receipt.get("arm_diagnostics") or {}).get("vmsses") or []
+        new_rows = [row for row in vmsses if workers.vmss_pool_name(row) == NEW_POOL]
+        cniv5_rows = [row for row in vmsses if workers.vmss_pool_name(row) == "cniv5"]
+        require(len(new_rows) == len(cniv5_rows) == 1, "Accepted creation lacks exact new/protected VMSS observations")
+        protected = copy.deepcopy(cniv5_rows[0])
+        require(protected.pop("provisioningState", None) == "Updating"
+                and protected["sku"].pop("capacity", None) == 2
+                and protected == bundle["vmss_pins"]["cniv5"],
+                "The captured protected VMSS differs by more than its Updating state")
+        require((new_rows[0].get("tags") or {}).get("aks-managed-createOperationID"),
+                "Accepted promv5 lacks a generation-bound creation operation tag")
+        return {"hashes": hashes, "receipt": receipt, "kind": "accepted-create", "new_vmss": new_rows[0]}
     require(journal.get("name") == JOURNAL and journal.get("namespace") == "kube-system"
             and journal.get("uid") == RESERVED_JOURNAL_UID and journal.get("retained") is True
             and journal.get("attempted") is True and journal.get("accepted") is True
@@ -407,7 +439,7 @@ def load_reserved_checkpoint(args, bundle):
             <= base.timestamp(journal["accepted_at"], "journal acceptance")
             <= base.timestamp(receipt["finished_at"], "reserved execution end"),
             "Reserved journal timing does not match the failed execution")
-    return {"hashes": hashes, "receipt": receipt}
+    return {"hashes": hashes, "receipt": receipt, "kind": "unsubmitted"}
 
 
 class PromRecovery(maintenance.ClusterOperator):
@@ -433,6 +465,7 @@ class PromRecovery(maintenance.ClusterOperator):
         self.new_vmss = ""
         self.phase = "plan"
         self.journal_history = []
+        self.continuation_recorded = False
 
     def save(self):
         mocks.write_json_atomic(self.args.summary_file, self.summary)
@@ -594,9 +627,25 @@ class PromRecovery(maintenance.ClusterOperator):
                 and isinstance(token, str) and re.fullmatch(r"[0-9a-f]{32}", token),
                 "Existing reserved journal identity, token, or lifecycle changed")
         created = base.timestamp(metadata.get("creationTimestamp"), "reserved journal creation")
-        require(base.timestamp(source["receipt"]["started_at"], "reserved execution start")
-                <= created <= base.timestamp(source["receipt"]["finished_at"], "reserved execution end"),
-                "Reserved journal was not created during the proven build 80007 execution")
+        accepted_create = source["kind"] == "accepted-create"
+        if accepted_create:
+            source_journal = source["receipt"]["journal"]
+            require(metadata["resourceVersion"] == source_journal["resource_version"]
+                    and base.digest(data) == source_journal["data_sha256"]
+                    and created <= base.timestamp(source["receipt"]["started_at"], "accepted continuation start"),
+                    "Accepted creation journal changed after its recorded checkpoint")
+            history = json.loads(data.get("continuation_history", "null"))
+            require(isinstance(history, list) and len(history) == 1 and isinstance(history[0], dict)
+                    and {key: value for key, value in history[0].items() if key != "continued_at"}
+                    == source["receipt"].get("continuation"),
+                    "Accepted creation lost its original unsubmitted-reservation history")
+            self.journal_history = copy.deepcopy(history)
+            self.summary["pool_add"] = copy.deepcopy(source["receipt"]["pool_add"])
+            self.new_vmss = source["new_vmss"]["name"]
+        else:
+            require(base.timestamp(source["receipt"]["started_at"], "reserved execution start")
+                    <= created <= base.timestamp(source["receipt"]["finished_at"], "reserved execution end"),
+                    "Reserved journal was not created during the proven build 80007 execution")
         self.token = token
         self.summary["status"] = "planned-read-only"
         require(data == self.journal_data(),
@@ -609,19 +658,20 @@ class PromRecovery(maintenance.ClusterOperator):
             resource_version=self.journal_resource_version, data_sha256=base.digest(data),
         )
         self.summary["continuation"] = {
-            "source_build_id": RESUME_BUILD, "source_checkpoint_sha256": source["hashes"]["recovery.json"],
+            "source_build_id": self.args.resume_build_id, "source_checkpoint_sha256": source["hashes"]["recovery.json"],
             "journal_uid": self.journal_uid, "source_resource_version": self.journal_resource_version,
             "source_data_sha256": base.digest(data), "source_record": data["record"],
-            "provider_request_previously_submitted": False,
+            "provider_request_previously_submitted": accepted_create,
         }
         self.owned_journal()
         self.save()
 
     def record_continuation(self):
-        require(self.args.execute and not self.journal_history,
+        require(self.args.execute and not self.continuation_recorded,
                 "A reserved-journal continuation may be recorded only once")
-        self.journal_history = [{**self.summary["continuation"], "continued_at": workers.utc_now()}]
+        self.journal_history.append({**self.summary["continuation"], "continued_at": workers.utc_now()})
         self.persist_journal()
+        self.continuation_recorded = True
 
     def owned_journal(self):
         row = self.kube("-n", "kube-system", "get", "configmap", JOURNAL, "-o", "json")
@@ -645,6 +695,9 @@ class PromRecovery(maintenance.ClusterOperator):
             or command == pool_delete_command()
         )
         require(allowed, "Write escaped the new-journal/one-add/one-empty-delete whitelist")
+        require((self.bundle.get("resume") or {}).get("kind") != "accepted-create"
+                or command != pool_add_command(),
+                "An already accepted monitoring pool add can never be submitted again")
         self.summary["mutation_started"] = True
         self.save()
         timeout = PROVIDER_SUBMIT_SECONDS if command[0] == "az" else self.args.request_timeout_seconds
@@ -766,10 +819,15 @@ class PromRecovery(maintenance.ClusterOperator):
             model.pop("provisioningState", None)
             capacity = model["sku"].pop("capacity", None)
             require(
-                capacity == expected_count and scale.get("provisioningState") == "Succeeded"
-                and model == self.bundle["vmss_pins"][name],
+                capacity == expected_count and model == self.bundle["vmss_pins"][name],
                 f"{name}: protected VMSS identity/model/capacity changed",
             )
+            if scale.get("provisioningState") == "Updating" and (
+                self.bundle.get("resume") or {}
+            ).get("kind") == "accepted-create":
+                raise ProtectedVmssBusy(f"{name}: waiting for unchanged protected VMSS Updating to become Succeeded")
+            require(scale.get("provisioningState") == "Succeeded",
+                    f"{name}: protected VMSS identity/model/capacity changed")
             instances = self.az_json("vmss", "list-instances", "--resource-group", base.NODE_GROUP,
                                      "--name", scale["name"], "--query", base.VM_QUERY)
             require(isinstance(instances, list) and len(instances) == expected_count,
@@ -887,6 +945,12 @@ class PromRecovery(maintenance.ClusterOperator):
             "promv5 VMSS ownership/SKU/capacity/state is invalid",
         )
         require(not self.new_vmss or self.new_vmss == name, "Observed promv5 VMSS identity changed")
+        if (self.bundle.get("resume") or {}).get("kind") == "accepted-create":
+            original = self.bundle["resume"]["new_vmss"]
+            require(prepared.resource_equal(scale.get("id"), original["id"])
+                    and scale.get("tags", {}).get("aks-managed-createOperationID")
+                    == original["tags"]["aks-managed-createOperationID"],
+                    "Accepted promv5 VMSS creation generation changed")
         self.new_vmss = name
         model = self.az_json("vmss", "show", "--resource-group", base.NODE_GROUP,
                              "--name", name, "--query", VMSS_MODEL_QUERY)
@@ -1450,21 +1514,32 @@ class PromRecovery(maintenance.ClusterOperator):
             self.save()
             raise
 
-    def wait_new_ready(self):
+    def wait_new_ready(self, *, persist=True):
         self.phase = "creating"
+        quiescence_deadline = min(self.work_deadline, time.monotonic() + 600)
         while True:
             self.unchanged_inputs()
             snapshot = self.snapshot()
             self.authority()
             self.journals(allow_own=True)
-            provider_ready, _, _ = self.models()
+            try:
+                provider_ready, _, _ = self.models()
+            except ProtectedVmssBusy as error:
+                self.summary["protected_vmss_wait_reason"] = str(error)
+                self.save()
+                print(f"{workers.utc_now()}: {error}; no mutation is authorized", flush=True)
+                require(time.monotonic() < quiescence_deadline,
+                        "Protected VMSS quiescence exceeded its read-only 600-second bound")
+                time.sleep(min(POLL_SECONDS, self.remaining_seconds(POLL_SECONDS)))
+                continue
             operator_ready = self.guard(snapshot, require_new=True)
             print(f"{workers.utc_now()}: promv5 provider_ready={provider_ready} operator_ready={operator_ready}"
                   f" {self.summary.get('new_prom_wait_reason', '')}", flush=True)
             if provider_ready and operator_ready:
                 self.memory_headroom()
                 self.summary["status"] = "promv5-and-existing-operator-ready"
-                self.persist_journal()
+                if persist:
+                    self.persist_journal()
                 return
             require(time.monotonic() < self.work_deadline,
                     "promv5/VM/guest/extensions/Node/NNC/DaemonSets/operator exceeded the bounded wait")
@@ -1549,6 +1624,17 @@ class PromRecovery(maintenance.ClusterOperator):
     def execute(self):
         if self.bundle.get("resume"):
             self.attach_reserved_journal()
+        if (self.bundle.get("resume") or {}).get("kind") == "accepted-create":
+            self.wait_new_ready(persist=False)
+            self.summary["plan_valid"] = True
+            self.save()
+            if not self.args.execute:
+                return
+            self.record_continuation()
+            self.submit("old_pool_delete", pool_delete_command())
+            self.wait_old_absent()
+            self.finalize()
+            return
         self.preflight()
         if not self.args.execute:
             return
@@ -1591,11 +1677,11 @@ def validate_args(args):
             "Reserved monitoring continuation requires both its build ID and checkpoint directory")
     if resume_build:
         resume_root = Path(resume_directory).resolve()
-        require(resume_build == RESUME_BUILD and resume_root.is_dir()
+        require(resume_build in (RESUME_BUILD, ACCEPTED_RESUME_BUILD) and resume_root.is_dir()
                 and not Path(resume_directory).is_symlink()
                 and resume_root not in output.parents and resume_root not in config.parents
                 and resume_root != root and root not in resume_root.parents and resume_root not in root.parents,
-                "Only the separate build 80007 unsubmitted reservation checkpoint is supported")
+                "Only the exact separate monitoring continuation checkpoints are supported")
     args.role = base.ROLE
 
 

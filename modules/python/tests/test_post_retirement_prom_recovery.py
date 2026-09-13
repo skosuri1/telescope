@@ -1526,3 +1526,95 @@ def test_reservation_continuation_cannot_adopt_other_or_attempted_operations(tmp
     with pytest.raises(prom.workers.ReconcileError):
         prom.execute_recovery(args, {}, runner=cloud)
     assert len(cloud.writes) == writes and cloud.add_count == cloud.delete_count == 0
+
+
+def accepted_creation_fixture(tmp_path, monkeypatch):
+    root, original_checkpoint, fixture, cloud = reserved_failure_fixture(tmp_path, monkeypatch)
+    checkpoint = tmp_path / "accepted-checkpoint"
+    checkpoint.mkdir()
+    plan_args = recovery_args(root, checkpoint / "plan.json", False)
+    plan_args.resume_directory, plan_args.resume_build_id = str(original_checkpoint), 80007
+    prom.execute_recovery(plan_args, {}, runner=cloud)
+    original_add = cloud.add_promv5
+
+    def add_with_protected_update():
+        original_add()
+        next(row for row in cloud.scales if prom.workers.vmss_pool_name(row) == prom.NEW_POOL)[
+            "tags"]["aks-managed-createOperationID"] = identity("accepted-prom-generation")
+        next(row for row in cloud.scales if prom.workers.vmss_pool_name(row) == "cniv5")[
+            "provisioningState"] = "Updating"
+
+    cloud.add_promv5 = add_with_protected_update
+    args = recovery_args(root, checkpoint / "recovery.json", True)
+    args.resume_directory, args.resume_build_id = str(original_checkpoint), 80007
+    with pytest.raises(prom.workers.ReconcileError, match="cniv5: protected VMSS"):
+        prom.execute_recovery(args, {}, runner=cloud)
+    receipt = json.loads((checkpoint / "recovery.json").read_text(encoding="utf-8"))
+    assert receipt["pool_add"]["accepted"] and cloud.add_count == 1 and cloud.delete_count == 0
+    return root, checkpoint, fixture, cloud
+
+
+def test_accepted_creation_waits_readonly_then_retires_only_empty_old_pool(tmp_path, monkeypatch):
+    root, checkpoint, _, cloud = accepted_creation_fixture(tmp_path, monkeypatch)
+    initial = copy.deepcopy(cloud.configmaps)
+    writes = len(cloud.writes)
+    quiescence_waits = []
+
+    def settle(_seconds):
+        assert len(cloud.writes) == writes and cloud.configmaps == initial
+        quiescence_waits.append(True)
+        next(row for row in cloud.scales if prom.workers.vmss_pool_name(row) == "cniv5")[
+            "provisioningState"] = "Succeeded"
+
+    monkeypatch.setattr(prom.time, "sleep", settle)
+    args = recovery_args(root, tmp_path / "observed-ready.json", False)
+    args.resume_directory, args.resume_build_id = str(checkpoint), 80011
+    plan = {}
+    prom.execute_recovery(args, plan, runner=cloud)
+    assert quiescence_waits and plan["plan_valid"] and not plan["mutation_started"]
+    assert cloud.configmaps == initial and cloud.add_count == 1 and cloud.delete_count == 0
+    args = recovery_args(root, tmp_path / "completed.json", True)
+    args.resume_directory, args.resume_build_id = str(checkpoint), 80011
+    summary = {}
+    prom.execute_recovery(args, summary, runner=cloud)
+    assert summary["success"] and cloud.add_count == cloud.delete_count == 1
+    assert len([row for row in cloud.writes[writes:] if row[0] == "az"]) == 1
+    assert all("add" not in row for row in cloud.writes[writes:] if row[0] == "az")
+    history = json.loads(cloud.configmaps[prom.JOURNAL]["data"]["continuation_history"])
+    assert [row["source_build_id"] for row in history] == [80007, 80011]
+    assert cloud.configmaps[prom.JOURNAL]["data"]["token"] == initial[prom.JOURNAL]["data"]["token"]
+    assert not summary["workloads_ready"]
+
+
+@pytest.mark.parametrize("fault", ["journal-data", "journal-version", "changed-protected-model", "new-generation", "old-delete-attempted"])
+def test_accepted_creation_cannot_replay_or_waive_changed_state(tmp_path, monkeypatch, fault):
+    root, checkpoint, _, cloud = accepted_creation_fixture(tmp_path, monkeypatch)
+    if fault == "journal-data":
+        cloud.configmaps[prom.JOURNAL]["data"]["owner"] = "changed"
+    elif fault == "journal-version":
+        cloud.configmaps[prom.JOURNAL]["metadata"]["resourceVersion"] = "99999"
+    elif fault == "changed-protected-model":
+        next(row for row in cloud.scales if prom.workers.vmss_pool_name(row) == "cniv5")["sku"]["name"] = "other"
+    elif fault == "new-generation":
+        next(row for row in cloud.scales if prom.workers.vmss_pool_name(row) == "cniv5")["provisioningState"] = "Succeeded"
+        next(row for row in cloud.scales if prom.workers.vmss_pool_name(row) == prom.NEW_POOL)[
+            "tags"]["aks-managed-createOperationID"] = identity("foreign-generation")
+    else:
+        path = checkpoint / "recovery.json"
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt["old_pool_delete"]["attempted"] = True
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+    args = recovery_args(root, tmp_path / "rejected-accepted.json", True)
+    args.resume_directory, args.resume_build_id = str(checkpoint), 80011
+    writes = len(cloud.writes)
+    with pytest.raises(prom.workers.ReconcileError):
+        prom.execute_recovery(args, {}, runner=cloud)
+    assert len(cloud.writes) == writes and cloud.add_count == 1 and cloud.delete_count == 0
+
+
+def test_accepted_create_rejects_even_a_direct_second_add():
+    recovery = object.__new__(prom.PromRecovery)
+    recovery.args = SimpleNamespace(execute=True)
+    recovery.bundle = {"resume": {"kind": "accepted-create"}}
+    with pytest.raises(prom.workers.ReconcileError, match="never be submitted again"):
+        recovery.raw_write(prom.pool_add_command())
