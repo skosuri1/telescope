@@ -55,7 +55,8 @@ def test_monitoring_route_is_exclusive_and_only_in_approved_stage():
     assert parameter["type"] == "number" and parameter["default"] == 0
     stage = next(row for row in pipeline["stages"] if row["stage"] == "azure_eastus2euap_n100_debug_resume_37deca")
     route = "${{ if ne(parameters.scaleDebugPostRetirementPromBuildId, 0) }}"
-    invocation = next(row[route][0] for row in stage["jobs"] if route in row)
+    branches = next(row[route] for row in stage["jobs"] if route in row)
+    invocation = next(row["${{ else }}"][0] for row in branches if "${{ else }}" in row)
     assert invocation["template"] == "/jobs/clustermesh-post-retirement-prom.yml"
     assert invocation["parameters"]["retirement_build_id"] == "${{ parameters.scaleDebugPostRetirementPromBuildId }}"
     assert invocation["parameters"]["resume_build_id"] == 80015

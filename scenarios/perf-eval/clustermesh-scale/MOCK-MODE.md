@@ -354,6 +354,13 @@ memory budget, and positive old-pool/VMSS absence before emitting the completed
 layout. The original failure on the deleted pool's `NotFound` operation endpoint
 is retained as evidence; neither accepted provider action is repeated.
 
+`scaleDebugPostRetirementPromBuildId=80017` selects a separate, read-only
+post-recovery readiness diagnosis from that failed workload's published evidence.
+It captures only the six affected roles' Node/Cilium/VM state and failed pool
+operations, never restarts or deletes resources, and does not claim healthy
+workloads from collected diagnostics. Other maintenance modes and workloads
+must remain disabled for this diagnostic run.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,
