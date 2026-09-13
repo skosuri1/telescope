@@ -109,12 +109,6 @@ steps:
         --resource-group "$node_group" --name aks-default-28928250-vmss \
         --query '[].{id:id,instanceId:instanceId,vmId:vmId,computerName:osProfile.computerName,provisioningState:provisioningState}' \
         --output json --only-show-errors > "$directory/default-instances.json"
-      for instance in 0 1; do
-        timeout 60 az vmss get-instance-view --subscription "$EXPECTED_SUBSCRIPTION_ID" \
-          --resource-group "$node_group" --name aks-default-28928250-vmss --instance-id "$instance" \
-          --query '{statuses:statuses,vmAgent:vmAgent,maintenanceRedeployStatus:maintenanceRedeployStatus,extensions:extensions[].{name:name,statuses:statuses}}' \
-          --output json --only-show-errors > "$directory/default-$instance-instance-view.json"
-      done
       private=$(mktemp -d "$AGENT_TEMP_DIRECTORY/native-worker-observe.XXXXXX")
       cleanup() {
         rm -f -- "$private/cluster.config"
@@ -133,6 +127,15 @@ steps:
         > "$directory/current-controllers.json"
       timeout 45 "${kube[@]}" get pdb -A -o json > "$directory/current-pdbs.json"
       timeout 45 "${kube[@]}" get nodenetworkconfigs -n kube-system -o json > "$directory/current-nnc.json"
+      jq -e 'length <= 4 and all(.[]; (.instanceId | tostring | test("^[0-9]+$")))
+        and ([.[].instanceId] | length == (unique | length))' "$directory/default-instances.json" >/dev/null
+      mapfile -t default_instances < <(jq -r '.[].instanceId' "$directory/default-instances.json")
+      for instance in "${default_instances[@]}"; do
+        timeout 60 az vmss get-instance-view --subscription "$EXPECTED_SUBSCRIPTION_ID" \
+          --resource-group "$node_group" --name aks-default-28928250-vmss --instance-id "$instance" \
+          --query '{statuses:statuses,vmAgent:vmAgent,maintenanceRedeployStatus:maintenanceRedeployStatus,extensions:extensions[].{name:name,statuses:statuses}}' \
+          --output json --only-show-errors > "$directory/default-$instance-instance-view.json"
+      done
       timeout 45 "${kube[@]}" get configmap kwok -n kube-system -o json > "$directory/kwok-config.json"
       timeout 45 "${kube[@]}" get stages -o json > "$directory/kwok-stages.json"
       timeout 45 "${kube[@]}" get leases -n kube-node-lease -o json > "$directory/kwok-node-leases.json"

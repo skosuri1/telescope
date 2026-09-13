@@ -566,3 +566,14 @@ def test_captured_configuration_drift_is_rejected_before_any_worker_action(envir
     with pytest.raises(retirement.EXPECTED_ERRORS, match="configuration changed before retirement"):
         run(environment, True)
     assert not cloud.writes and not cloud.native_calls
+
+
+def test_external_vmss_update_blocks_mutation_but_preserves_kubernetes_snapshot(environment):
+    _, cloud = environment
+    cloud.scales[0]["provisioningState"] = "Updating"
+    with pytest.raises(retirement.EXPECTED_ERRORS):
+        run(environment, True)
+    diagnostics = cloud.receipt()["qualification_recheck"]["read_only_capacity_guard"]
+    assert diagnostics["kubernetes_diagnostics"]["nodes"]["items"]
+    assert diagnostics["kubernetes_diagnostics"]["pods"]["items"]
+    assert not cloud.writes and not cloud.native_calls

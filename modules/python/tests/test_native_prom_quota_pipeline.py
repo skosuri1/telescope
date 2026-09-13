@@ -126,11 +126,14 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
             elif args[:2] == ["vmss", "get-instance-view"]:
                 assert arg("--name") in ("aks-default-28928250-vmss", "aks-cniv5-27550670-vmss")
                 modern = arg("--name") == "aks-cniv5-27550670-vmss"
+                if not modern and "--instance-id" in args and fault == "default-view-forbidden":
+                    print("AuthorizationFailed: default VM view denied", file=sys.stderr)
+                    sys.exit(1)
                 if modern and fault == "modern-forbidden":
                     print("AuthorizationFailed: new VM view denied", file=sys.stderr)
                     sys.exit(1)
                 if "--instance-id" in args:
-                    assert arg("--instance-id") in ("0", "1")
+                    assert arg("--instance-id") in (("0", "2") if fault == "new-default-instance" else ("0", "1"))
                     value = {"statuses": [{"code": "PowerState/running"}], "extensions": [],
                              "maintenanceRedeployStatus": {"isCustomerInitiatedMaintenanceAllowed": False}}
                 else:
@@ -184,6 +187,9 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
                 assert arg("--name") in ("aks-prompool-38822163-vmss", "aks-default-28928250-vmss",
                                         "aks-cniv5-27550670-vmss")
                 value = []
+                if arg("--name") == "aks-default-28928250-vmss":
+                    value = [{"instanceId": str(index)} for index in
+                             ((0, 2) if fault == "new-default-instance" else (0, 1))]
                 if arg("--name") == "aks-cniv5-27550670-vmss":
                     value = [{"instanceId": str(index), "vmId": f"new-vm-{index}", "latestModelApplied": True,
                               "osProfile": {"computerName": f"new-node-{index}"}} for index in (0, 1)]
@@ -268,7 +274,7 @@ def test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, fau
     result = subprocess.run(
         ["bash", "-c", script], env=environment, capture_output=True, text=True, check=False, timeout=20,
     )
-    success = fault in ("none", "absent", "managed-absent", "modern-creating", "modern-succeeded")
+    success = fault in ("none", "absent", "managed-absent", "modern-creating", "modern-succeeded", "new-default-instance")
     assert (result.returncode == 0) is success, result.stderr
     directory = tmp_path / "artifacts" / "n100-unreachable-worker-recovery"
     if success:
@@ -343,4 +349,18 @@ def test_kwok_log_denial_is_not_treated_as_healthy_or_complete(tmp_path):
     test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, "kwok-log-forbidden", 32, 100, "number")
     directory = tmp_path / "artifacts" / "n100-unreachable-worker-recovery"
     assert (directory / "kwok-node-leases.json").is_file()
+    assert not (directory / "quota-observation.json").exists()
+
+
+def test_default_vm_observation_uses_actual_inventory_instead_of_guessing_old_ids(tmp_path):
+    test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, "new-default-instance", 32, 100, "number")
+    directory = tmp_path / "artifacts" / "n100-unreachable-worker-recovery"
+    assert (directory / "default-2-instance-view.json").exists()
+    assert not (directory / "default-1-instance-view.json").exists()
+
+
+def test_default_view_failure_does_not_hide_kubernetes_state(tmp_path):
+    test_quota_observer_never_mutates_or_claims_workload_readiness(tmp_path, "default-view-forbidden", 32, 100, "number")
+    directory = tmp_path / "artifacts" / "n100-unreachable-worker-recovery"
+    assert (directory / "current-nodes.json").exists() and (directory / "current-pods.json").exists()
     assert not (directory / "quota-observation.json").exists()

@@ -503,6 +503,8 @@ class Qualification(maintenance.ClusterOperator):
         self.unchanged_inputs()
         self.reader.authority()
         snapshot = self.reader.snapshot()
+        self.reader.summary["kubernetes_diagnostics"] = stalled.safe_diagnostics(snapshot)
+        self.reader.save()
         new = self.reader.models(snapshot)
         networks = self.guard(snapshot, new)
         self.historical_journal()
