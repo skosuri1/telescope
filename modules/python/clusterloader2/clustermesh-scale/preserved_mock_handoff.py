@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from typing import Dict, Optional, Sequence
@@ -180,6 +181,135 @@ def validate_verification_artifact(
     }
 
 
+def validate_post_retirement_artifact(proof_path: str, receipt: dict) -> dict:
+    """Bind current mesh-96 identities to the completed native retirement."""
+
+    retirement_dir = os.path.join(os.path.dirname(proof_path), "retirement-input")
+    retirement_path = os.path.join(retirement_dir, "retirement.json")
+    if os.path.islink(retirement_dir) or os.path.islink(retirement_path):
+        raise HandoffError("post-retirement source evidence must not be symlinked")
+    retirement = _load_object(retirement_path, "completed native retirement")
+    try:
+        with open(retirement_path, "rb") as handle:
+            retirement_sha = hashlib.sha256(handle.read()).hexdigest()
+    except OSError as exc:
+        raise HandoffError(f"unable to hash completed native retirement: {exc}") from exc
+    if (
+        receipt.get("retirement_build_id") != 80001
+        or isinstance(receipt.get("retirement_build_id"), bool)
+        or receipt.get("retirement_sha256") != retirement_sha
+        or retirement.get("plan_sha256") != modern_baseline.PLAN_SHA
+    ):
+        raise HandoffError("monitoring handoff lacks the exact successful 80001 retirement")
+    if (
+        not all(retirement.get(key) is True for key in (
+            "execute", "success", "native_fencing_proven", "source_retired",
+            "replacements_ready", "placement_hold_removed",
+        ))
+        or retirement.get("current_mock_ready") != 100
+        or retirement.get("kwok_ready") != 100
+        or retirement.get("cleanup_errors") != []
+    ):
+        raise HandoffError("monitoring handoff lacks the exact successful 80001 retirement")
+    if retirement.get("target") != {
+        "node_name": "aks-default-28928250-vmss000001",
+        "node_uid": "c673a142-17ac-44c7-92cc-32efc0d34c61",
+        "vm_id": "d81b78a9-fe40-468d-91ec-d66f0456bfa7",
+    }:
+        raise HandoffError("monitoring handoff names a different retired worker")
+    native = retirement.get("native")
+    if (
+        not isinstance(native, dict) or native.get("accepted") is not True
+        or native.get("ambiguous") is not False
+        or not native.get("vm_absence_observed_at")
+    ):
+        raise HandoffError("monitoring handoff lacks positive native worker fencing")
+    current = verify.validate_uid_map(retirement.get("current_mock_uids"), 100, "retired mesh-96 mock identities")
+    nodes = verify.validate_uid_map(retirement.get("preserved_kwok_uids"), 100, "retired mesh-96 KWOK identities")
+    protected = retirement.get("protected_mock_uids")
+    original = retirement.get("original_target_mock_uids")
+    replacements = retirement.get("controller_replacements")
+    partition_error = "retirement does not account for exactly 44 preserved and 56 replacement agents"
+    if not all(isinstance(mapping, dict) for mapping in (protected, original, replacements)):
+        raise HandoffError(partition_error)
+    if (
+        len(protected) != 44 or len(original) != 56 or set(replacements) != set(original)
+        or any(not isinstance(uid, str) or not uid for uid in original.values())
+    ):
+        raise HandoffError(partition_error)
+    if (
+        len(set(original.values())) != 56 or set(protected) & set(original)
+        or set(protected) | set(original) != set(current)
+        or any(current[name] != uid for name, uid in protected.items())
+    ):
+        raise HandoffError(partition_error)
+    for name, replacement in replacements.items():
+        if not isinstance(replacement, dict):
+            raise HandoffError(f"{name}: replacement identity is not backed by native fencing")
+        identity_matches = (
+            replacement.get("old_uid") == original[name]
+            and replacement.get("new_uid") == current[name]
+            and original[name] not in current.values()
+        )
+        readiness_proven = (
+            replacement.get("fencing_proven") is True and replacement.get("ready") is True
+            and replacement.get("node_name") in (
+                "aks-cniv5-27550670-vmss000000", "aks-cniv5-27550670-vmss000001",
+            )
+        )
+        if not identity_matches or not readiness_proven:
+            raise HandoffError(f"{name}: replacement identity is not backed by native fencing")
+    if (
+        verify.validate_uid_map(receipt.get("current_mock_uids"), 100, "monitoring mock identities") != current
+        or verify.validate_uid_map(receipt.get("preserved_kwok_uids"), 100, "monitoring KWOK identities") != nodes
+    ):
+        raise HandoffError("monitoring recovery changed the completed retirement identities")
+    return {
+        "role": "mesh-96", "retirement_build_id": 80001, "retirement_sha256": retirement_sha,
+        "preserved_agent_count": 44, "fenced_replacement_count": 56,
+        "agent_uids": current, "node_uids": nodes,
+    }
+
+
+def validate_post_retirement_live(live: dict, expected: dict) -> None:
+    """Require current identities, without substituting old terminated Pod UIDs."""
+
+    if (
+        live.get("role") != "mesh-96"
+        or verify.validate_uid_map(live.get("agent_uids"), 100, "live mesh-96 mock identities") != expected["agent_uids"]
+        or verify.validate_uid_map(live.get("node_uids"), 100, "live mesh-96 KWOK identities") != expected["node_uids"]
+    ):
+        raise HandoffError("mesh-96 identities changed since completed monitoring recovery")
+
+
+def capture_post_retirement_identities(cluster: capture.Cluster, timeout: int) -> dict:
+    """Observe the repaired role before reconciliation can make any changes."""
+
+    base = ["kubectl", "--kubeconfig", cluster.kubeconfig, f"--request-timeout={timeout}s"]
+    nodes = capture.parse_json(capture.run_command(
+        base + ["get", "nodes", "-l", "type=kwok", "-o", "json"], timeout,
+    ), "repaired mesh-96 KWOK Nodes")
+    agents = capture.parse_json(capture.run_command(
+        base + ["-n", "mock-clustermesh", "get", "pods", "-l", "app=mock-cilium-agent", "-o", "json"], timeout,
+    ), "repaired mesh-96 mock agents")
+    row = {
+        "role": cluster.role,
+        "node_uids": capture.parse_node_identities(nodes, 100),
+        "agent_uids": capture.parse_agent_identities(agents, 100),
+    }
+    if any(item.get("metadata", {}).get("deletionTimestamp") for item in nodes["items"] + agents["items"]):
+        raise HandoffError("repaired mesh-96 contains a deleting KWOK Node or mock agent")
+    for item in nodes["items"]:
+        status = item.get("status")
+        conditions = status.get("conditions") if isinstance(status, dict) else None
+        if not isinstance(conditions, list) or not any(
+            isinstance(condition, dict) and condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in conditions
+        ):
+            raise HandoffError("repaired mesh-96 KWOK Nodes are not all Ready")
+    return row
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse command-line arguments."""
 
@@ -249,13 +379,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stage = "loading_artifact_chain"
     try:
         modern_layout = None
+        retirement_identities = None
         historical_pool_count = args.expected_pool_count
         if getattr(args, "modern_baseline_proof", None):
+            modern_receipt = _load_object(args.modern_baseline_proof, "completed modern pool baseline receipt")
             modern_layout = modern_baseline.validate_receipt(
-                _load_object(args.modern_baseline_proof, "completed modern CNI baseline receipt"),
+                modern_receipt,
                 run_id=args.run_id, subscription_id=args.expected_subscription_id,
                 expected_pool_count=args.expected_pool_count,
             )
+            if "retirement_build_id" in modern_receipt or os.path.exists(
+                os.path.join(os.path.dirname(args.modern_baseline_proof), "retirement-input")
+            ):
+                if args.expected_cluster_count != 100 or args.expected_mock_count != 100:
+                    raise HandoffError("post-retirement handoff requires the exact n100 mock inventory")
+                retirement_identities = validate_post_retirement_artifact(args.modern_baseline_proof, modern_receipt)
+                summary["post_retirement_identity_chain"] = retirement_identities
             historical_pool_count = modern_baseline.ORIGINAL_POOL_COUNT
             summary["modern_pool_layout"] = modern_layout
             summary["historical_verified_pool_count"] = historical_pool_count
@@ -290,6 +429,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.run_id,
             args.expected_mock_count,
         )
+
+        if retirement_identities is not None:
+            stage = "validating_repaired_mesh96_before_reconcile"
+            repaired_cluster = next((cluster for cluster in clusters if cluster.role == "mesh-96"), None)
+            if repaired_cluster is None:
+                raise HandoffError("post-retirement handoff is missing mesh-96")
+            repaired_live = capture_post_retirement_identities(repaired_cluster, args.command_timeout_seconds)
+            verify.write_json_atomic(
+                os.path.join(args.artifact_dir, "monitoring-identities-pre-reconcile.json"), repaired_live,
+            )
+            validate_post_retirement_live(repaired_live, retirement_identities)
 
         stage = "reconciling_pre_suite_layer"
         reconcile = verify.run_reconciler(
@@ -340,6 +490,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "clusters": live,
             },
         )
+        if retirement_identities is not None:
+            repaired_live = next((row for row in live if row.get("role") == "mesh-96"), None)
+            if repaired_live is None:
+                raise HandoffError("post-reconcile capture is missing mesh-96")
+            validate_post_retirement_live(repaired_live, retirement_identities)
+            summary["post_retirement_identities_preserved"] = True
         handoff = {
             "schema_version": 1,
             "validated_at": verify.utc_now(),
@@ -364,6 +520,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "live_mock_agents": args.expected_cluster_count
             * args.expected_mock_count,
         }
+        if retirement_identities is not None:
+            handoff["post_retirement_identity_chain"] = retirement_identities
+            handoff["post_retirement_identities_preserved"] = True
         verify.write_json_atomic(
             os.path.join(args.artifact_dir, "handoff.json"),
             handoff,

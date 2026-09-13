@@ -64,6 +64,23 @@ steps:
       if [ -n "${MODERN_BASELINE_PROOF:-}" ]; then
         test -s "$MODERN_BASELINE_PROOF"
         cp "$MODERN_BASELINE_PROOF" "$artifact_dir/modern-baseline-source.json"
+        if jq -e 'has("retirement_build_id")' "$MODERN_BASELINE_PROOF" >/dev/null ||
+          [ -e "$(dirname "$MODERN_BASELINE_PROOF")/retirement-input" ]; then
+          python3 - "$MODERN_BASELINE_PROOF" "$artifact_dir" <<'PY'
+      import shutil
+      import sys
+      from pathlib import Path
+
+      proof, artifacts = (Path(value) for value in sys.argv[1:])
+      original, output = proof.parent / "retirement-input", artifacts / "retirement-input"
+      if original.is_symlink() or not original.is_dir() or any(path.is_symlink() for path in original.rglob("*")):
+          raise SystemExit("Monitoring handoff requires the complete, non-symlinked retirement source.")
+      original, output = original.resolve(), output.resolve()
+      if original == output or original in output.parents or output in original.parents or output.exists():
+          raise SystemExit("Monitoring handoff retirement output must be new and disjoint from its source.")
+      shutil.copytree(original, output)
+      PY
+        fi
         modern_args+=(--modern-baseline-proof "$artifact_dir/modern-baseline-source.json")
       fi
       python3 "$PRESERVED_MOCK_HANDOFF" \

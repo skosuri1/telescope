@@ -1,0 +1,130 @@
+parameters:
+  - name: phase
+    type: string
+    values:
+      - plan
+      - execute
+  - name: scope
+    type: object
+
+steps:
+  - script: |
+      set -euo pipefail
+      umask 077
+      directory="$ARTIFACT_DIRECTORY/n100-post-retirement-prom"
+      snapshot_hashes() {
+        input="$directory/retirement-input"
+        test -d "$input"
+        test ! -L "$input"
+        if find "$input" -type l -print -quit | grep -q .; then
+          echo "Retirement evidence contains a symlink." >&2
+          return 1
+        fi
+        (cd "$input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --)
+      }
+      if [ "$PHASE" = "plan" ]; then
+        python3 - "$RETIREMENT_DIRECTORY" "$directory" <<'PY'
+      import sys
+      from pathlib import Path
+      original, output = (Path(value) for value in sys.argv[1:])
+      if original.is_symlink() or not original.is_dir():
+          raise SystemExit("Completed retirement input must be a real directory.")
+      original, output = original.resolve(), output.resolve()
+      if original == output or original in output.parents or output in original.parents or output.exists():
+          raise SystemExit("Monitoring output must be new and disjoint from retirement evidence.")
+      PY
+        if find "$RETIREMENT_DIRECTORY" -type l -print -quit | grep -q .; then
+          echo "Retirement evidence contains a symlink." >&2
+          exit 1
+        fi
+        jq -e '.success == true and .native_fencing_proven == true and .source_retired == true
+          and .replacements_ready == true and .placement_hold_removed == true
+          and .current_mock_ready == 100 and .kwok_ready == 100
+          and (.cleanup_errors | type == "array" and length == 0)' \
+          "$RETIREMENT_DIRECTORY/retirement.json" >/dev/null
+        mkdir -p "$ARTIFACT_DIRECTORY"
+        mkdir "$directory"
+        echo "##vso[task.setvariable variable=POST_RETIREMENT_PROM_DIAGNOSTICS_READY]true"
+        cp -R -- "$RETIREMENT_DIRECTORY" "$directory/retirement-input"
+        snapshot_hashes > "$directory/inputs.sha256"
+        inputs_sha=$(sha256sum "$directory/inputs.sha256" | awk '{print $1}')
+        tfvars_sha=$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')
+        echo "##vso[task.setvariable variable=POST_RETIREMENT_PROM_INPUTS_SHA;isReadOnly=true]$inputs_sha"
+        echo "##vso[task.setvariable variable=POST_RETIREMENT_PROM_TFVARS_SHA;isReadOnly=true]$tfvars_sha"
+      elif [ "$PHASE" = "execute" ]; then
+        if ! [[ "$INPUTS_SHA" =~ ^[0-9a-f]{64}$ ]] || ! [[ "$TFVARS_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "Monitoring restoration requires the completed plan's frozen hashes." >&2
+          exit 1
+        fi
+        inputs_sha="$INPUTS_SHA"
+        tfvars_sha="$TFVARS_SHA"
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+          "$directory/plan.json" >/dev/null
+      else
+        echo "Unknown monitoring restoration phase; no action is authorized." >&2
+        exit 1
+      fi
+      verify_inputs() {
+        snapshot_hashes > "$directory/inputs-$PHASE.sha256"
+        if [ "$(sha256sum "$directory/inputs-$PHASE.sha256" | awk '{print $1}')" != "$inputs_sha" ] ||
+          [ "$(sha256sum "$REPOSITORY_DIRECTORY/$TFVARS_PATH" | awk '{print $1}')" != "$tfvars_sha" ]; then
+          echo "Monitoring restoration inputs changed; no further action is authorized." >&2
+          return 1
+        fi
+      }
+      verify_inputs
+      private="$AGENT_TEMP_DIRECTORY/post-retirement-prom.$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+      mkdir -m 700 -- "$private"
+      cleanup() {
+        rm -f -- "$private/cluster.config"
+        rmdir -- "$private"
+      }
+      trap cleanup EXIT
+      timeout 90 az aks get-credentials --subscription "$SUBSCRIPTION" --resource-group "$RUN_ID" \
+        --name clustermesh-96 --file "$private/cluster.config" --context clustermesh-96 --only-show-errors
+      chmod 600 "$private/cluster.config"
+      args=(
+        --resource-group "$RUN_ID" --confirm-resource-group "$CONFIRM_RESUME"
+        --expected-subscription "$SUBSCRIPTION" --expected-region "$REGION"
+        --expected-tfvars-sha "$tfvars_sha"
+        --retirement-directory "$directory/retirement-input" --retirement-build-id "$RETIREMENT_BUILD_ID"
+        --kubeconfig "$private/cluster.config" --context clustermesh-96 --timeout-seconds 3600
+      )
+      if [ "$PHASE" = "plan" ]; then
+        args+=(--summary-file "$directory/plan.json")
+      else
+        args+=(--summary-file "$directory/recovery.json" --execute)
+      fi
+      echo "Starting dedicated monitoring restoration $PHASE at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+      python3 -u "$REPOSITORY_DIRECTORY/modules/python/clusterloader2/clustermesh-scale/post_retirement_prom_recovery.py" "${args[@]}"
+      verify_inputs
+      if [ "$PHASE" = "plan" ]; then
+        jq -e '.execute == false and .mutation_started == false and .plan_valid == true' \
+          "$directory/plan.json" >/dev/null
+      else
+        jq -e '.execute == true and .success == true and .repaired == true and .workloads_ready == false
+          and .modern_cni.completed == true and .modern_cni.source_retired == true
+          and .baseline_pool_layout.expected_total_pool_count == 202' \
+          "$directory/recovery.json" >/dev/null
+      fi
+    ${{ if eq(parameters.phase, 'plan') }}:
+      displayName: "Plan dedicated monitoring restoration without changes"
+      timeoutInMinutes: 15
+    ${{ else }}:
+      displayName: "Create real User monitoring worker and retire only the empty old pool"
+      timeoutInMinutes: 65
+    retryCountOnTaskFailure: 0
+    env:
+      PHASE: ${{ parameters.phase }}
+      RUN_ID: ${{ parameters.scope.target_run_id }}
+      CONFIRM_RESUME: ${{ parameters.scope.confirm_resume }}
+      SUBSCRIPTION: ${{ parameters.scope.expected_subscription_id }}
+      REGION: ${{ parameters.scope.expected_region }}
+      TFVARS_PATH: ${{ parameters.scope.tfvars_path }}
+      RETIREMENT_BUILD_ID: ${{ parameters.scope.retirement_build_id }}
+      RETIREMENT_DIRECTORY: $(Pipeline.Workspace)/post-retirement-prom-source
+      ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)
+      REPOSITORY_DIRECTORY: $(Pipeline.Workspace)/s
+      AGENT_TEMP_DIRECTORY: $(Agent.TempDirectory)
+      INPUTS_SHA: $(POST_RETIREMENT_PROM_INPUTS_SHA)
+      TFVARS_SHA: $(POST_RETIREMENT_PROM_TFVARS_SHA)

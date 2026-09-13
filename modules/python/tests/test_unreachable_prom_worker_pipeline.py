@@ -118,7 +118,7 @@ def test_recovery_mode_excludes_other_mutation_paths():
         if row.get("stage") == "azure_eastus2euap_n100_debug_resume_37deca"
     )
     key = (
-        "${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), "
+        "${{ if and(eq(parameters.scaleDebugPostRetirementPromBuildId, 0), eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), eq(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), "
         "eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0), "
         "or(parameters.scaleDebugModernPromRecovery, ne(parameters.scaleDebugUnreachableWorkerReplaceFailedHostBuildId, 0), "
         "ne(parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId, 0), "

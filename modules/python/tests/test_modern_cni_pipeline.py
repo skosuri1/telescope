@@ -122,7 +122,7 @@ def test_modern_cni_plan_execute_and_private_input_contract(tmp_path, fault, exp
 def test_modern_cni_receipt_disables_legacy_and_normal_jobs():
     pipeline = yaml.safe_load((ROOT / "pipelines/system/new-pipeline-test.yml").read_text(encoding="utf-8"))
     stage = next(row for row in pipeline["stages"] if row.get("stage") == "azure_eastus2euap_n100_debug_resume_37deca")
-    key = "${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), ne(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0)) }}"
+    key = "${{ if and(eq(parameters.scaleDebugPostRetirementPromBuildId, 0), eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), ne(parameters.scaleDebugModernCniPromBuildId, 0), eq(parameters.scaleDebugDv3QuotaRequestLimit, 0), eq(parameters.scaleDebugQuotaRequestReceiptBuildId, 0)) }}"
     entry = next(row[key][0] for row in stage["jobs"] if key in row)
     assert entry["template"] == "/jobs/clustermesh-modern-cni.yml"
     for row in stage["jobs"][:4]:

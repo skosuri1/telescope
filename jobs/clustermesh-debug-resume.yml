@@ -37,6 +37,12 @@ parameters:
 - name: modern_baseline_build_id
   type: number
   default: 0
+- name: modern_baseline_artifact
+  type: string
+  default: n100-modern-cni
+  values:
+  - n100-modern-cni
+  - n100-post-retirement-prom
 - name: retained_worker_restart_build_id
   type: number
   default: 0
@@ -47,6 +53,9 @@ parameters:
   type: number
   default: 0
 - name: qualified_retirement_build_id
+  type: number
+  default: 0
+- name: post_retirement_prom_build_id
   type: number
   default: 0
 - name: lease_extension_hours
@@ -105,6 +114,7 @@ jobs:
 - job: azure
   condition: >-
     and(succeeded(),
+    eq(${{ parameters.post_retirement_prom_build_id }}, 0),
     eq(${{ parameters.qualified_retirement_build_id }}, 0),
     eq(${{ parameters.capacity_qualification_build_id }}, 0),
     eq(${{ parameters.capacity_first_build_id }}, 0),
@@ -139,12 +149,13 @@ jobs:
       credential_type: ${{ parameters.credential_type }}
       ssh_key_enabled: false
 
-  - ${{ if gt(parameters.modern_baseline_build_id, 0) }}:
+  - ${{ if or(gt(parameters.modern_baseline_build_id, 0), ne(parameters.modern_baseline_artifact, 'n100-modern-cni')) }}:
     - script: |
         set -euo pipefail
         if [ "${RUN_WORKLOAD,,}" != "true" ] ||
           [ "$PRESERVATION_MODE" != "none" ] ||
-          [ "$EXPECTED_POOLS" != "202" ]; then
+          [ "$EXPECTED_POOLS" != "202" ] ||
+          ! [[ "$SOURCE_BUILD_ID" =~ ^[1-9][0-9]*$ ]]; then
           echo "A modern baseline receipt is only valid for the explicit 202-pool workload handoff." >&2
           exit 1
         fi
@@ -153,8 +164,9 @@ jobs:
         RUN_WORKLOAD: "${{ parameters.run_workload }}"
         PRESERVATION_MODE: ${{ parameters.mock_preservation_mode }}
         EXPECTED_POOLS: "${{ parameters.expected_pool_count }}"
+        SOURCE_BUILD_ID: "${{ parameters.modern_baseline_build_id }}"
     - task: DownloadPipelineArtifact@2
-      displayName: "Download completed mesh96 modern CNI baseline proof"
+      displayName: "Download completed mesh96 hardware baseline proof"
       inputs:
         buildType: specific
         project: $(System.TeamProjectId)
@@ -162,7 +174,7 @@ jobs:
         specificBuildWithTriggering: false
         buildVersionToDownload: specific
         pipelineId: ${{ parameters.modern_baseline_build_id }}
-        artifactName: n100-modern-cni-${{ parameters.modern_baseline_build_id }}-1
+        artifactName: ${{ parameters.modern_baseline_artifact }}-${{ parameters.modern_baseline_build_id }}-1
         targetPath: $(Pipeline.Workspace)/modern-pool-baseline
     - script: |
         set -euo pipefail
@@ -173,6 +185,7 @@ jobs:
 
         sys.path.insert(0, os.environ["MODERN_BASELINE_MODULE_DIR"])
         import modern_pool_baseline
+        import preserved_mock_handoff
 
         with open(os.environ["MODERN_BASELINE_PROOF"], encoding="utf-8") as handle:
             receipt = json.load(handle)
@@ -181,12 +194,15 @@ jobs:
             subscription_id=os.environ["EXPECTED_SUBSCRIPTION_ID"],
             expected_pool_count=int(os.environ["EXPECTED_POOL_COUNT"]),
         )
+        if os.environ["MODERN_BASELINE_ARTIFACT"] == "n100-post-retirement-prom":
+            preserved_mock_handoff.validate_post_retirement_artifact(os.environ["MODERN_BASELINE_PROOF"], receipt)
         print("Completed mesh96 modern-pool receipt matches the explicit workload baseline.")
         PY
       displayName: "Validate modern pool baseline before general reconciliation"
       env:
         MODERN_BASELINE_MODULE_DIR: $(Pipeline.Workspace)/s/modules/python/clusterloader2/clustermesh-scale
         MODERN_BASELINE_PROOF: $(Pipeline.Workspace)/modern-pool-baseline/recovery.json
+        MODERN_BASELINE_ARTIFACT: ${{ parameters.modern_baseline_artifact }}
         EXPECTED_RUN_ID: ${{ parameters.target_run_id }}
         EXPECTED_SUBSCRIPTION_ID: ${{ parameters.expected_subscription_id }}
         EXPECTED_POOL_COUNT: "${{ parameters.expected_pool_count }}"

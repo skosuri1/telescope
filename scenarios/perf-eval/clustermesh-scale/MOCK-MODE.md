@@ -334,6 +334,19 @@ action to be terminal, the exact VM/Node identity and failed-OS timestamps, and
 fresh unavailable-guest evidence; an `Updating` VMSS still blocks retirement.
 The original restart and capacity qualification receipts remain unchanged.
 
+`scaleDebugPostRetirementPromBuildId=80001` selects the final dedicated monitoring
+recovery, with every other maintenance/workload job disabled. It requires the
+successful native retirement and all 100 mock/KWOK identities healthy before
+adding one real `promv5` User worker. The existing pending Prometheus operator
+must become Ready naturally on that worker; healthy workloads are not moved or
+recreated. Only after the new monitoring capacity is ready may the empty legacy
+`prompool` object be retired. The resulting actual pool identities/counts/SKUs
+produce the explicit 202-pool layout handoff, while `workloads_ready` stays false
+until the separate workload preflight succeeds. Normal new-worker startup is
+observed without reissuing creation; final readiness includes the campaign's
+16 GiB Prometheus memory budget. Raw semantic guards are bound to the original
+retirement input hashes, rather than compared with redacted diagnostics.
+
 `scaleDebugRetainedWorkerRestartBuildId` selects a separate, exclusive host
 recovery using a read-only worker-state artifact. It permits at most one
 receipt-bound normal restart of the exact unresponsive mesh-96 default worker,
@@ -367,10 +380,18 @@ default worker and its healthy mock identities are preserved.
 The final mesh-96 layout is `default` System count 1, `promv5` User count 1, and
 `cniv5` System count 2. This changes the campaign pool-object baseline from 201
 to 202 and introduces a documented hardware baseline change. Workload mode
-requires `scaleDebugModernBaselineBuildId` pointing to the completed modern CNI
-receipt. The historical verification artifact is still checked against its
+requires `scaleDebugModernBaselineBuildId` pointing to the completed recovery
+receipt. For post-retirement monitoring recovery, also select
+`scaleDebugModernBaselineArtifact=n100-post-retirement-prom`; the default
+`n100-modern-cni` retains the earlier recovery artifact contract.
+`scaleDebugPostRetirementPromBuildId` must be zero for workload mode. The
+historical verification artifact is still checked against its
 original 201 pools; current live validation requires the exact receipt-bound
 202-pool layout, all other clusters' original pool names, and full health.
+The post-retirement handoff also checks mesh-96's current identities before and
+after reconciliation: all 100 KWOK UIDs, the 44 preserved mock Pod UIDs, and the
+56 controller replacements backed by positive native fencing. Historical
+terminated Pod UIDs are retained as evidence, not demanded as current objects.
 Changing an expected count alone never authorizes an unproved layout.
 
 ### Planned single-worker CNI maintenance

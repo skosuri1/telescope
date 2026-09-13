@@ -70,7 +70,7 @@ def test_quota_mode_is_exclusive_and_does_not_allocate_capacity():
     assert parameters["scaleDebugDv3QuotaRequestLimit"]["default"] == 0
     assert parameters["scaleDebugDv3QuotaRequestLimit"]["values"] == [0, 5500]
     stage = next(row for row in pipeline["stages"] if row.get("stage") == "azure_eastus2euap_n100_debug_resume_37deca")
-    key = "${{ if and(eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), or(eq(parameters.scaleDebugDv3QuotaRequestLimit, 5500), ne(parameters.scaleDebugQuotaRequestReceiptBuildId, 0))) }}"
+    key = "${{ if and(eq(parameters.scaleDebugPostRetirementPromBuildId, 0), eq(parameters.scaleDebugQualifiedWorkerRetirementBuildId, 0), eq(parameters.scaleDebugCapacityQualificationBuildId, 0), eq(parameters.scaleDebugCapacityFirstRecoveryBuildId, 0), eq(parameters.scaleDebugRetainedWorkerRestartBuildId, 0), or(eq(parameters.scaleDebugDv3QuotaRequestLimit, 5500), ne(parameters.scaleDebugQuotaRequestReceiptBuildId, 0))) }}"
     invocation = next(row[key][0] for row in stage["jobs"] if key in row)
     assert invocation["template"] == "/jobs/clustermesh-quota-request.yml"
     assert invocation["parameters"]["native_build_id"] == "${{ parameters.scaleDebugUnreachableWorkerResumeReplacementBuildId }}"
